@@ -13,10 +13,18 @@ interface Job { run: () => Promise<void>; attempts: number; timer?: NodeJS.Timeo
 export class Jobs {
   private readonly jobs = new Map<string, Job>()
   private closed = false
-  constructor(private readonly onError: (key: string, error: unknown, final: boolean) => void = () => {}) {}
+  /**
+   * @param defer - runs `enqueue` once the caller's transaction commits (`Store.afterCommit`), so work a rolled-back command
+   * queued never runs.
+   */
+  constructor(private readonly onError: (key: string, error: unknown, final: boolean) => void = () => {},
+    private readonly defer: (run: () => void) => void = run => run()) {}
 
   /** Queue `run` under `key`; it starts on the next tick. */
   enqueue(key: string, run: () => Promise<void>, options: JobOptions = {}): void {
+    this.defer(() => this.add(key, run, options))
+  }
+  private add(key: string, run: () => Promise<void>, options: JobOptions): void {
     if (this.closed) return
     const existing = this.jobs.get(key)
     if (existing) {

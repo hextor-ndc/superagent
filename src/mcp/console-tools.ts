@@ -58,7 +58,7 @@ export function consoleActions(runtime: Runtime) {
     },
     superagent_retry: ({ ticket_id }: { ticket_id: string }) => ({ retried: runtime.view(engine.retryTicket(ticket(ticket_id).id)) }),
     superagent_note: ({ ticket_id, text }: { ticket_id: string; text: string }) => { engine.note(ticket(ticket_id).id, text); return { noted: true } },
-    superagent_pause: ({ paused }: { paused: boolean }) => { runtime.settings = { ...runtime.settings, paused }; return { paused } },
+    superagent_pause: ({ paused }: { paused: boolean }) => { runtime.setPaused(paused); return { paused } },
     superagent_messages: () => ({ messages: runtime.outbox.list().slice(0, 30).map(record => ({ ticket: record.message.ticketId,
       kind: record.message.kind, status: record.status, at: record.at, text: record.message.text })) }),
   }

@@ -1,4 +1,5 @@
 /** Configuration from the environment. Point 5: the only credential is t3code's `mcp-client` token. */
+import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 
@@ -15,6 +16,8 @@ export interface Config {
   /** How t3code's agents reach this service; workers' MCP URLs start with it. */
   publicUrl: string
   consoleToken: string
+  /** The SQLite file, or `:memory:` in tests. */
+  database: string
   operator: string
   maxWorkers: number
   runtimeMode?: string
@@ -40,6 +43,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port,
     publicUrl: (env.SUPERAGENT_PUBLIC_URL ?? `http://127.0.0.1:${port}`).replace(/\/+$/, ''),
     consoleToken: env.SUPERAGENT_CONSOLE_TOKEN || randomBytes(24).toString('base64url'),
+    database: join(resolve(env.SUPERAGENT_STATE_DIR ?? join(homedir(), '.superagent-t3')), 'state.sqlite'),
     operator: env.SUPERAGENT_OPERATOR ?? 'operator',
     maxWorkers: Number(env.SUPERAGENT_MAX_WORKERS ?? 3),
     runtimeMode: env.SUPERAGENT_RUNTIME_MODE || undefined,
