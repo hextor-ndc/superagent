@@ -12,6 +12,7 @@ import { z } from 'zod'
 import { threadKey, type Assessor, type Candidate, type Engine, type Ticket, type WorkerReport } from '../../vendor/dsh/src/core/index.ts'
 import type { Settings } from '../../vendor/dsh/src/policy.ts'
 import type { TicketView } from '../app/runtime.ts'
+import type { Health } from '../app/health.ts'
 import type { Store } from '../app/store.ts'
 import { policySection, routerInstructions } from './prompt.ts'
 import { routerTools, type RouterTool } from './tools.ts'
@@ -41,6 +42,7 @@ export interface ClaudeRouterOptions {
   /** Queues work after the Engine's transaction commits. */
   defer: (run: () => void) => void
   log?: (message: string, error?: unknown) => void
+  health?: Health
 }
 
 interface Item { id: string; text: string; evalId?: string }
@@ -61,6 +63,8 @@ export class ClaudeRouter implements Router {
   }
 
   start(): void { this.kick() }
+  /** How many items wait for the Router, and whether it is working on a batch now. */
+  state(): { waiting: number; working: boolean } { return { waiting: this.inbox().length, working: !!this.running } }
   async stop(): Promise<void> { this.closed = true; await this.running?.catch(() => {}) }
 
   // The Assessor port: called inside the Engine's transaction, so only the inbox changes here.
@@ -97,7 +101,10 @@ export class ClaudeRouter implements Router {
   /** Starts a turn unless one runs; a running turn takes what arrives meanwhile. */
   private kick(): void {
     if (this.running || this.closed || this.options.settings().paused || !this.inbox().length) return
-    this.running = this.turn().catch(error => this.options.log?.('the Router turn failed', error)).finally(() => {
+    this.running = this.turn().then(() => this.options.health?.ok('router'), error => {
+      this.options.log?.('the Router turn failed', error)
+      this.options.health?.fail('router', error)
+    }).finally(() => {
       this.running = undefined
       if (this.inbox().length) setTimeout(() => this.kick(), 1000)
     })

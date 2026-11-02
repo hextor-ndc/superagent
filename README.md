@@ -21,6 +21,7 @@ See [PLAN.md](PLAN.md) for the design, the phases and what is still approximate.
 2. **A pinned "Superagent" thread.** This is the console: ask it what needs you, start requests, answer questions, stop or retry work.
 3. **An attention queue.** In the console, `superagent_attention` draws an interactive queue (an MCP App, which renders with Codex). The same view is at `/panel/<console token>` for t3code's browser tab.
 4. **Links back.** Every acknowledgement and result the super agent posts ends with **Open in T3 Code**.
+5. **A "Superagent Watchdog" thread.** Its agent schedules its own checks with t3code's scheduler, so it keeps checking even when the super agent is down. It checks the health of t3code, GitHub, the Router and the job queues, and whether each worker is making real progress. It can nudge a looping worker or retry a failed one; anything else becomes an alert in the console's attention queue. Only a person stops a ticket.
 
 ## Run it
 
@@ -72,6 +73,7 @@ It prints the console thread and the panel URL. Open the **Superagent** thread i
 | `SUPERAGENT_ROUTER` | `claude` with Anthropic credentials, else `rules` | `rules` only accepts explicit requests and relays results |
 | `SUPERAGENT_ROUTER_MODEL` / `SUPERAGENT_ROUTER_EFFORT` | `claude-opus-5-5` / `medium` | The Router's model and effort |
 | `SUPERAGENT_ACCEPT_MODE` | `observe` | Proactive work: `off`, `observe` (record what it would do) or `auto` |
+| `SUPERAGENT_WATCHDOG_MINUTES` | `15` | Minutes between Watchdog checks; `0` turns it off |
 
 The Router reads Anthropic credentials the way the SDK does: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or an `ant auth login` profile. It sends the default server-side refusal fallback (`fallbacks: "default"`), so a declined request is retried on a fallback model.
 

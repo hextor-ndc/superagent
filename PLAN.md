@@ -54,7 +54,7 @@ DeepSeek's prototype supplies the control plane: Source → Trigger → Thread �
 | --- | --- | --- |
 | 1 | Vendored core; t3code client; T3Executor; worker and console MCP server; attention app; links; token auth; tests against a fake t3code | done |
 | 2 | SQLite store and restart recovery; GitHub Source and Channel; the Router as a Claude session in the control plane, with batching; OAuth `connect` | done |
-| 3 | Watchdog as a scheduled t3code thread; several machines (one `t3 serve` each, plus a cloud control plane); per-machine tokens and project allowlists | later |
+| 3 | Watchdog as a scheduled t3code thread (done); several machines (one `t3 serve` each, plus a cloud control plane); per-machine tokens and project allowlists | in progress |
 | 4 | Acceptance test: the paper's synthetic workload (~300 messages, ~20 requests) using t3code's Replay test provider | later |
 
 ## Phase 2 notes

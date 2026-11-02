@@ -17,6 +17,7 @@ import { InterimRouter } from './interim-router.ts'
 import { ClaudeRouter, type ModelCall, type Router } from '../router/claude-router.ts'
 import { Jobs } from './jobs.ts'
 import { StoredOutbox } from './outbox.ts'
+import { Health } from './health.ts'
 import { Store } from './store.ts'
 
 export interface TicketView {
@@ -36,15 +37,22 @@ export class Runtime {
   settings: Settings
   /** The Superagent console thread in t3code, once it exists. */
   console?: { threadId: string; link?: string }
+  /** The Watchdog thread in t3code, once it exists. */
+  watchdog?: { threadId: string; link?: string }
+  private watchdogTimer?: NodeJS.Timeout
   private pass?: NodeJS.Timeout
   readonly events: DomainEvent[] = []
+  readonly health = new Health()
 
   constructor(readonly config: Config, readonly t3: T3Client, project: { id: string; root: string },
     timing: Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs'> = {}, deps: { gh?: Gh; model?: ModelCall } = {}) {
     const log = config.log
     this.repo = new Store(config.database, error => log('after-commit work failed', error))
     const defer = (run: () => void) => this.repo.afterCommit(run)
-    this.jobs = new Jobs((key, error, final) => log(`${key} failed${final ? ' for the last time' : ''}`, error), defer)
+    this.jobs = new Jobs((key, error, final) => {
+      log(`${key} failed${final ? ' for the last time' : ''}`, error)
+      this.health.fail(`jobs:${key.split(':')[0]}`, error)
+    }, defer)
     const saved = this.repo.kv.get<{ paused?: boolean }>('settings')
     this.settings = SettingsSchema.parse({
       paused: saved?.paused ?? false,
@@ -55,9 +63,10 @@ export class Runtime {
       executor: { maxWorkers: config.maxWorkers },
     })
     this.console = this.repo.kv.get('console')
+    this.watchdog = this.repo.kv.get('watchdog')
     if (config.github && config.repository) {
       this.github = new GithubSource({ gh: deps.gh ?? ghCli(config.github.gh), repository: config.repository, login: config.github.login,
-        engine: () => this.engine, store: this.repo, pollMs: config.github.pollMs, log })
+        engine: () => this.engine, store: this.repo, pollMs: config.github.pollMs, log, health: this.health })
     }
     const scope: SourceScope = {
       scope: ({ source, meta }) => source === CONSOLE ? { listened: true, observed: false, row: 'console' }
@@ -67,7 +76,7 @@ export class Runtime {
       t3, repo: this.repo, engine: () => this.engine, settings: () => this.settings,
       project: { ...project, repository: config.repository }, worktreeRoot: config.worktreeRoot, baseRef: config.baseRef,
       workerUrl: token => `${config.publicUrl}/mcp/worker/${token}`, maxWorkers: () => this.settings.executor.maxWorkers,
-      runtimeMode: config.runtimeMode, log, defer, ...timing,
+      runtimeMode: config.runtimeMode, log, defer, health: this.health, ...timing,
       ...config.github ? { account: { login: config.github.login, commitEmail: config.github.commitEmail } } : {},
       state: { load: () => this.repo.kv.list<TicketThread>('ticket-thread:'), save: entry => this.repo.kv.set(`ticket-thread:${entry.ticketId}`, entry) },
     })
@@ -77,7 +86,7 @@ export class Runtime {
     if (this.github) { const github = this.github; this.outbox.register(GITHUB, message => github.send(message)) }
     this.router = config.router.kind === 'claude'
       ? new ClaudeRouter({ engine: () => this.engine, store: this.repo, settings: () => this.settings, view: ticket => this.view(ticket),
-        model: config.router.model, effort: config.router.effort, defer, log, ...deps.model ? { call: deps.model } : {} })
+        model: config.router.model, effort: config.router.effort, defer, log, health: this.health, ...deps.model ? { call: deps.model } : {} })
       : new InterimRouter(this.jobs, () => this.engine, log)
     this.engine = new Engine({
       repo: this.repo, policy: () => settingsPolicy(this.settings, scope), scope, assessor: this.router, executor: this.executor,
@@ -98,6 +107,7 @@ export class Runtime {
   }
   async stop(): Promise<void> {
     clearInterval(this.pass)
+    clearInterval(this.watchdogTimer)
     this.github?.stop()
     await this.router.stop?.()
     await this.executor.close()
@@ -129,6 +139,45 @@ export class Runtime {
     }
   }
   consoleUrl(): string { return `${this.config.publicUrl}/mcp/console/${this.config.consoleToken}` }
+  /** The Watchdog's own token, derived from the console's so it never opens the console's tools. */
+  watchdogToken(): string { return createHash('sha256').update(`watchdog:${this.config.consoleToken}`).digest('base64url').slice(0, 32) }
+  watchdogUrl(): string { return `${this.config.publicUrl}/mcp/watchdog/${this.watchdogToken()}` }
+
+  /**
+   * Phase 3: the Watchdog thread. Its first message tells its agent to schedule its own checks with t3code's `schedule_task`,
+   * bound to its thread, so t3code wakes it whether or not this service runs: a check that cannot reach the super agent is
+   * itself the alarm. In the other direction, when check-ins stop, this service asks the Watchdog to check and re-arm.
+   */
+  async ensureWatchdog(): Promise<void> {
+    const minutes = this.config.watchdogMinutes
+    if (!minutes) return
+    const requestId = `superagent-watchdog:${createHash('sha256').update(this.config.consoleToken).digest('hex').slice(0, 16)}`
+    const launched = await this.t3.launchScratch({ title: 'Superagent Watchdog', clientRequestId: requestId })
+    this.watchdog = { threadId: launched.threadId, link: launched.link }
+    this.repo.kv.set('watchdog', this.watchdog)
+    const detail = await this.t3.read(launched.threadId, { limit: 1 })
+    if (detail.thread.worktreePath) await writeMcpConfig(detail.thread.worktreePath, this.watchdogUrl())
+    else this.config.log(`The Watchdog thread has no folder; add its MCP server by hand: ${MCP_SERVER_NAME} ${this.watchdogUrl()}`)
+    if (!detail.items.length) {
+      await this.t3.send(launched.threadId, watchdogSetup(minutes), `${requestId}:setup`, 'queue')
+        .catch(error => this.config.log('setting up the Watchdog failed', error))
+    }
+    const since = Date.now()
+    clearInterval(this.watchdogTimer)
+    this.watchdogTimer = setInterval(() => { void this.checkWatchdog(since).catch(error => this.config.log('checking the Watchdog failed', error)) },
+      minutes * 60_000)
+  }
+
+  /** Re-arms a Watchdog whose check-ins stopped for more than two and a half intervals. */
+  async checkWatchdog(since: number, now = Date.now()): Promise<boolean> {
+    const window = this.config.watchdogMinutes * 60_000 * 2.5
+    const last = this.repo.kv.get<string>('watchdog:last-check')
+    const quiet = now - Math.max(last ? Date.parse(last) : 0, since)
+    if (!this.watchdog || quiet <= window) { this.health.ok('watchdog'); return false }
+    this.health.fail('watchdog', `no check-in for ${Math.round(quiet / 60_000)} minutes`)
+    await this.t3.send(this.watchdog.threadId, WATCHDOG_REARM, `superagent-watchdog:rearm:${Math.floor(now / window)}`, 'auto')
+    return true
+  }
   panelUrl(): string { return `${this.config.publicUrl}/panel/${this.config.consoleToken}` }
 
   // Reads for the console and the panel.
@@ -156,11 +205,42 @@ export class Runtime {
 
 export const newToken = (): string => randomBytes(24).toString('base64url')
 
+function watchdogSetup(minutes: number): string {
+  return [
+    'You are the Watchdog of the superagent: the external control loop that keeps it healthy over long runs. You are not part of it,',
+    'and you do no ticket work.',
+    '',
+    `First, schedule your own checks: call the T3 Code tool schedule_task with title "Superagent watchdog check", schedule {type: "interval", everyMs: ${minutes * 60_000}},`,
+    'bindToCurrentThread true, and the prompt "Run the superagent watchdog check." Check list_scheduled_tasks first and do not create a second one.',
+    '',
+    'In every check:',
+    '1. Call watchdog_check (superagent MCP server). If the server cannot be reached at all, the superagent is down: say so in one line',
+    '   in this thread, which is the operator’s alarm, and stop.',
+    '2. Infrastructure: for each part in `failing` (t3code, github, router, watchdog, jobs:*), tell a passing fault from a lasting one.',
+    '   Raise watchdog_alert once for a part failing across two checks.',
+    '3. Progress: for each open ticket with running_turn and minutes_running above 30, or minutes_since_activity above 60 while working,',
+    '   read watchdog_thread and judge whether the worker makes real progress toward its assignment, or loops (the same failing',
+    '   command, the same edit back and forth) or drifts beyond its scope. Nudge a looping or drifting worker once with watchdog_nudge,',
+    '   naming what it repeats and what to do instead. If an earlier nudge did not help, raise watchdog_alert recommending a stop:',
+    '   never stop a ticket yourself.',
+    '4. Failed or undelivered tickets: watchdog_retry only when the cause was passing and is gone, and only once per ticket.',
+    '5. Check watchdog_alerts so you never raise the same alert twice.',
+    '',
+    'End each check with one line. When everything is healthy, the line is "All healthy." and nothing else. The operator may also ask',
+    'you questions in this thread; answer them from these tools.',
+    '',
+    'Now schedule your checks, then run the first one.',
+  ].join('\n')
+}
+
+const WATCHDOG_REARM = 'The superagent has not seen a Watchdog check for a while. Run the check now, then confirm with list_scheduled_tasks that '
+  + 'your interval task exists and is enabled; create it again as your first message says if not.'
+
 const CONSOLE_INTRO = [
   'This is the Superagent console. You help the operator run the superagent, which works on tickets in their own T3 Code threads.',
   'Use the `superagent` MCP tools: superagent_attention first (what waits for a person), superagent_status, superagent_ticket, '
     + 'superagent_request to start work, superagent_answer to answer a ticket\'s question, superagent_stop, superagent_retry, '
-    + 'superagent_note, superagent_pause and superagent_messages.',
+    + 'superagent_note, superagent_pause, superagent_messages and superagent_dismiss_alert (for the Watchdog\'s alerts).',
   'Keep answers short. Do not do ticket work in this thread: start a request instead, and link each ticket\'s thread when you mention it.',
   'Reply with one line saying you are ready.',
 ].join('\n')

@@ -9,6 +9,7 @@ import { CONSOLE, consoleThread, consoleTrigger } from '../app/console-source.ts
 import type { Runtime } from '../app/runtime.ts'
 import { ATTENTION_URI, MCP_APP_MIME, attentionPage } from './attention-app.ts'
 import { ok } from './result.ts'
+import { alerts, dismissAlert, lastCheck } from './watchdog-tools.ts'
 
 /** The console actions, shared by the MCP tools and the panel's HTTP API. */
 export function consoleActions(runtime: Runtime) {
@@ -24,9 +25,12 @@ export function consoleActions(runtime: Runtime) {
       const open = tickets.filter(view => !view.outcome)
       return { paused: runtime.settings.paused, workers: runtime.executor.load(), open: open.length,
         waiting_for_a_person: open.filter(view => view.stage.startsWith('person/')).length,
-        console: runtime.console?.link, panel: runtime.panelUrl(), recent: tickets.slice(0, 15) }
+        console: runtime.console?.link, panel: runtime.panelUrl(), failing: runtime.health.failing(),
+        watchdog: runtime.watchdog ? { thread: runtime.watchdog.link ?? runtime.watchdog.threadId, last_check: lastCheck(runtime) ?? null } : null,
+        alerts: alerts(runtime).length, recent: tickets.slice(0, 15) }
     },
-    superagent_attention: () => ({ tickets: runtime.attention() }),
+    superagent_attention: () => ({ tickets: runtime.attention(), alerts: alerts(runtime) }),
+    superagent_dismiss_alert: ({ alert_id }: { alert_id: string }) => ({ dismissed: dismissAlert(runtime, alert_id) }),
     superagent_ticket: ({ ticket_id }: { ticket_id: string }) => {
       const found = ticket(ticket_id)
       return { ...runtime.view(found), scope: found.mandate.scope, strength: found.mandate.strength,
@@ -75,9 +79,11 @@ export function consoleServer(runtime: Runtime): McpServer {
     async () => ({ contents: [{ uri: ATTENTION_URI, mimeType: MCP_APP_MIME, text: attentionPage('app') }] }))
 
   server.registerTool('superagent_attention', {
-    description: 'What waits for a person, first: questions to answer, results to review, blocked or failed tickets. Empty means healthy.',
+    description: 'What waits for a person, first: questions to answer, results to review, blocked or failed tickets, and the Watchdog\'s alerts. Empty means healthy.',
     annotations: readOnly, _meta: { ui: { resourceUri: ATTENTION_URI }, 'ui/resourceUri': ATTENTION_URI },
   }, async () => ok(actions.superagent_attention()))
+  server.registerTool('superagent_dismiss_alert', { description: 'Dismiss one of the Watchdog\'s alerts once it is dealt with.',
+    inputSchema: { alert_id: z.string().min(1) } }, async args => ok(actions.superagent_dismiss_alert(args)))
   server.registerTool('superagent_status', { description: 'Overview: open tickets, worker load, pause state and recent tickets.', annotations: readOnly },
     async () => ok(actions.superagent_status()))
   server.registerTool('superagent_ticket', { description: 'One ticket in detail: stage, reports, inputs and messages.', inputSchema: id, annotations: readOnly },

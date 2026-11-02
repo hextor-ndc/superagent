@@ -31,7 +31,7 @@ export async function harness(t3: FakeT3, place: { dir: string; root: string }, 
   const errors: string[] = []
   const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', projectRoot: place.root, worktreeRoot: join(place.dir, 'worktrees'), baseRef: 'HEAD',
     router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' },
-    repository: 'acme/widgets', port: 0, publicUrl: '', consoleToken: 'console-secret', database, operator: 'hector', maxWorkers: 2,
+    repository: 'acme/widgets', port: 0, publicUrl: '', consoleToken: 'console-secret', watchdogMinutes: 0, database, operator: 'hector', maxWorkers: 2,
     log: (message, error) => { errors.push(`${message} ${error instanceof Error ? error.message : error ?? ''}`) }, ...overrides }
   const runtime = new Runtime(config, t3, { id: 'project-1', root: place.root }, { waitMs: 10, idlePollMs: 10, continueAfterMs: 0 }, deps)
   const http = await startHttp(runtime, 0)

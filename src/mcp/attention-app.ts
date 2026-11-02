@@ -40,9 +40,11 @@ async function call(name,args){
   if(MODE==='app'){const r=await rpc('tools/call',{name,arguments:args});if(r&&r.isError)throw new Error((r.content||[]).map(c=>c.text).join(' '));return r&&r.structuredContent}
   const r=await fetch(API+'/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,arguments:args})});
   if(!r.ok)throw new Error(await r.text());return r.json()}
-function render(data){const items=(data&&data.tickets)||[];const list=document.getElementById('list');
-  if(!items.length){list.innerHTML='<div class="empty">Nothing waits for a person.</div>';return}
-  list.innerHTML=items.map(t=>{const action=t.stage.split('/')[1]||t.stage;return '<div class="row" data-id="'+esc(t.id)+'">'
+function render(data){const items=(data&&data.tickets)||[],alerts=(data&&data.alerts)||[];const list=document.getElementById('list');
+  if(!items.length&&!alerts.length){list.innerHTML='<div class="empty">Nothing waits for a person.</div>';return}
+  list.innerHTML=alerts.map(a=>'<div class="row" data-alert="'+esc(a.id)+'"><div class="top"><span class="stage failed">watchdog</span>'
+    +'<span class="id">'+esc(new Date(a.at).toLocaleString())+'</span></div><p class="q">'+esc(a.text)+'</p>'
+    +'<div class="actions"><button data-do="dismiss">Dismiss</button></div></div>').join('')+items.map(t=>{const action=t.stage.split('/')[1]||t.stage;return '<div class="row" data-id="'+esc(t.id)+'">'
     +'<div class="top"><span class="id">'+esc(t.short)+'</span><strong>'+esc(t.title)+'</strong><span class="stage '+esc(action)+'">'+esc(action)+'</span></div>'
     +(t.question?'<p class="q">'+esc(t.question)+'</p>':'')+(t.summary?'<p class="s">'+esc(t.summary)+'</p>':'')
     +'<div class="actions">'+(t.question?'<button data-do="answer">Answer</button>':'')
@@ -50,7 +52,7 @@ function render(data){const items=(data&&data.tickets)||[];const list=document.g
     +'<button data-do="stop">Stop</button>'+(t.link?'<a class="btn" href="'+esc(t.link)+'" target="_blank" rel="noopener">Open thread</a>':'')+'</div></div>'}).join('')}
 async function refresh(){try{render(await call('superagent_attention',{}))}catch(e){document.getElementById('note').textContent=e.message}}
 document.addEventListener('click',async e=>{const b=e.target.closest('button[data-do]');if(!b)return;const row=b.closest('.row'),id=row.dataset.id,what=b.dataset.do;
-  try{if(what==='answer'){let box=row.querySelector('textarea');if(!box){box=document.createElement('textarea');box.rows=3;box.placeholder='Your answer';
+  try{if(what==='dismiss'){await call('superagent_dismiss_alert',{alert_id:row.dataset.alert})}else if(what==='answer'){let box=row.querySelector('textarea');if(!box){box=document.createElement('textarea');box.rows=3;box.placeholder='Your answer';
       row.querySelector('.actions').before(box);b.textContent='Send answer';box.focus();return}
       if(!box.value.trim())return;await call('superagent_answer',{ticket_id:id,text:box.value.trim()})}
     else if(what==='retry')await call('superagent_retry',{ticket_id:id});else if(what==='stop')await call('superagent_stop',{ticket_id:id});

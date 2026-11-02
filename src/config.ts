@@ -28,6 +28,8 @@ export interface Config {
    * explicit requests. `acceptMode` is the Policy's accept mode for proactive work (prototype docs/002).
    */
   router: { kind: 'claude' | 'rules'; model: string; effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; acceptMode: 'off' | 'observe' | 'auto' }
+  /** Minutes between Watchdog checks; 0 turns the Watchdog off. */
+  watchdogMinutes: number
   /** The GitHub Source; off without an agent account. */
   github?: { login: string; allowed: string[]; gh: string; pollMs: number; commitEmail?: string }
   log: (message: string, error?: unknown) => void
@@ -63,6 +65,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       effort: oneOf(env.SUPERAGENT_ROUTER_EFFORT, ['low', 'medium', 'high', 'xhigh', 'max'] as const, 'medium'),
       acceptMode: oneOf(env.SUPERAGENT_ACCEPT_MODE, ['off', 'observe', 'auto'] as const, 'observe'),
     },
+    watchdogMinutes: Number(env.SUPERAGENT_WATCHDOG_MINUTES ?? 15),
     ...env.SUPERAGENT_GITHUB_LOGIN ? { github: {
       login: env.SUPERAGENT_GITHUB_LOGIN,
       allowed: (env.SUPERAGENT_GITHUB_ALLOWED ?? '').split(',').map(login => login.trim()).filter(Boolean),

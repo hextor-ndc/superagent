@@ -15,6 +15,7 @@ import type { EngineForSources, OutboundMessage, ScopeResult, Trigger } from '..
 import { CommentSchema, IssueSchema, SOURCE, commentTrigger, githubAddress, issueTrigger, pullTrigger }
   from '../../vendor/dsh/src/sources/github-trigger.ts'
 import { sameName } from '../../vendor/dsh/src/infra/text.ts'
+import type { Health } from '../app/health.ts'
 import type { Store } from '../app/store.ts'
 
 export { SOURCE as GITHUB }
@@ -46,6 +47,7 @@ export interface GithubOptions {
   store: Pick<Store, 'kv' | 'threads' | 'tickets'>
   pollMs?: number
   log?: (message: string, error?: unknown) => void
+  health?: Health
 }
 
 const ReviewCommentSchema = CommentSchema.extend({ pull_request_url: z.string().nullish() })
@@ -76,7 +78,10 @@ export class GithubSource {
 
   /** One poll; overlapping calls share it. */
   poll(): Promise<void> {
-    this.polling ??= this.pollOnce().catch(error => this.options.log?.('polling GitHub failed', error)).finally(() => { this.polling = undefined })
+    this.polling ??= this.pollOnce().then(() => this.options.health?.ok('github'), error => {
+      this.options.log?.('polling GitHub failed', error)
+      this.options.health?.fail('github', error)
+    }).finally(() => { this.polling = undefined })
     return this.polling
   }
 

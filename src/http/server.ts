@@ -12,6 +12,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { Runtime } from '../app/runtime.ts'
 import { attentionPage } from '../mcp/attention-app.ts'
 import { consoleActions, consoleServer, type ConsoleAction } from '../mcp/console-tools.ts'
+import { watchdogServer } from '../mcp/watchdog-tools.ts'
 import { workerServer } from '../mcp/worker-tools.ts'
 
 const MAX_BODY = 1024 * 1024
@@ -43,6 +44,10 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
   if (area === 'mcp' && kind === 'console' && token) {
     if (!same(token, runtime.config.consoleToken)) return send(res, 401, { error: 'unknown console token' })
     return serveMcp(consoleServer(runtime), req, res)
+  }
+  if (area === 'mcp' && kind === 'watchdog' && token) {
+    if (!same(token, runtime.watchdogToken())) return send(res, 401, { error: 'unknown watchdog token' })
+    return serveMcp(watchdogServer(runtime), req, res)
   }
   if (area === 'panel' && kind) {
     if (!same(kind, runtime.config.consoleToken)) return send(res, 401, { error: 'unknown console token' })

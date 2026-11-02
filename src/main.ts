@@ -41,6 +41,7 @@ async function run(): Promise<void> {
   const http = await startHttp(runtime, config.port)
   runtime.start()
   await runtime.ensureConsole()
+  await runtime.ensureWatchdog().catch(error => log(`starting the Watchdog failed: ${error instanceof Error ? error.message : String(error)}`))
   log(`ready: router ${config.router.kind}${config.github ? `, GitHub ${config.repository} as ${config.github.login}` : ''}; `
     + `console ${runtime.console?.link ?? runtime.console?.threadId}, panel ${runtime.panelUrl()}`)
 

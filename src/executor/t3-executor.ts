@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { latestAssignment, liveTicket, runningAssignment, waitsForPerson, type AssessmentOutcome, type Assignment, type EngineForExecutor,
   type Executor, type Repositories, type Ticket, type TicketInput } from '../../vendor/dsh/src/core/index.ts'
 import type { Settings } from '../../vendor/dsh/src/policy.ts'
+import type { Health } from '../app/health.ts'
 import { Jobs, Later } from '../app/jobs.ts'
 import { T3Error, TERMINAL, type T3Client } from '../t3/client.ts'
 import { assignmentMessage, inputMessage, threadTitle, ticketName, type ExecutionVariables } from './render.ts'
@@ -56,6 +57,8 @@ export interface T3ExecutorOptions {
   /** The first pause before a worker whose turn failed is told to go on; it doubles each time. */
   continueAfterMs?: number
   log?: (message: string, error?: unknown) => void
+  /** Where t3code's reachability is reported, for the Watchdog. */
+  health?: Health
   /** Where each Ticket's thread record survives a restart. */
   state?: { load(): TicketThread[]; save(entry: TicketThread): void }
   /** Queues work once the Engine's transaction commits (`Store.afterCommit`); at once without one. */
@@ -73,13 +76,18 @@ export class T3Executor implements Executor {
   private readonly threads = new Map<string, TicketThread>()
   /** Tickets whose thread runs a turn, which holds a worker slot. */
   private readonly busy = new Set<string>()
+  /** When each busy Ticket's current turn was first seen running, for the Watchdog. */
+  private readonly busyAt = new Map<string, string>()
   private readonly watching = new Map<string, AbortController>()
   /** Stops in flight, by Ticket: a new launch of the same Ticket waits for them, so an interrupt never lands on its new turn. */
   private readonly stopping = new Map<string, Promise<void>>()
   private closed = false
 
   constructor(private readonly options: T3ExecutorOptions) {
-    this.jobs = new Jobs((key, error, final) => options.log?.(`${key} failed${final ? ' for the last time' : ''}`, error), options.defer)
+    this.jobs = new Jobs((key, error, final) => {
+      options.log?.(`${key} failed${final ? ' for the last time' : ''}`, error)
+      options.health?.fail(`jobs:${key.split(':')[0]}`, error)
+    }, options.defer)
     this.slots = new WorkerSlots(() => [...this.busy], options.maxWorkers)
     for (const entry of options.state?.load() ?? []) this.threads.set(entry.ticketId, entry)
   }
@@ -126,6 +134,12 @@ export class T3Executor implements Executor {
     for (const entry of this.threads.values()) if (entry.token === token) return entry.ticketId
     return undefined
   }
+  private markBusy(ticketId: string): void {
+    this.busy.add(ticketId)
+    if (!this.busyAt.has(ticketId)) this.busyAt.set(ticketId, new Date().toISOString())
+  }
+  /** Since when a Ticket's worker has been running its current turn; undefined while it is idle. */
+  busySince(ticketId: string): string | undefined { return this.busy.has(ticketId) ? this.busyAt.get(ticketId) : undefined }
   /** Worker slots in use, for the console. */
   load(): { used: number; max: number } { return { used: this.slots.used(), max: this.options.maxWorkers() } }
 
@@ -142,7 +156,7 @@ export class T3Executor implements Executor {
     this.jobs.enqueue(`stop:${ticket.id}:${assignment.id}`, async () => {
       try {
         this.watching.get(ticket.id)?.abort(); this.watching.delete(ticket.id)
-        this.busy.delete(ticket.id); this.slots.free(ticket.id); this.slotFreed()
+        this.busy.delete(ticket.id); this.busyAt.delete(ticket.id); this.slots.free(ticket.id); this.slotFreed()
         const entry = this.threads.get(ticket.id)
         if (!entry?.threadId) return
         // An ended Ticket's thread stops as its Stop button does. A Ticket that goes on (a retry or a restart) only has its
@@ -201,7 +215,7 @@ export class T3Executor implements Executor {
       }
       entry.failures = 0
       this.save(entry)
-      this.busy.add(ticketId)
+      this.markBusy(ticketId)
       this.options.engine().assignmentStarted(ticketId, assignmentId)
       this.watch(ticketId, assignmentId)
     } catch (error) {
@@ -225,7 +239,7 @@ export class T3Executor implements Executor {
         .join('\n\n')
       const ids = inputs.map(input => input.id)
       if (text) await this.options.t3.send(entry.threadId, text, `deliver:${assignmentId}:${ids.join(',')}`.slice(0, 256))
-      this.busy.add(ticketId)
+      this.markBusy(ticketId)
       entry.unread.push(...ids.filter(id => !entry.unread.includes(id)))
       this.save(entry)
       this.options.engine().inputsDelivered(ticketId, assignmentId, ids)
@@ -254,7 +268,10 @@ export class T3Executor implements Executor {
           const result = await t3.wait(entry.threadId, this.options.waitMs ?? 30_000)
           if (controller.signal.aborted) break
           if (!result.timedOut && TERMINAL.has(result.status)) {
-            if (this.busy.delete(ticketId) || (result.runId && result.runId !== entry.endedRunId)) {
+            this.options.health?.ok('t3code')
+            const wasBusy = this.busy.delete(ticketId)
+            this.busyAt.delete(ticketId)
+            if (wasBusy || (result.runId && result.runId !== entry.endedRunId)) {
               this.slotFreed()
               if (controller.signal.aborted || this.stopping.has(ticketId)) break
               if (result.status === 'interrupted') {
@@ -268,10 +285,11 @@ export class T3Executor implements Executor {
               this.turnEnded(ticketId, assignmentId, entry, result.runId)
             }
             await sleep(this.options.idlePollMs ?? 5000, controller.signal)
-          } else this.busy.add(ticketId)
+          } else { this.options.health?.ok('t3code'); this.markBusy(ticketId) }
         } catch (error) {
           if (controller.signal.aborted) break
           this.options.log?.(`watching ${ticketId} failed`, error)
+          this.options.health?.fail('t3code', error)
           await sleep(5000, controller.signal)
         }
       }
@@ -296,7 +314,7 @@ export class T3Executor implements Executor {
     try {
       await this.options.t3.send(entry.threadId!, 'Your previous turn failed with an error. Go on with the assignment from where it stopped.',
         `continue:${assignmentId}:${entry.failures}`)
-      this.busy.add(ticketId)
+      this.markBusy(ticketId)
       return true
     } catch (error) {
       this.options.log?.(`telling ${ticketId} to go on failed`, error)
