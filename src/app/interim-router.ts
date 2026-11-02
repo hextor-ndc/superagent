@@ -5,10 +5,11 @@
  * - proactive (inferred) candidates are ignored, so nothing proactive happens without the real Router;
  * - a worker's `ready` report goes back to the requester as the result, and its question as the attention message.
  */
-import type { Assessor, Candidate, EngineForMainSession, Ticket, Trigger, WorkerReport } from '../../vendor/dsh/src/core/index.ts'
+import type { Candidate, EngineForMainSession, Ticket, Trigger, WorkerReport } from '../../vendor/dsh/src/core/index.ts'
+import type { Router } from '../router/claude-router.ts'
 import type { Jobs } from './jobs.ts'
 
-export class InterimRouter implements Assessor {
+export class InterimRouter implements Router {
   constructor(private readonly jobs: Jobs, private readonly engine: () => Pick<EngineForMainSession, 'candidateDelivered' | 'decide' | 'reply'>,
     private readonly log: (message: string, error?: unknown) => void = () => {}) {}
 

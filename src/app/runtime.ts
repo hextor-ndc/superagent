@@ -14,6 +14,7 @@ import type { T3Client } from '../t3/client.ts'
 import { GITHUB, GithubSource, ghCli, type Gh } from '../sources/github.ts'
 import { CONSOLE } from './console-source.ts'
 import { InterimRouter } from './interim-router.ts'
+import { ClaudeRouter, type ModelCall, type Router } from '../router/claude-router.ts'
 import { Jobs } from './jobs.ts'
 import { StoredOutbox } from './outbox.ts'
 import { Store } from './store.ts'
@@ -29,7 +30,7 @@ export class Runtime {
   readonly engine: Engine
   readonly executor: T3Executor
   readonly outbox: StoredOutbox
-  readonly router: InterimRouter
+  readonly router: Router
   /** The GitHub Source, when an agent account is configured. */
   readonly github?: GithubSource
   settings: Settings
@@ -39,7 +40,7 @@ export class Runtime {
   readonly events: DomainEvent[] = []
 
   constructor(readonly config: Config, readonly t3: T3Client, project: { id: string; root: string },
-    timing: Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs'> = {}, deps: { gh?: Gh } = {}) {
+    timing: Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs'> = {}, deps: { gh?: Gh; model?: ModelCall } = {}) {
     const log = config.log
     this.repo = new Store(config.database, error => log('after-commit work failed', error))
     const defer = (run: () => void) => this.repo.afterCommit(run)
@@ -49,8 +50,8 @@ export class Runtime {
       paused: saved?.paused ?? false,
       policy: { sources: { [CONSOLE]: { allowed: [{ id: config.operator }] },
         ...config.github ? { [GITHUB]: { allowed: config.github.allowed.map(id => ({ id })) } } : {} } },
-      // Proactive work stays off until the model-backed Router exists (phase 2).
-      eval: { mode: 'off' },
+      // The rule-based Router cannot judge proactive work, so it stays off there.
+      eval: { mode: config.router.kind === 'claude' ? config.router.acceptMode : 'off' },
       executor: { maxWorkers: config.maxWorkers },
     })
     this.console = this.repo.kv.get('console')
@@ -74,7 +75,10 @@ export class Runtime {
     // Console messages are kept for the console to show; they never leave this process.
     this.outbox.register(CONSOLE, async () => 'sent')
     if (this.github) { const github = this.github; this.outbox.register(GITHUB, message => github.send(message)) }
-    this.router = new InterimRouter(this.jobs, () => this.engine, log)
+    this.router = config.router.kind === 'claude'
+      ? new ClaudeRouter({ engine: () => this.engine, store: this.repo, settings: () => this.settings, view: ticket => this.view(ticket),
+        model: config.router.model, effort: config.router.effort, defer, log, ...deps.model ? { call: deps.model } : {} })
+      : new InterimRouter(this.jobs, () => this.engine, log)
     this.engine = new Engine({
       repo: this.repo, policy: () => settingsPolicy(this.settings, scope), scope, assessor: this.router, executor: this.executor,
       outbox: this.outbox, prepareTicket: (ticket, outcome) => this.executor.prepare(ticket, outcome),
@@ -87,6 +91,7 @@ export class Runtime {
     this.executor.resume()
     this.outbox.resume()
     this.github?.start()
+    this.router.start?.()
     this.pass = setInterval(() => {
       try { this.engine.evaluateDue() } catch (error) { this.config.log('pass failed', error) }
     }, 1000)
@@ -94,6 +99,7 @@ export class Runtime {
   async stop(): Promise<void> {
     clearInterval(this.pass)
     this.github?.stop()
+    await this.router.stop?.()
     await this.executor.close()
     this.jobs.close()
     this.repo.close()

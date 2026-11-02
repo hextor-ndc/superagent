@@ -21,6 +21,11 @@ export interface Config {
   operator: string
   maxWorkers: number
   runtimeMode?: string
+  /**
+   * The Router: `claude`, the model-backed Router, whenever Anthropic credentials are set; otherwise `rules`, which only accepts
+   * explicit requests. `acceptMode` is the Policy's accept mode for proactive work (prototype docs/002).
+   */
+  router: { kind: 'claude' | 'rules'; model: string; effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; acceptMode: 'off' | 'observe' | 'auto' }
   /** The GitHub Source; off without an agent account. */
   github?: { login: string; allowed: string[]; gh: string; pollMs: number; commitEmail?: string }
   log: (message: string, error?: unknown) => void
@@ -49,6 +54,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     operator: env.SUPERAGENT_OPERATOR ?? 'operator',
     maxWorkers: Number(env.SUPERAGENT_MAX_WORKERS ?? 3),
     runtimeMode: env.SUPERAGENT_RUNTIME_MODE || undefined,
+    router: {
+      kind: (env.SUPERAGENT_ROUTER ?? (env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_PROFILE ? 'claude' : 'rules')) === 'claude' ? 'claude' : 'rules',
+      model: env.SUPERAGENT_ROUTER_MODEL ?? 'claude-opus-5-5',
+      effort: oneOf(env.SUPERAGENT_ROUTER_EFFORT, ['low', 'medium', 'high', 'xhigh', 'max'] as const, 'medium'),
+      acceptMode: oneOf(env.SUPERAGENT_ACCEPT_MODE, ['off', 'observe', 'auto'] as const, 'observe'),
+    },
     ...env.SUPERAGENT_GITHUB_LOGIN ? { github: {
       login: env.SUPERAGENT_GITHUB_LOGIN,
       allowed: (env.SUPERAGENT_GITHUB_ALLOWED ?? '').split(',').map(login => login.trim()).filter(Boolean),
@@ -58,4 +69,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     } } : {},
     log: (message, error) => console.error(`[superagent] ${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`),
   }
+}
+
+function oneOf<T extends string>(value: string | undefined, allowed: readonly T[], fallback: T): T {
+  if (value === undefined || value === '') return fallback
+  if (!(allowed as readonly string[]).includes(value)) throw new Error(`Expected one of ${allowed.join(', ')}, got ${value}`)
+  return value as T
 }
