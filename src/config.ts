@@ -21,6 +21,8 @@ export interface Config {
   operator: string
   maxWorkers: number
   runtimeMode?: string
+  /** The GitHub Source; off without an agent account. */
+  github?: { login: string; allowed: string[]; gh: string; pollMs: number; commitEmail?: string }
   log: (message: string, error?: unknown) => void
 }
 
@@ -47,6 +49,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     operator: env.SUPERAGENT_OPERATOR ?? 'operator',
     maxWorkers: Number(env.SUPERAGENT_MAX_WORKERS ?? 3),
     runtimeMode: env.SUPERAGENT_RUNTIME_MODE || undefined,
+    ...env.SUPERAGENT_GITHUB_LOGIN ? { github: {
+      login: env.SUPERAGENT_GITHUB_LOGIN,
+      allowed: (env.SUPERAGENT_GITHUB_ALLOWED ?? '').split(',').map(login => login.trim()).filter(Boolean),
+      gh: env.SUPERAGENT_GH || 'gh',
+      pollMs: Number(env.SUPERAGENT_GITHUB_POLL_SECONDS ?? 30) * 1000,
+      ...env.SUPERAGENT_GITHUB_COMMIT_EMAIL ? { commitEmail: env.SUPERAGENT_GITHUB_COMMIT_EMAIL } : {},
+    } } : {},
     log: (message, error) => console.error(`[superagent] ${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`),
   }
 }

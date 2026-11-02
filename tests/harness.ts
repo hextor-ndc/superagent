@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { Runtime } from '../src/app/runtime.ts'
 import type { Config } from '../src/config.ts'
 import { startHttp } from '../src/http/server.ts'
+import type { Gh } from '../src/sources/github.ts'
 import { FakeT3 } from './fake-t3.ts'
 
 export const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
@@ -24,12 +25,13 @@ export function checkout(): { dir: string; root: string } {
 
 export interface Harness { runtime: Runtime; http: Server; base: string; errors: string[]; close(): Promise<void> }
 
-export async function harness(t3: FakeT3, place: { dir: string; root: string }, database = ':memory:', overrides: Partial<Config> = {}): Promise<Harness> {
+export async function harness(t3: FakeT3, place: { dir: string; root: string }, database = ':memory:', overrides: Partial<Config> = {},
+  deps: { gh?: Gh } = {}): Promise<Harness> {
   const errors: string[] = []
   const config: Config = { t3Url: 'unused', t3Token: 'unused', projectRoot: place.root, worktreeRoot: join(place.dir, 'worktrees'), baseRef: 'HEAD',
     repository: 'acme/widgets', port: 0, publicUrl: '', consoleToken: 'console-secret', database, operator: 'hector', maxWorkers: 2,
     log: (message, error) => { errors.push(`${message} ${error instanceof Error ? error.message : error ?? ''}`) }, ...overrides }
-  const runtime = new Runtime(config, t3, { id: 'project-1', root: place.root }, { waitMs: 10, idlePollMs: 10, continueAfterMs: 0 })
+  const runtime = new Runtime(config, t3, { id: 'project-1', root: place.root }, { waitMs: 10, idlePollMs: 10, continueAfterMs: 0 }, deps)
   const http = await startHttp(runtime, 0)
   const base = `http://127.0.0.1:${(http.address() as AddressInfo).port}`
   // The public URL is known once the server listens; the runtime reads it whenever it builds a URL.

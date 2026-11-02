@@ -11,6 +11,7 @@ import { T3Executor, type T3ExecutorOptions, type TicketThread } from '../execut
 import { MCP_SERVER_NAME, writeMcpConfig } from '../executor/workspace.ts'
 import { shortId } from '../executor/render.ts'
 import type { T3Client } from '../t3/client.ts'
+import { GITHUB, GithubSource, ghCli, type Gh } from '../sources/github.ts'
 import { CONSOLE } from './console-source.ts'
 import { InterimRouter } from './interim-router.ts'
 import { Jobs } from './jobs.ts'
@@ -29,6 +30,8 @@ export class Runtime {
   readonly executor: T3Executor
   readonly outbox: StoredOutbox
   readonly router: InterimRouter
+  /** The GitHub Source, when an agent account is configured. */
+  readonly github?: GithubSource
   settings: Settings
   /** The Superagent console thread in t3code, once it exists. */
   console?: { threadId: string; link?: string }
@@ -36,7 +39,7 @@ export class Runtime {
   readonly events: DomainEvent[] = []
 
   constructor(readonly config: Config, readonly t3: T3Client, project: { id: string; root: string },
-    timing: Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs'> = {}) {
+    timing: Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs'> = {}, deps: { gh?: Gh } = {}) {
     const log = config.log
     this.repo = new Store(config.database, error => log('after-commit work failed', error))
     const defer = (run: () => void) => this.repo.afterCommit(run)
@@ -44,25 +47,33 @@ export class Runtime {
     const saved = this.repo.kv.get<{ paused?: boolean }>('settings')
     this.settings = SettingsSchema.parse({
       paused: saved?.paused ?? false,
-      policy: { sources: { [CONSOLE]: { allowed: [{ id: config.operator }] } } },
+      policy: { sources: { [CONSOLE]: { allowed: [{ id: config.operator }] },
+        ...config.github ? { [GITHUB]: { allowed: config.github.allowed.map(id => ({ id })) } } : {} } },
       // Proactive work stays off until the model-backed Router exists (phase 2).
       eval: { mode: 'off' },
       executor: { maxWorkers: config.maxWorkers },
     })
     this.console = this.repo.kv.get('console')
+    if (config.github && config.repository) {
+      this.github = new GithubSource({ gh: deps.gh ?? ghCli(config.github.gh), repository: config.repository, login: config.github.login,
+        engine: () => this.engine, store: this.repo, pollMs: config.github.pollMs, log })
+    }
     const scope: SourceScope = {
-      scope: ({ source }) => source === CONSOLE ? { listened: true, observed: false, row: 'console' } : { listened: false, reason: 'source_off' },
+      scope: ({ source, meta }) => source === CONSOLE ? { listened: true, observed: false, row: 'console' }
+        : source === GITHUB && this.github ? this.github.scope(meta) : { listened: false, reason: 'source_off' },
     }
     this.executor = new T3Executor({
       t3, repo: this.repo, engine: () => this.engine, settings: () => this.settings,
       project: { ...project, repository: config.repository }, worktreeRoot: config.worktreeRoot, baseRef: config.baseRef,
       workerUrl: token => `${config.publicUrl}/mcp/worker/${token}`, maxWorkers: () => this.settings.executor.maxWorkers,
       runtimeMode: config.runtimeMode, log, defer, ...timing,
+      ...config.github ? { account: { login: config.github.login, commitEmail: config.github.commitEmail } } : {},
       state: { load: () => this.repo.kv.list<TicketThread>('ticket-thread:'), save: entry => this.repo.kv.set(`ticket-thread:${entry.ticketId}`, entry) },
     })
     this.outbox = new StoredOutbox(this.repo.kv, this.jobs, ticketId => this.executor.thread(ticketId)?.link)
     // Console messages are kept for the console to show; they never leave this process.
     this.outbox.register(CONSOLE, async () => 'sent')
+    if (this.github) { const github = this.github; this.outbox.register(GITHUB, message => github.send(message)) }
     this.router = new InterimRouter(this.jobs, () => this.engine, log)
     this.engine = new Engine({
       repo: this.repo, policy: () => settingsPolicy(this.settings, scope), scope, assessor: this.router, executor: this.executor,
@@ -75,12 +86,14 @@ export class Runtime {
   start(): void {
     this.executor.resume()
     this.outbox.resume()
+    this.github?.start()
     this.pass = setInterval(() => {
       try { this.engine.evaluateDue() } catch (error) { this.config.log('pass failed', error) }
     }, 1000)
   }
   async stop(): Promise<void> {
     clearInterval(this.pass)
+    this.github?.stop()
     await this.executor.close()
     this.jobs.close()
     this.repo.close()

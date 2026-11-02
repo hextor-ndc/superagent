@@ -54,6 +54,8 @@ export function workerServer(runtime: Runtime, ticketId: string): McpServer {
     if (args.pr_url && thread?.threadId) {
       await runtime.t3.linkPullRequests(thread.threadId, [args.pr_url]).catch(error => runtime.config.log('linking the PR failed', error))
     }
+    // Its pull request becomes a Thread the Ticket follows: review comments reach this worker, and its merge ends the Ticket.
+    if (args.pr_url && runtime.github) runtime.github.bindPull(ticketId, args.pr_url)
     const report = { state: args.state, summary: args.summary, ...args.human_action !== undefined ? { question: args.human_action } : {},
       ...args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {},
       ...args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {} }
