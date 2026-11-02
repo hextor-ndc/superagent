@@ -65,6 +65,7 @@ It prints the console thread and the panel URL. Open the **Superagent** thread i
 | `SUPERAGENT_OPERATOR` | `operator` | The operator's name on the console's allowed list |
 | `SUPERAGENT_MAX_WORKERS` | `3` | Worker threads running at once |
 | `SUPERAGENT_RUNTIME_MODE` | the token's ceiling | Runtime mode for worker threads |
+| `SUPERAGENT_MODEL` | the project's default model | `<provider instance>/<model>`, such as `codex/gpt-6-astra`, for every thread it launches. Needed when the project has no default model in t3code; the model picker in t3code's project settings does not set one |
 | `SUPERAGENT_GITHUB_LOGIN` | GitHub off | The agent's own GitHub account; mentions of it address the agent |
 | `SUPERAGENT_GITHUB_ALLOWED` | nobody | Comma-separated logins that may ask for work on GitHub |
 | `SUPERAGENT_GH` | `gh` | The agent account's GitHub CLI, or a wrapper that runs `gh` as that account |

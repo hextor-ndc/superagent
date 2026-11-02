@@ -64,6 +64,8 @@ export interface McpT3ClientOptions {
   url: string
   /** An `mcp-client` bearer token (PLAN.md, point 5). */
   token: string
+  /** Sent with every launch; t3code refuses a launch without one when the project has no default model. */
+  modelSelection?: { instanceId: string; model: string }
   fetch?: typeof fetch
 }
 
@@ -100,20 +102,32 @@ export class McpT3Client implements T3Client {
     return payload as T
   }
 
+  /** Reads every page: t3code returns at most 20 projects per call, with `nextCursor` for the rest. */
   async listProjects(): Promise<ProjectSummary[]> {
-    const result = await this.call<{ projects: { id: string; title?: string; workspaceRoot: string }[] }>('t3_project_list', {})
-    return result.projects.map(project => ({ id: project.id, title: project.title, workspaceRoot: project.workspaceRoot }))
+    const projects: ProjectSummary[] = []
+    let cursor: number | null | undefined
+    do {
+      const result = await this.call<{ projects: { id: string; title?: string; workspaceRoot: string }[]; nextCursor?: number | null }>(
+        't3_project_list', cursor == null ? {} : { cursor })
+      projects.push(...result.projects.map(project => ({ id: project.id, title: project.title, workspaceRoot: project.workspaceRoot })))
+      cursor = result.nextCursor
+    } while (cursor != null)
+    return projects
   }
   launch(input: LaunchInput): Promise<LaunchResult> {
     return this.call('t3_thread_launch', {
       projectId: input.projectId, title: input.title, message: input.message, clientRequestId: input.clientRequestId,
       workspaceStrategy: { type: 'existing_worktree', worktreePath: input.worktreePath, ...(input.branch ? { branch: input.branch } : {}) },
       ...(input.runtimeMode ? { runtimeMode: input.runtimeMode } : {}),
+      ...this.model(),
     })
   }
   launchScratch(input: ScratchLaunchInput): Promise<LaunchResult> {
     return this.call('t3_thread_launch', { scratch: true, title: input.title, clientRequestId: input.clientRequestId,
-      ...(input.message ? { message: input.message } : {}) })
+      ...(input.message ? { message: input.message } : {}), ...this.model() })
+  }
+  private model(): { modelSelection?: { instanceId: string; model: string } } {
+    return this.options.modelSelection ? { modelSelection: this.options.modelSelection } : {}
   }
   send(threadId: string, message: string, clientRequestId: string, mode: 'auto' | 'queue' | 'steer' | 'restart' = 'auto'): Promise<SendResult> {
     return this.call('t3_thread_send', { threadId, message, clientRequestId, mode })

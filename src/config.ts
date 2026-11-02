@@ -23,6 +23,8 @@ export interface Config {
   operator: string
   maxWorkers: number
   runtimeMode?: string
+  /** The model for every thread the super agent launches; needed when the project has no default model in t3code. */
+  model?: { instanceId: string; model: string }
   /**
    * The Router: `claude`, the model-backed Router, whenever Anthropic credentials are set; otherwise `rules`, which only accepts
    * explicit requests. `acceptMode` is the Policy's accept mode for proactive work (prototype docs/002).
@@ -59,6 +61,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     operator: env.SUPERAGENT_OPERATOR ?? 'operator',
     maxWorkers: Number(env.SUPERAGENT_MAX_WORKERS ?? 3),
     runtimeMode: env.SUPERAGENT_RUNTIME_MODE || undefined,
+    ...env.SUPERAGENT_MODEL ? { model: modelSelection(env.SUPERAGENT_MODEL) } : {},
     router: {
       kind: (env.SUPERAGENT_ROUTER ?? (env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_PROFILE ? 'claude' : 'rules')) === 'claude' ? 'claude' : 'rules',
       model: env.SUPERAGENT_ROUTER_MODEL ?? 'claude-opus-5-5',
@@ -75,6 +78,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     } } : {},
     log: (message, error) => console.error(`[superagent] ${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`),
   }
+}
+
+/** `<provider instance>/<model>`, such as `codex/gpt-6-astra`; `orchestrator_capabilities` lists both. */
+function modelSelection(value: string): { instanceId: string; model: string } {
+  const [instanceId, ...rest] = value.trim().split('/')
+  const model = rest.join('/')
+  if (!instanceId || !model) throw new Error(`Set SUPERAGENT_MODEL as <provider instance>/<model>, such as codex/gpt-6-astra; got "${value}".`)
+  return { instanceId, model }
 }
 
 function oneOf<T extends string>(value: string | undefined, allowed: readonly T[], fallback: T): T {

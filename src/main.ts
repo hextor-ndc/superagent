@@ -30,7 +30,7 @@ async function run(): Promise<void> {
     if (left < 3) log(`the T3 Code sign-in expires on ${saved.expiresAt}; run \`npm run connect\` again before then`)
     token = saved.token
   }
-  const t3 = new McpT3Client({ url: config.t3Url, token })
+  const t3 = new McpT3Client({ url: config.t3Url, token, ...(config.model ? { modelSelection: config.model } : {}) })
   const projects = await t3.listProjects()
   const project = config.projectId
     ? projects.find(item => item.id === config.projectId)
