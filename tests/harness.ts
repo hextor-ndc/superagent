@@ -29,7 +29,7 @@ export interface Harness { runtime: Runtime; http: Server; base: string; errors:
 export async function harness(t3: FakeT3, place: { dir: string; root: string }, database = ':memory:', overrides: Partial<Config> = {},
   deps: { gh?: Gh; model?: ModelCall } = {}): Promise<Harness> {
   const errors: string[] = []
-  const config: Config = { t3Url: 'unused', t3Token: 'unused', projectRoot: place.root, worktreeRoot: join(place.dir, 'worktrees'), baseRef: 'HEAD',
+  const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', projectRoot: place.root, worktreeRoot: join(place.dir, 'worktrees'), baseRef: 'HEAD',
     router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' },
     repository: 'acme/widgets', port: 0, publicUrl: '', consoleToken: 'console-secret', database, operator: 'hector', maxWorkers: 2,
     log: (message, error) => { errors.push(`${message} ${error instanceof Error ? error.message : error ?? ''}`) }, ...overrides }

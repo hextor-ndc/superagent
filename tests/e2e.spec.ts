@@ -48,7 +48,7 @@ describe('superagent on t3code', () => {
     git(root, '-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.')
     git(root, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init')
     t3 = new FakeT3([{ id: 'project-1', workspaceRoot: root }])
-    const config: Config = { t3Url: 'unused', t3Token: 'unused', projectRoot: root, worktreeRoot: join(dir, 'worktrees'), baseRef: 'HEAD',
+    const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', projectRoot: root, worktreeRoot: join(dir, 'worktrees'), baseRef: 'HEAD',
       repository: 'acme/widgets', port: 0, publicUrl: '', consoleToken: 'console-secret', database: ':memory:', router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' }, operator: 'hector', maxWorkers: 2,
       log: (message, error) => { errors.push(`${message} ${error instanceof Error ? error.message : error ?? ''}`) } }
     // The public URL is known only once the server listens; the runtime reads it when it builds URLs.

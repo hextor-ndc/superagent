@@ -8,6 +8,13 @@ A super agent in the style of DeepSeek's *Exploring Super-agent Design*. It runs
 
 See [PLAN.md](PLAN.md) for the design, the phases and what is still approximate.
 
+## What it does
+
+- **Takes requests where people already work.** On GitHub, it acts on a mention of the agent account by someone on the allowed list. In t3code, it acts on what the operator types in the console. Anyone not on the list, any bot, and the agent's own comments are ignored.
+- **Decides with a Router.** One Claude conversation in the control plane accepts work, attaches follow-ups, stops work on request, and relays results and questions. Messages that arrive while it is working are handled together in its next request. Every authorization rule stays in DeepSeek's Engine and Policy, never in the model. Proactive work (unaddressed messages matched against the team's rules) starts in `observe` mode: the agent records what it would have done.
+- **Works in t3code.** Each Ticket gets its own worktree and thread. The worker's pull request becomes a thread the Ticket follows: review comments reach the worker without a new mention, and the merge ends the Ticket.
+- **Survives restarts.** State is in SQLite. Workers keep running in t3code while the super agent restarts, and it picks them up again. A run that t3code interrupted restarts with a recovery note. A failed turn is told to continue three times before the Ticket is reported failed.
+
 ## What you see in t3code
 
 1. **One thread per Ticket.** Titled `[T-xxxxxxxx] <request>`, on branch `agent/<name>`. Open it to watch the worker, or type into it to step in.
@@ -19,7 +26,7 @@ See [PLAN.md](PLAN.md) for the design, the phases and what is still approximate.
 
 Requirements: Node 22.19 or later, git, and `t3 serve` with the project added in t3code.
 
-1. Create a token for the super agent. It signs in as an outside agent (point 5); see "Sign-in" below.
+1. Sign the super agent in to t3code once with `npm run connect` (point 5); see "Sign-in" below.
 2. In the t3code project's settings, turn off PR watching and "continue threads after server update". The super agent handles both (PLAN.md, ground rule 3).
 3. Install and start:
 
@@ -28,10 +35,16 @@ npm install
 ```
 
 ```bash
+T3_MCP_URL=http://127.0.0.1:3773/mcp npm run connect
+```
+
+```bash
 T3_MCP_URL=http://127.0.0.1:3773/mcp \
-T3_MCP_TOKEN=<token> \
 SUPERAGENT_PROJECT_ROOT=/path/to/your/checkout \
 SUPERAGENT_REPOSITORY=owner/name \
+SUPERAGENT_GITHUB_LOGIN=<agent account> \
+SUPERAGENT_GITHUB_ALLOWED=<your login> \
+ANTHROPIC_API_KEY=<key> \
 npm start
 ```
 
@@ -40,7 +53,8 @@ It prints the console thread and the panel URL. Open the **Superagent** thread i
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `T3_MCP_URL` | `http://127.0.0.1:3773/mcp` | The t3code environment's MCP URL (Settings → Environments → Copy MCP URL) |
-| `T3_MCP_TOKEN` | required | An `mcp-client` token |
+| `T3_MCP_TOKEN` | the token `npm run connect` saved | An `mcp-client` token given directly |
+| `SUPERAGENT_STATE_DIR` | `~/.superagent-t3` | The database and the saved t3code token |
 | `SUPERAGENT_PROJECT_ROOT` | required | The project's checkout, as registered in t3code |
 | `SUPERAGENT_PROJECT_ID` | found from the root | The t3code project id |
 | `SUPERAGENT_WORKTREE_ROOT` | `<root>/../<name>-superagent` | Where Ticket worktrees go |
@@ -50,21 +64,31 @@ It prints the console thread and the panel URL. Open the **Superagent** thread i
 | `SUPERAGENT_OPERATOR` | `operator` | The operator's name on the console's allowed list |
 | `SUPERAGENT_MAX_WORKERS` | `3` | Worker threads running at once |
 | `SUPERAGENT_RUNTIME_MODE` | the token's ceiling | Runtime mode for worker threads |
+| `SUPERAGENT_GITHUB_LOGIN` | GitHub off | The agent's own GitHub account; mentions of it address the agent |
+| `SUPERAGENT_GITHUB_ALLOWED` | nobody | Comma-separated logins that may ask for work on GitHub |
+| `SUPERAGENT_GH` | `gh` | The agent account's GitHub CLI, or a wrapper that runs `gh` as that account |
+| `SUPERAGENT_GITHUB_POLL_SECONDS` | `30` | How often GitHub is read |
+| `SUPERAGENT_GITHUB_COMMIT_EMAIL` | none | The commit email the workers use |
+| `SUPERAGENT_ROUTER` | `claude` with Anthropic credentials, else `rules` | `rules` only accepts explicit requests and relays results |
+| `SUPERAGENT_ROUTER_MODEL` / `SUPERAGENT_ROUTER_EFFORT` | `claude-opus-5-5` / `medium` | The Router's model and effort |
+| `SUPERAGENT_ACCEPT_MODE` | `observe` | Proactive work: `off`, `observe` (record what it would do) or `auto` |
+
+The Router reads Anthropic credentials the way the SDK does: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or an `ant auth login` profile. It sends the default server-side refusal fallback (`fallbacks: "default"`), so a declined request is retried on a fallback model.
 
 ## Sign-in (point 5)
 
-t3code's `/mcp` endpoint accepts only outside-agent (`mcp-client`) sessions. There are two ways to get one:
+t3code's `/mcp` endpoint accepts only outside-agent (`mcp-client`) sessions.
 
-- **Now:** on the t3code host, run:
+- **`npm run connect`** uses t3code's documented OAuth sign-in for outside agents: discovery, client registration, PKCE and a loopback redirect. It prints a page to open. On that page, approve with a pairing code from **Settings → Sharing & access** (or `t3 auth pairing create`), and choose the access: a runtime-mode ceiling that t3code enforces on every thread the super agent starts. Open the page in a browser on the machine where you ran `connect`, because the redirect returns to `127.0.0.1`. The token is saved with mode 600 in the state directory.
+- **Alternatively**, on the t3code host, run:
 
   ```bash
   t3 auth session issue --subject mcp-client --scopes orchestration:read,orchestration:operate --token-only
   ```
 
   Then pass the result as `T3_MCP_TOKEN`.
-- **Phase 2:** `superagent connect` will use t3code's documented OAuth sign-in for outside agents. The owner approves it once, with a pairing code, and picks a runtime-mode ceiling that t3code enforces on every thread the super agent starts.
 
-Users only ever sign in to t3code.
+The session lasts 30 days, and t3code issues no refresh token. The super agent warns 3 days before expiry; run `npm run connect` again then. Users only ever sign in to t3code.
 
 ## Develop
 

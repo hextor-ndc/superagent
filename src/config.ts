@@ -5,7 +5,9 @@ import { randomBytes } from 'node:crypto'
 
 export interface Config {
   t3Url: string
+  /** An `mcp-client` token given directly; empty to use the one `superagent connect` saved in `tokenFile`. */
   t3Token: string
+  tokenFile: string
   /** The t3code project the workers use; found by `projectRoot` when not given. */
   projectId?: string
   projectRoot: string
@@ -41,7 +43,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const port = Number(env.SUPERAGENT_PORT ?? 3790)
   return {
     t3Url: env.T3_MCP_URL ?? 'http://127.0.0.1:3773/mcp',
-    t3Token: need('T3_MCP_TOKEN'),
+    t3Token: env.T3_MCP_TOKEN?.trim() ?? '',
+    tokenFile: join(stateDir(env), 't3-token.json'),
     projectId: env.SUPERAGENT_PROJECT_ID || undefined,
     projectRoot,
     worktreeRoot: resolve(env.SUPERAGENT_WORKTREE_ROOT ?? join(dirname(projectRoot), `${basename(projectRoot)}-superagent`)),
@@ -50,7 +53,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port,
     publicUrl: (env.SUPERAGENT_PUBLIC_URL ?? `http://127.0.0.1:${port}`).replace(/\/+$/, ''),
     consoleToken: env.SUPERAGENT_CONSOLE_TOKEN || randomBytes(24).toString('base64url'),
-    database: join(resolve(env.SUPERAGENT_STATE_DIR ?? join(homedir(), '.superagent-t3')), 'state.sqlite'),
+    database: join(stateDir(env), 'state.sqlite'),
     operator: env.SUPERAGENT_OPERATOR ?? 'operator',
     maxWorkers: Number(env.SUPERAGENT_MAX_WORKERS ?? 3),
     runtimeMode: env.SUPERAGENT_RUNTIME_MODE || undefined,
@@ -76,3 +79,6 @@ function oneOf<T extends string>(value: string | undefined, allowed: readonly T[
   if (!(allowed as readonly string[]).includes(value)) throw new Error(`Expected one of ${allowed.join(', ')}, got ${value}`)
   return value as T
 }
+
+/** Where the super agent keeps its database and its t3code token. */
+export const stateDir = (env: NodeJS.ProcessEnv = process.env): string => resolve(env.SUPERAGENT_STATE_DIR ?? join(homedir(), '.superagent-t3'))

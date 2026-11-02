@@ -52,13 +52,26 @@ DeepSeek's prototype supplies the control plane: Source → Trigger → Thread �
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 1 | Vendored core; t3code client; T3Executor; worker and console MCP server; attention app; links; token auth; tests against a fake t3code | **in progress** |
-| 2 | SQLite store and durable effects (ported from the prototype's `store.ts` and `effects.ts`); GitHub Source and Channel; the Router as a model-API session in the control plane, with batching; OAuth `connect` | next |
+| 1 | Vendored core; t3code client; T3Executor; worker and console MCP server; attention app; links; token auth; tests against a fake t3code | done |
+| 2 | SQLite store and restart recovery; GitHub Source and Channel; the Router as a Claude session in the control plane, with batching; OAuth `connect` | done |
 | 3 | Watchdog as a scheduled t3code thread; several machines (one `t3 serve` each, plus a cloud control plane); per-machine tokens and project allowlists | later |
 | 4 | Acceptance test: the paper's synthetic workload (~300 messages, ~20 requests) using t3code's Replay test provider | later |
 
-## Known approximations in phase 1
+## Phase 2 notes
+
+- **Store** (`src/app/store.ts`): the core's repositories on `node:sqlite`, with savepoint transactions. Jobs are queued only after the Engine's transaction commits. Each Ticket's thread record, the outbox receipts, the pause state and the console thread live in its key-value table.
+- **Recovery is the super agent's** (ground rule 3):
+  - A super-agent restart re-attaches to running workers.
+  - A run t3code interrupted restarts its Assignment with the prototype's recovery note, in the same thread.
+  - A failed turn is told to continue three times, then the Ticket fails and waits for a person.
+  - A retry's stop never lands on its relaunch: a live Ticket's thread is only interrupted, not stopped, and the launch waits for the interrupt.
+- **GitHub** (`src/sources/github.ts`): polling through the agent account's `gh`. It takes in mentions, anything on subscribed threads, and reviews and merge or close of followed PRs. The prototype's trigger builders are vendored unchanged; its notification-based polling was tied to the harness and is not used.
+- **Router** (`src/router/`): the prototype's main-Session tools under the same names, so its prompts apply unchanged. One append-only conversation, persisted, with compaction. A batch is whatever waited while the model worked. Proactive acceptance still goes through the vendored `assessmentOutcome`, so the model can never accept outside the Policy.
+- **Sign-in** (`src/t3/connect.ts`): t3code's outside-agent OAuth. The session lasts 30 days with no refresh, so the service warns before expiry.
+
+## Known approximations
 
 - **"Read" tracking.** DeepSeek's harness reports when a message enters the model's history. We count an input as read once a run that started after its delivery ends. This is conservative: a follow-up may be counted unread slightly longer than it truly was.
 - **Turn ends are found by polling** `t3_thread_wait`, not from an event stream.
-- **State is in memory** (`MemoryRepositories`) until phase 2.
+- **The Router has no tool for settings or prompts.** The operator changes those in config and restarts.
+- **No Feishu or other chat Source yet.** The console is the only non-GitHub Source.
