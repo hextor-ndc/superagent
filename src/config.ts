@@ -2,6 +2,12 @@
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { AdmissionTableSchema } from '../vendor/dsh/src/policy.ts'
+import type { AdmissionRow } from '../vendor/dsh/src/admission.ts'
+
+/** The admission table's rows on GitHub, as the Source's `scope` names them: new Issues, new pull requests, and comments. */
+export const GITHUB_ROWS = ['issues', 'pulls', 'comments'] as const
+export type GithubRow = typeof GITHUB_ROWS[number]
 
 export interface Config {
   t3Url: string
@@ -32,8 +38,13 @@ export interface Config {
   router: { kind: 'claude' | 'rules'; model: string; effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; acceptMode: 'off' | 'observe' | 'auto' }
   /** Minutes between Watchdog checks; 0 turns the Watchdog off. */
   watchdogMinutes: number
-  /** The GitHub Source; off without an agent account. */
-  github?: { login: string; allowed: string[]; gh: string; pollMs: number; commitEmail?: string }
+  /**
+   * The GitHub Source; off without an agent account. `observe` lists the rows whose unaddressed messages the Source reads across
+   * the repository, so the admission table can make candidates of them; `admission` is the Policy's admission table for GitHub
+   * (prototype docs/002-authorization.md), cells left out keeping the prototype's defaults.
+   */
+  github?: { login: string; allowed: string[]; gh: string; pollMs: number; commitEmail?: string; observe?: GithubRow[]
+    admission?: Partial<Record<GithubRow, AdmissionRow>> }
   log: (message: string, error?: unknown) => void
 }
 
@@ -75,6 +86,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       gh: env.SUPERAGENT_GH || 'gh',
       pollMs: Number(env.SUPERAGENT_GITHUB_POLL_SECONDS ?? 30) * 1000,
       ...env.SUPERAGENT_GITHUB_COMMIT_EMAIL ? { commitEmail: env.SUPERAGENT_GITHUB_COMMIT_EMAIL } : {},
+      ...env.SUPERAGENT_GITHUB_OBSERVE?.trim() ? { observe: githubRows(env.SUPERAGENT_GITHUB_OBSERVE) } : {},
+      ...env.SUPERAGENT_GITHUB_ADMISSION?.trim() ? { admission: githubAdmission(env.SUPERAGENT_GITHUB_ADMISSION) } : {},
     } } : {},
     log: (message, error) => console.error(`[superagent] ${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`),
   }
@@ -86,6 +99,28 @@ function modelSelection(value: string): { instanceId: string; model: string } {
   const model = rest.join('/')
   if (!instanceId || !model) throw new Error(`Set SUPERAGENT_MODEL as <provider instance>/<model>, such as codex/gpt-6-astra; got "${value}".`)
   return { instanceId, model }
+}
+
+/** `issues,pulls,comments`, any of them, or `all`; `none` for none. */
+function githubRows(value: string): GithubRow[] {
+  const names = value.split(',').map(name => name.trim().toLowerCase()).filter(Boolean)
+  if (names.length === 1 && (names[0] === 'all' || names[0] === '1')) return [...GITHUB_ROWS]
+  if (names.length === 1 && (names[0] === 'none' || names[0] === '0')) return []
+  const unknown = names.filter(name => !(GITHUB_ROWS as readonly string[]).includes(name))
+  if (unknown.length) throw new Error(`Set SUPERAGENT_GITHUB_OBSERVE to all, none, or some of ${GITHUB_ROWS.join(', ')}; got "${value}".`)
+  return [...new Set(names)] as GithubRow[]
+}
+
+/** The admission table as JSON, such as `{"comments":{"unlistedAddressed":"inferred"}}`, checked against the prototype's schema. */
+function githubAdmission(value: string): Partial<Record<GithubRow, AdmissionRow>> {
+  const fail = (detail: string) => new Error(`SUPERAGENT_GITHUB_ADMISSION is not a valid admission table: ${detail}. See README.md, "Run it".`)
+  let json: unknown
+  try { json = JSON.parse(value) } catch (error) { throw fail(error instanceof Error ? error.message : String(error)) }
+  const parsed = AdmissionTableSchema.safeParse(json)
+  if (!parsed.success) throw fail(parsed.error.issues.map(issue => `${issue.path.join('.') || 'value'}: ${issue.message}`).join('; '))
+  const unknown = Object.keys(parsed.data).filter(row => !(GITHUB_ROWS as readonly string[]).includes(row))
+  if (unknown.length) throw fail(`unknown rows ${unknown.join(', ')}; the rows are ${GITHUB_ROWS.join(', ')}`)
+  return parsed.data
 }
 
 function oneOf<T extends string>(value: string | undefined, allowed: readonly T[], fallback: T): T {

@@ -2,19 +2,24 @@
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { LaunchInput, LaunchResult, ProjectSummary, ScratchLaunchInput, SendResult, T3Client, T3Status, ThreadRead, WaitResult }
-  from '../src/t3/client.ts'
+import { T3Error, type LaunchInput, type LaunchResult, type PendingRequest, type ProjectSummary, type ScratchLaunchInput, type SendResult, type T3Client,
+  type T3Status, type ThreadRead, type WaitResult } from '../src/t3/client.ts'
 
 interface FakeThread {
   id: string; title: string; link: string; worktreePath: string | null; branch: string | null; pinned: boolean
   runs: { id: string; status: T3Status }[]
   messages: { id: string; text: string; clientRequestId: string }[]
   pullRequests: string[]
+  pending: PendingRequest[]
 }
 
 export class FakeT3 implements T3Client {
   readonly threads = new Map<string, FakeThread>()
   readonly calls: { tool: string; args: unknown }[] = []
+  /** Threads whose pending requests were read, in order: the executor and the Runtime look at them on timers. */
+  readonly pendingReads: string[] = []
+  /** The next this many pending-request reads fail, as when t3code is unreachable. */
+  failPendingReads = 0
   private readonly requests = new Map<string, unknown>()
   private seq = 0
   constructor(readonly projects: ProjectSummary[]) {}
@@ -40,7 +45,7 @@ export class FakeT3 implements T3Client {
     return this.once(input.clientRequestId, () => this.create(input.title, mkdtempSync(join(tmpdir(), 'scratch-')), null, input.message, input.clientRequestId))
   }
   private create(title: string, worktreePath: string | null, branch: string | null, message: string | undefined, requestId: string): LaunchResult {
-    const thread: FakeThread = { id: this.id('thread'), title, link: '', worktreePath, branch, pinned: false, runs: [], messages: [], pullRequests: [] }
+    const thread: FakeThread = { id: this.id('thread'), title, link: '', worktreePath, branch, pinned: false, runs: [], messages: [], pullRequests: [], pending: [] }
     thread.link = `https://app.t3.codes/thread/${thread.id}`
     this.threads.set(thread.id, thread)
     let runId: string | null = null
@@ -75,7 +80,8 @@ export class FakeT3 implements T3Client {
     const latest = thread.runs.at(-1)
     return {
       thread: { threadId, title: thread.title, link: thread.link, status: latest?.status ?? 'idle', activeRunId: latest?.status === 'running' ? latest.id : null,
-        latestRunId: latest?.id ?? null, worktreePath: thread.worktreePath, branch: thread.branch, settled: false, archived: false },
+        latestRunId: latest?.id ?? null, worktreePath: thread.worktreePath, branch: thread.branch, settled: false, archived: false,
+        pendingRequestCount: thread.pending.length },
       items: thread.messages.map((message, position) => ({ position, itemId: message.id, runId: null, messageId: message.id, type: 'user_message',
         text: message.text, createdBy: null })),
       nextPosition: null,
@@ -93,6 +99,18 @@ export class FakeT3 implements T3Client {
   async linkPullRequests(threadId: string, urls: string[]) {
     this.calls.push({ tool: 'link_pull_requests', args: { threadId, urls } })
     this.thread(threadId).pullRequests.push(...urls)
+  }
+  async pendingRequests(threadId: string): Promise<PendingRequest[]> {
+    this.pendingReads.push(threadId)
+    if (this.failPendingReads > 0) { this.failPendingReads--; throw new T3Error('t3_thread_read', 'network', 'fetch failed') }
+    return [...this.thread(threadId).pending]
+  }
+  async answerQuestion(threadId: string, requestId: string, answers: Record<string, string | string[]>) {
+    this.calls.push({ tool: 't3_pending_request', args: { action: 'respond', threadId, requestId, answers } })
+    const thread = this.thread(threadId)
+    const index = thread.pending.findIndex(request => request.kind === 'question' && request.requestId === requestId)
+    if (index < 0) throw new Error(`invalid_request The pending user-input request was not found.`)
+    thread.pending.splice(index, 1)
   }
   async close() {}
 

@@ -11,6 +11,10 @@ export class Health {
   ok(name: string): void {
     this.entries.set(name, { ...this.entries.get(name), ok: true, lastOk: new Date().toISOString(), failures: 0, error: undefined })
   }
+  /** Clears the failures of a part that has failed before; a part that never failed gets no entry. */
+  recovered(name: string): void {
+    if (this.entries.get(name)?.failures) this.ok(name)
+  }
   fail(name: string, error: unknown): void {
     const entry = this.entries.get(name)
     const failures = (entry?.failures ?? 0) + 1

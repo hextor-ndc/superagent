@@ -12,6 +12,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check": "tsc --noEmit && vitest run",
+    "test:live": "T3_LIVE=1 vitest run tests/live",
+    "acceptance": "vitest run tests/workload",
+    "acceptance:live": "T3_LIVE=1 vitest run tests/live/workload.spec.ts",
     "start": "node --no-warnings=ExperimentalWarning --import tsx src/main.ts start",
     "connect": "node --no-warnings=ExperimentalWarning --import tsx src/main.ts connect"
   },

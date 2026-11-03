@@ -60,7 +60,8 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
       const actions = consoleActions(runtime) as Record<string, (args: never) => unknown>
       const action = body.name && Object.hasOwn(actions, body.name) ? actions[body.name as ConsoleAction] : undefined
       if (!action) return send(res, 404, { error: 'unknown action' })
-      try { return send(res, 200, action((body.arguments ?? {}) as never)) }
+      // Some actions reach t3code, so each is awaited.
+      try { return send(res, 200, await action((body.arguments ?? {}) as never)) }
       catch (error) { return send(res, 400, { error: error instanceof Error ? error.message : String(error) }) }
     }
   }

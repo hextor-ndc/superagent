@@ -4,18 +4,21 @@
  *
  * What it listens to, as the domain asks a Source to decide (prototype docs/001-domain.md):
  * - a comment, inline review comment, new Issue or new pull request that mentions the agent account;
- * - anything on a Thread a Ticket subscribes to, so later discussion reaches the worker without a new mention;
- * - reviews, and merges or closes, of the pull requests Tickets follow.
+ * - anything on a Thread a Ticket subscribes to written since the Ticket followed it, so later discussion reaches the worker
+ *   without a new mention;
+ * - reviews, and merges or closes, of the pull requests Tickets follow;
+ * - with `observe`, every new Issue, new pull request or comment of the rows it names, for the Policy's admission table.
  * The agent account's own messages never enter.
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { z } from 'zod'
-import type { EngineForSources, OutboundMessage, ScopeResult, Trigger } from '../../vendor/dsh/src/core/index.ts'
+import { threadKey, type EngineForSources, type OutboundMessage, type ScopeResult, type Thread, type Trigger } from '../../vendor/dsh/src/core/index.ts'
 import { CommentSchema, IssueSchema, SOURCE, commentTrigger, githubAddress, issueTrigger, pullTrigger }
   from '../../vendor/dsh/src/sources/github-trigger.ts'
 import { sameName } from '../../vendor/dsh/src/infra/text.ts'
 import type { Health } from '../app/health.ts'
+import type { GithubRow } from '../config.ts'
 import type { Store } from '../app/store.ts'
 
 export { SOURCE as GITHUB }
@@ -44,8 +47,10 @@ export interface GithubOptions {
   /** The agent account's login: mentions of it address the agent, and its own messages are dropped. */
   login: string
   engine: () => Pick<EngineForSources, 'receive' | 'bindThread' | 'threadClosed'>
-  store: Pick<Store, 'kv' | 'threads' | 'tickets'>
+  store: Pick<Store, 'kv' | 'threads' | 'tickets' | 'triggers'>
   pollMs?: number
+  /** The rows whose unaddressed messages it reads across the repository, from when each was switched on; none by default. */
+  observe?: readonly GithubRow[]
   log?: (message: string, error?: unknown) => void
   health?: Health
 }
@@ -56,6 +61,10 @@ const PostedSchema = z.looseObject({ id: z.number(), body: z.string().nullish(),
   in_reply_to_id: z.number().nullish() })
 const SINCE = 'github:since'
 const CLOSED = 'github:closed:'
+/** Per subscribed Issue or pull request number, the start of the poll before the one that first saw it subscribed. */
+const FOLLOWING = 'github:following'
+/** Per observed row, when the Source began observing it. */
+const OBSERVING = 'github:observing'
 /** Polls overlap by this much, so an item GitHub indexed late is not missed; duplicates are dropped by Trigger id. */
 const OVERLAP_MS = 60_000
 
@@ -70,10 +79,13 @@ export class GithubSource {
   }
   stop(): void { clearInterval(this.timer) }
 
-  /** What the Policy's gate sees of this Source: it listens to every Trigger it lets in, and receives only mentions. */
+  /**
+   * What the Policy's gate sees of this Source: it listens to every Trigger it lets in, and receives every message of the rows
+   * it observes, only mentions of the others.
+   */
   scope(meta: Record<string, unknown>): ScopeResult {
-    const kind = meta.kind
-    return { listened: true, observed: false, row: kind === 'issue' ? 'issues' : kind === 'pull' ? 'pulls' : 'comments' }
+    const row = rowOf(meta)
+    return { listened: true, observed: this.options.observe?.includes(row) ?? false, row }
   }
 
   /** One poll; overlapping calls share it. */
@@ -92,7 +104,7 @@ export class GithubSource {
     const since = store.kv.get<string>(SINCE) ?? started.toISOString()
     const from = new Date(Date.parse(since) - OVERLAP_MS).toISOString()
     const repo = `repos/${this.options.repository}`
-    const subscribed = this.subscribedNumbers()
+    const subscribed: Taking = { following: this.following(since, from), observing: this.observing(started.toISOString()) }
 
     for (const comment of await this.pages(CommentSchema.extend({ issue_url: z.string().nullish() }), `${repo}/issues/comments?since=${from}&sort=updated&direction=asc`)) {
       const number = Number(/\/issues\/(\d+)$/.exec(comment.issue_url ?? '')?.[1])
@@ -102,7 +114,7 @@ export class GithubSource {
     }
     for (const comment of await this.pages(ReviewCommentSchema, `${repo}/pulls/comments?since=${from}&sort=updated&direction=asc`)) {
       const number = Number(/\/pulls\/(\d+)$/.exec(comment.pull_request_url ?? '')?.[1])
-      if (number) this.take(commentTrigger(comment, { number, isPr: true, url: comment.html_url ?? undefined }, 'inline', this.options.login), subscribed)
+      if (number) this.take(withBody(commentTrigger(comment, { number, isPr: true, url: comment.html_url ?? undefined }, 'inline', this.options.login), comment), subscribed)
     }
     for (const issue of await this.pages(IssueSchema, `${repo}/issues?since=${from}&state=all&sort=created&direction=asc`)) {
       if (issue.created_at < from) continue
@@ -113,7 +125,7 @@ export class GithubSource {
   }
 
   /** Reviews of followed pull requests, and their merge or close, which ends the Tickets done with them. */
-  private async pollFollowedPulls(repo: string, from: string, subscribed: Set<number>): Promise<void> {
+  private async pollFollowedPulls(repo: string, from: string, subscribed: Taking): Promise<void> {
     const followed = new Set<number>()
     for (const ticket of this.options.store.tickets.open()) {
       for (const follow of ticket.follows ?? []) if (follow.thread.startsWith(`${SOURCE}:`) && !follow.closed) followed.add(Number(follow.thread.slice(SOURCE.length + 1)))
@@ -121,7 +133,9 @@ export class GithubSource {
     for (const number of followed) {
       try {
         for (const review of await this.pages(CommentSchema, `${repo}/pulls/${number}/reviews`)) {
-          if ((review.submitted_at ?? '') >= from) this.take(commentTrigger(review, { number, isPr: true, url: review.html_url ?? undefined }, 'review', this.options.login), subscribed)
+          if ((review.submitted_at ?? '') >= from) {
+            this.take(withBody(commentTrigger(review, { number, isPr: true, url: review.html_url ?? undefined }, 'review', this.options.login), review), subscribed)
+          }
         }
         const pull = PullSchema.parse(JSON.parse(await this.options.gh(['api', `${repo}/pulls/${number}`])))
         if (pull.state === 'closed' && !this.options.store.kv.get(CLOSED + number)) {
@@ -133,21 +147,72 @@ export class GithubSource {
     }
   }
 
-  /** Lets a Trigger in when it addresses the agent or lands on a Thread a Ticket subscribes to; the agent's own never. */
-  private take(trigger: Trigger, subscribed: Set<number>): void {
+  /**
+   * Lets a Trigger in when it addresses the agent, or was written on a Thread a Ticket subscribes to since it followed the
+   * Thread, or in a row the Source observes since it began observing it; the agent's own never.
+   */
+  private take(trigger: Trigger, { following, observing }: Taking): void {
     if (sameName(trigger.actor.id, this.options.login)) return
-    const number = Number(trigger.meta.number)
-    if (!trigger.addressed && !subscribed.has(number)) return
     if (!trigger.text.trim()) return
+    const at = Date.parse(trigger.at)
+    const since = (from: number | undefined) => from !== undefined && at >= from
+    if (!trigger.addressed && !since(following.get(Number(trigger.meta.number))) && !since(observing.get(rowOf(trigger.meta)))) return
     try { this.options.engine().receive(trigger) } catch (error) { this.options.log?.(`taking in ${trigger.id} failed`, error) }
   }
 
-  private subscribedNumbers(): Set<number> {
-    const numbers = new Set<number>()
-    for (const thread of this.options.store.threads.list()) {
-      if (thread.ref.source === SOURCE && thread.subscriptions.length && /^\d+$/.test(thread.ref.id)) numbers.add(Number(thread.ref.id))
+  /**
+   * For each Issue or pull request a Ticket subscribes to, the time from which its unaddressed messages are let in. Polls
+   * re-read the last minute, so a message the Source skipped because no Ticket followed the Thread yet would otherwise come back
+   * as new once one does, such as the opening post of the Issue a request was made on. For a Ticket with messages of its own on
+   * the Thread (the request that started it, or one that reached it as an Input), the time is the earliest of them, so a reply
+   * written after the request but before the Ticket existed still reaches the worker; these are GitHub's own times, like the
+   * messages compared with them. For a Thread followed without one, such as for context, it is the start of the poll before
+   * the one that first saw the Thread followed. A pull request a Ticket opened has no such time: all of it is for the worker.
+   * The first sighting is recorded, and dropped once nothing subscribes; a Thread followed since before the overlap lets in all
+   * the poll reads, without reading its Tickets.
+   */
+  private following(since: string, from: string): Map<number, number> {
+    const { kv, threads } = this.options.store
+    const stored = kv.get<Record<string, string>>(FOLLOWING) ?? {}
+    const kept: Record<string, string> = {}
+    const following = new Map<number, number>()
+    for (const thread of threads.list()) {
+      if (thread.ref.source !== SOURCE || !thread.subscriptions.length || !/^\d+$/.test(thread.ref.id)) continue
+      const noticed = kept[thread.ref.id] = stored[thread.ref.id] ?? since
+      following.set(Number(thread.ref.id), noticed < from ? -Infinity : this.followedFrom(thread, Date.parse(noticed)))
     }
-    return numbers
+    if (JSON.stringify(kept) !== JSON.stringify(stored)) kv.set(FOLLOWING, kept)
+    return following
+  }
+
+  private followedFrom(thread: Thread, noticed: number): number {
+    const { tickets, triggers } = this.options.store
+    let earliest = Infinity
+    for (const id of thread.subscriptions) {
+      const ticket = tickets.get(id)
+      if (ticket?.follows?.some(follow => follow.thread === thread.key && follow.own)) return -Infinity
+      const triggerIds = ticket ? [...ticket.origin.triggerIds, ...ticket.inputs.flatMap(input => input.kind === 'trigger' ? [input.triggerId] : [])] : []
+      let own = Infinity
+      for (const triggerId of new Set(triggerIds)) {
+        const trigger = triggers.get(triggerId)
+        if (trigger?.threads.some(ref => threadKey(ref) === thread.key)) own = Math.min(own, Date.parse(trigger.at))
+      }
+      earliest = Math.min(earliest, own === Infinity ? noticed : own)
+    }
+    return earliest === Infinity ? noticed : earliest
+  }
+
+  /**
+   * When the Source began observing each row it observes: a row switched on reads nothing written before. The start is this
+   * machine's poll time, compared with GitHub's times, as the prototype does; a comment's time is its last edit, so an older
+   * comment edited after the start is read as a new message.
+   */
+  private observing(started: string): Map<GithubRow, number> {
+    const { kv } = this.options.store
+    const stored = kv.get<Partial<Record<GithubRow, string>>>(OBSERVING) ?? {}
+    const kept = Object.fromEntries((this.options.observe ?? []).map(row => [row, stored[row] ?? started]))
+    if (JSON.stringify(kept) !== JSON.stringify(stored)) kv.set(OBSERVING, kept)
+    return new Map(Object.entries(kept).map(([row, at]) => [row as GithubRow, Date.parse(at)]))
   }
 
   /**
@@ -200,3 +265,13 @@ export class GithubSource {
   }
 }
 
+/** What a poll lets in beyond mentions: per subscribed number and per observed row, the time from which it takes messages. */
+interface Taking { following: Map<number, number>; observing: Map<GithubRow, number> }
+
+/** The admission table's row of a Trigger: a new Issue, a new pull request, or a comment of any kind. */
+const rowOf = (meta: Record<string, unknown>): GithubRow => meta.kind === 'issue' ? 'issues' : meta.kind === 'pull' ? 'pulls' : 'comments'
+/**
+ * A review's or an inline comment's Trigger with the comment's own words in `meta.body`: its text starts with the review's
+ * decision or the file and diff it is on, and the rules router reads a stop only from what the person wrote.
+ */
+const withBody = (trigger: Trigger, comment: { body?: string | null }): Trigger => ({ ...trigger, meta: { ...trigger.meta, body: comment.body ?? '' } })

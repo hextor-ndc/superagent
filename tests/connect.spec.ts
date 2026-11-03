@@ -1,6 +1,6 @@
 /** `superagent connect` against a fake t3code OAuth server that checks PKCE, the redirect and the resource as t3code does. */
 import { createHash } from 'node:crypto'
-import { mkdtempSync, statSync } from 'node:fs'
+import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -64,10 +64,13 @@ describe('superagent connect', () => {
     expect(Math.round(daysLeft(saved))).toBe(30)
     expect(registered.at(-1)).toMatchObject({ client_name: 'Superagent', token_endpoint_auth_method: 'none' })
 
-    const file = join(mkdtempSync(join(tmpdir(), 'token-')), 'state', 't3-token.json')
-    await saveToken(file, saved)
-    expect(statSync(file).mode & 0o777).toBe(0o600)
-    expect(await loadToken(file)).toEqual(saved)
+    const dir = mkdtempSync(join(tmpdir(), 'token-'))
+    const file = join(dir, 'state', 't3-token.json')
+    try {
+      await saveToken(file, saved)
+      expect(statSync(file).mode & 0o777).toBe(0o600)
+      expect(await loadToken(file)).toEqual(saved)
+    } finally { rmSync(dir, { recursive: true, force: true }) }
   })
 
   it('refuses an approval that comes back with another state', async () => {

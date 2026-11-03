@@ -11,13 +11,39 @@ import { latestAssignment, latestReport, type Ticket } from '../../vendor/dsh/sr
 import type { Runtime } from '../app/runtime.ts'
 import { ok } from './result.ts'
 
-export interface Alert { id: string; at: string; text: string; ticketId?: string }
+export interface Alert {
+  id: string; at: string; text: string; ticketId?: string
+  /** Where a person deals with it, for an alert this service computes rather than one the Watchdog raised. */
+  link?: string
+}
 const ALERTS = 'watchdog:alerts', LAST_CHECK = 'watchdog:last-check'
+/** The id of the computed alert for a Watchdog thread that waits on a person. */
+export const WATCHDOG_PENDING_ALERT = 'pending:watchdog'
 const minutes = (since: string | undefined, now: number) => since ? Math.round((now - Date.parse(since)) / 60_000) : undefined
 
-export function alerts(runtime: Runtime): Alert[] { return runtime.repo.kv.get<Alert[]>(ALERTS) ?? [] }
+/** The alerts the Watchdog raised, as stored. */
+function raised(runtime: Runtime): Alert[] { return runtime.repo.kv.get<Alert[]>(ALERTS) ?? [] }
+/** Every open alert: the computed ones first, then those the Watchdog raised. */
+export function alerts(runtime: Runtime): Alert[] {
+  const waiting = runtime.watchdogPending
+  if (!waiting || !runtime.watchdog) return raised(runtime)
+  const approvals = waiting.requests.flatMap(request => request.kind === 'approval' ? [request.text] : [])
+  const questions = waiting.requests.flatMap(request => request.kind === 'question' ? request.questions.map(question => question.question) : [])
+  const where = runtime.watchdog.link ? ` ${runtime.watchdog.link}` : ''
+  const text = [
+    approvals.length ? `The Watchdog thread waits on ${approvals.length === 1 ? 'an approval' : `${approvals.length} approvals`}: `
+      + `${approvals.map(item => `"${item}"`).join(', ')}. Approvals are answered in T3 Code only: open the thread and approve or decline.` : '',
+    questions.length ? `The Watchdog thread waits on a question in T3 Code: ${questions.map(item => `"${item}"`).join(', ')}.` : '',
+    `No Watchdog check runs until then.${where}`,
+  ].filter(Boolean).join(' ')
+  return [{ id: WATCHDOG_PENDING_ALERT, at: waiting.since, text, ...runtime.watchdog.link ? { link: runtime.watchdog.link } : {} }, ...raised(runtime)]
+}
 export function dismissAlert(runtime: Runtime, id: string): boolean {
-  const all = alerts(runtime)
+  if (id === WATCHDOG_PENDING_ALERT) {
+    throw new Error('This alert cannot be dismissed: it shows what the Watchdog thread waits on, and clears itself once that is answered '
+      + `in T3 Code${runtime.watchdog?.link ? ` (${runtime.watchdog.link})` : ''}.`)
+  }
+  const all = raised(runtime)
   runtime.repo.kv.set(ALERTS, all.filter(alert => alert.id !== id))
   return all.some(alert => alert.id === id)
 }
@@ -117,7 +143,7 @@ export function watchdogServer(runtime: Runtime): McpServer {
   }, async ({ text, ticket_id }) => {
     const alert: Alert = { id: randomUUID(), at: new Date().toISOString(), text, ...ticket_id ? { ticketId: ticket(ticket_id).id } : {} }
     // One open alert per ticket and text: a check that sees the same fault again does not repeat it.
-    const all = alerts(runtime)
+    const all = raised(runtime)
     if (!all.some(item => item.text === alert.text && item.ticketId === alert.ticketId)) runtime.repo.kv.set(ALERTS, [...all, alert])
     return ok({ alert })
   })

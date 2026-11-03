@@ -9,7 +9,7 @@
  */
 import Anthropic from '@anthropic-ai/sdk'
 import { z } from 'zod'
-import { threadKey, type Assessor, type Candidate, type Engine, type Ticket, type WorkerReport } from '../../vendor/dsh/src/core/index.ts'
+import { threadKey, type Assessor, type Candidate, type Engine, type Ticket, type Trigger, type WorkerReport } from '../../vendor/dsh/src/core/index.ts'
 import type { Settings } from '../../vendor/dsh/src/policy.ts'
 import type { TicketView } from '../app/runtime.ts'
 import type { Health } from '../app/health.ts'
@@ -23,9 +23,15 @@ type MessageParam = Anthropic.Beta.Messages.BetaMessageParam
 type Block = Anthropic.Beta.Messages.BetaContentBlockParam
 export type ModelCall = (params: Params) => Promise<Message>
 
-/** What both Routers do: assess candidates, and hear about workers' reports. */
+/** What both Routers do: assess candidates, and hear about workers' reports and people's follow-ups. */
 export interface Router extends Assessor {
   reported(ticket: Ticket, report: WorkerReport): void
+  /**
+   * A person's message that reached open tickets on their own threads, `tickets`, whose workers decide it: it goes to no Eval,
+   * and the Router may only stop the work on it when the person asks (the prototype's follow_up notice). Called inside the
+   * Engine's transaction.
+   */
+  followup?(trigger: Trigger, tickets: Ticket[]): void
   start?(): void
   stop?(): Promise<void>
 }
@@ -50,12 +56,17 @@ const INBOX = 'router:inbox', MESSAGES = 'router:messages'
 /** Tool steps one turn may take before the Router ends it; a batch rarely needs more than two. */
 const MAX_STEPS = 12
 const REPORT_CHARS = 600
+/** What a follow-up asks of the Router, as the prototype's main Session reads it (its src/app/notices.ts). */
+const FOLLOWUP_NOTE = 'Its ticket\'s worker has it and decides; act only if the person asks to stop the work '
+  + '(orchestrator_route kind stop with this trigger_id).'
 
 export class ClaudeRouter implements Router {
   private readonly tools: RouterTool[]
   private readonly call: ModelCall
   private running?: Promise<void>
   private closed = false
+  /** Set while one of the Router's own tools runs, so a message it routes to a ticket itself is not told back to it. */
+  private routing = false
 
   constructor(private readonly options: ClaudeRouterOptions) {
     this.tools = routerTools({ engine: options.engine, store: options.store, settings: options.settings, view: options.view })
@@ -86,6 +97,16 @@ export class ClaudeRouter implements Router {
       next: kind === 'worker_attention' ? 'Ask the person with orchestrator_reply purpose=attention, copying the question into human_action.'
         : report.state === 'ready' ? 'Tell the requester the result with orchestrator_reply purpose=result, unless a matched rule says otherwise.'
           : 'Nothing to send unless a person must act; the ticket waits for a person in the console.' }) })
+  }
+
+  /** A person's follow-up on a ticket's own thread: a notice, so the Router can stop the work when the person asks. */
+  followup(trigger: Trigger, tickets: Ticket[]): void {
+    if (this.routing) return
+    const text = trigger.text.length > REPORT_CHARS ? `${trigger.text.slice(0, REPORT_CHARS)}… (orchestrator_eval_read)` : trigger.text
+    this.add({ id: `follow_up:${trigger.id}`, text: JSON.stringify({ type: 'follow_up', trigger_id: trigger.id, from: trigger.actor.id,
+      source: trigger.source, thread: threadKey(trigger.threads[0]!), at: trigger.at, text, ...trigger.url ? { url: trigger.url } : {},
+      delivered_to: tickets.map(ticket => { const view = this.options.view(ticket); return { ticket_id: view.id, title: view.title, stage: view.stage } }),
+      note: FOLLOWUP_NOTE }) })
   }
 
   private add(item: Item): void {
@@ -156,8 +177,10 @@ export class ClaudeRouter implements Router {
     if (!tool) return fail(`Unknown tool ${use.name}`)
     const args = tool.schema.safeParse(use.input)
     if (!args.success) return fail(`Invalid arguments: ${args.error.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`).join('; ')}`)
+    this.routing = true
     try { return { type: 'tool_result', tool_use_id: use.id, content: JSON.stringify(tool.run(args.data) ?? { ok: true }) } }
     catch (error) { return fail(error instanceof Error ? error.message : String(error)) }
+    finally { this.routing = false }
   }
 
   private params(messages: MessageParam[]): Params {

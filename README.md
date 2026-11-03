@@ -74,6 +74,8 @@ It prints the console thread and the panel URL. Open the **Superagent** thread i
 | `SUPERAGENT_ROUTER` | `claude` with Anthropic credentials, else `rules` | `rules` only accepts explicit requests and relays results |
 | `SUPERAGENT_ROUTER_MODEL` / `SUPERAGENT_ROUTER_EFFORT` | `claude-opus-5-5` / `medium` | The Router's model and effort |
 | `SUPERAGENT_ACCEPT_MODE` | `observe` | Proactive work: `off`, `observe` (record what it would do) or `auto` |
+| `SUPERAGENT_GITHUB_OBSERVE` | none | Which GitHub rows are read for proactive work even when nobody mentions the agent: `all`, `none`, or a comma list of `issues`, `pulls`, `comments`. Ignored when `SUPERAGENT_ACCEPT_MODE` is `off` |
+| `SUPERAGENT_GITHUB_ADMISSION` | the prototype's table | The admission table as JSON, such as `{"comments":{"unlistedAddressed":"inferred"}}`, checked against the prototype's schema. Only the `issues`, `pulls` and `comments` rows |
 | `SUPERAGENT_WATCHDOG_MINUTES` | `15` | Minutes between Watchdog checks; `0` turns it off |
 
 The Router reads Anthropic credentials the way the SDK does: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or an `ant auth login` profile. It sends the default server-side refusal fallback (`fallbacks: "default"`), so a declined request is retried on a fallback model.
@@ -86,12 +88,19 @@ t3code's `/mcp` endpoint accepts only outside-agent (`mcp-client`) sessions.
 - **Alternatively**, on the t3code host, run:
 
   ```bash
-  t3 auth session issue --subject mcp-client --scopes orchestration:read,orchestration:operate --token-only
+  t3 auth session issue --subject mcp-client --scope orchestration:read --scope orchestration:operate --token-only
   ```
 
-  Then pass the result as `T3_MCP_TOKEN`.
+  Then pass the result as `T3_MCP_TOKEN`. A token issued this way is capped at `approval-required`, so workers stop at every tool that needs approval. Use `npm run connect` for a higher ceiling.
 
 The session lasts 30 days, and t3code issues no refresh token. The super agent warns 3 days before expiry; run `npm run connect` again then. Users only ever sign in to t3code.
+
+## Approvals and questions
+
+When a worker waits on a person, its ticket shows in the attention queue:
+
+- **A question** (t3code's `t3_pending_request`) is answered from the console with `superagent_answer`, or from the queue's buttons.
+- **An approval** cannot be answered through `/mcp`; t3code answers approvals only in its own UI. The queue shows the request with an **Approve in T3 Code** link to the thread. The Watchdog raises an alert when an approval has waited a minute.
 
 ## Develop
 
@@ -99,4 +108,21 @@ The session lasts 30 days, and t3code issues no refresh token. The super agent w
 npm run check
 ```
 
-This runs the typecheck and the tests: an end-to-end run against an in-memory t3code with a real git checkout, plus the MCP contract the client sends. `vendor/dsh/UPSTREAM` records the prototype commit the core was copied from; `vendor/dsh/src/policy.ts` has one change, an inlined constant.
+This runs the typecheck and the tests that need no t3code: an end-to-end run against an in-memory t3code with a real git checkout, the MCP contract the client sends, and the synthetic workload (below). `vendor/dsh/UPSTREAM` records the prototype commit the core was copied from; `vendor/dsh/src/policy.ts` has one change, an inlined constant.
+
+### Live tests against a real t3code
+
+```bash
+npm run test:live
+```
+
+This starts its own isolated `t3 serve` for each suite (a temporary base directory and port, a scripted ACP agent as the only provider), so it never touches `~/.t3` or a running t3code. It needs `t3` on `PATH`, or `T3_BIN` set to the binary. Set `T3_LIVE_KEEP=1` to keep the temporary folders. The suites are in `tests/live/`: the contract of every `/mcp` tool the super agent uses, end-to-end runs with approvals and questions, read tracking, and the workload below.
+
+### Acceptance: the synthetic workload
+
+```bash
+npm run acceptance
+npm run acceptance:live
+```
+
+The paper's workload (about 300 messages and 20 requests, generated from `WORKLOAD_SEED`, default 1) is played in memory with the Claude Router scripted, and with the rules router (`npm run acceptance`), then against an isolated t3code (`npm run acceptance:live`, about 45 s). The live run also takes `WORKLOAD_LIVE_ROUTER=rules` and `WORKLOAD_LIVE_SCALE` (such as `0.5`). The paper does not publish its per-category counts, so the mix is our own; see `tests/workload/workload.ts`.
