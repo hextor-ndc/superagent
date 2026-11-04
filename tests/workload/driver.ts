@@ -377,7 +377,8 @@ interface Worker { threadId: string; client: Client; state: WorkerState; seen: n
 
 /** Tiers A and B: FakeT3, with each worker played here; a turn that does not hold ends its run. */
 export class MemoryWorkers implements Workers {
-  readonly t3 = new SlotT3([{ id: 'project-1', workspaceRoot: '' }])
+  // Off, as before: the project's root is set only in open() (docs/multi-project-plan.md, phase 0).
+  readonly t3 = new SlotT3([{ id: 'project-1', workspaceRoot: '' }], { checkWorktrees: false })
   readonly pauseMs = 3
   readonly settleMs = 20_000
   readonly realClock = false

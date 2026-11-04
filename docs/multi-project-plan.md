@@ -1,6 +1,6 @@
 # Plan: multi-project routing for superagent-t3
 
-Status: plan only. Nothing in the repo has changed.
+Status: phase 0 done (2026-11-04, branch feat/multi-project); phases 1 and later not started. The phase 0 probe results are in the phase 0 section and in README "Live tests against a real t3code".
 Base design: "Per-ticket project binding (one instance, one console, many t3code projects)", the winner of both judges, with the grafts they recommended, the errors they found corrected, and a reviewer's corrections applied.
 
 Line numbers are from the current tree at /Users/hextor/coding/COMMON/superagent. Anything not verified in code or tests is marked "to check".
@@ -50,7 +50,7 @@ After this work, one instance serves every project Hector has registered in T3 C
 | D10 | Catalogue `git-worktree` entries fold into their main checkout by `git rev-parse --git-common-dir`. | Seven bardash entries share one purpose string. |
 | D11 | Delivery is `pr` only for the project mapped to `SUPERAGENT_REPOSITORY`. Every other project, including a legacy project with no repository, uses `branch`: commit on the ticket branch, no push, no PR. The rule is written into the assignment text. | The vendored brief says push and open a PR (vendor/dsh/prompts/work.md:29). Its exception is "unless the assignment explicitly requests a different deliverable" (work.md:35), so the rule belongs in `execution.assignment`. |
 | D12 | Completed `branch` tickets appear in a "to review / merge" list until their branch is in the project's default branch. | A ready report on a ticket that follows no thread ends it at once as `completed` (vendor/dsh/src/core/assignments.ts:129-132). `ticketStage` then returns `ended` (vendor/dsh/src/core/stage.ts:10), so `attention()` (runtime.ts:271) never shows it. |
-| D13 | Worktrees for new projects go under `<stateDir>/worktrees/<project-slug>/` if the phase 0 probe shows t3code accepts them. Otherwise the sibling `<root>-superagent` rule. The legacy project keeps its current root. | Sibling folders land inside /Users/hextor/coding, where catalogue scans pick them up (COMMON/sa-testrepo-superagent exists on disk). |
+| D13 | Worktrees for new projects go under `<stateDir>/worktrees/<project-slug>/`. The phase 0 probe 2 showed t3code accepts a worktree anywhere on disk, as long as it is in the project's `git worktree list` (tests/live/contract.spec.ts:495). The legacy project keeps its current root. | Sibling folders land inside /Users/hextor/coding, where catalogue scans pick them up (COMMON/sa-testrepo-superagent exists on disk). |
 | D14 | Base ref for new projects: the local default branch, named by what `refs/remotes/origin/HEAD` points to, else local `main`, else `master`. No `git fetch`. The legacy project keeps `SUPERAGENT_BASE_REF` or `HEAD`. Open question 6. | Hector's checkouts are often on feature branches. A remote-tracking ref can be stale, misses his unpushed local commits, and `-b` from it sets an upstream. |
 | D15 | `SUPERAGENT_MODEL` and `SUPERAGENT_RUNTIME_MODE` stay global for all launches. Per-project overrides only if open question 9 says so (phase 4). | No behaviour change for the legacy project. |
 | D16 | `Config` gets a `stateDir` field. The console token is read or created in `<stateDir>/console-token` (mode 0600) by a function main.ts calls after `loadConfig`. `loadConfig` writes nothing. | config.ts:70 randomizes the token on every start, so every restart makes a new console and Watchdog thread. Config has no `stateDir` today, only paths built from it (config.ts:62, 71). A writing `loadConfig` would write files during unit tests (tests/github.spec.ts:165). |
@@ -88,6 +88,7 @@ All reads are synchronous from an in-memory cache. Two callers are synchronous: 
 - Exact: `realpath(catalogue.workspace + "/" + entry.path) === realpath(t3.workspaceRoot)`. Paths may contain spaces (for example `SE/EHS regulations/codingharness`).
 - Fallback: when no exact entry exists, the longest catalogue path that contains the root is recorded as `insideCatalogued: <path>`. No purpose or notes are copied.
 - `git-worktree` entries fold into the main checkout their common dir names.
+- T3 Code projects are deduplicated by realpath root before the join; see status `ambiguous`.
 - Paths under any project's worktree root, and paths ending in `-superagent`, are excluded.
 
 **Entry fields.** `{ id (t3), key (catalogue path, or t3 title if uncatalogued), title, aliases, root (realpath), commonDir, defaultBranch, worktreeRoot, baseRef, delivery, repository?, access, status, catalogue?: { path, kind, purpose, notes, related, map } | { insideCatalogued } }`.
@@ -100,6 +101,7 @@ All reads are synchronous from an in-memory cache. Two callers are synchronous: 
 - `no-git`: no git, or toplevel differs from root. Covers the 50 `project-folder` entries and the FMEA folder whose `.git` file points at a Windows path.
 - `denied`: by override or the `ARCHIVE/` default.
 - `missing-checkout`: root no longer exists.
+- `ambiguous`: two or more registered projects have the same realpath root. t3code refuses a root that is already registered, also with a trailing slash, but takes a symlinked form of it as a new project (phase 0 probe 3), so one folder can be two T3 Code projects that both launch its worktrees. None of them is routable by default; only the one an override in projects.json names (by t3 id, with `access` not `deny`) is, and the others show as `ambiguous` with that one's key.
 
 **Refresh.** At startup (in place of main.ts:34-38), on a 5-minute timer, on `superagent_projects({ refresh: true })`, when a name given to `superagent_request` does not resolve, and before a new-thread launch when the cache is older than 60 s. A failed refresh keeps the last good list and sets health key `projects` to failing. kv `projects:roster` stores the last good snapshot for display after a restart while t3code is down. It never authorises a launch.
 
@@ -264,7 +266,7 @@ The Router's conversation (kv `router:messages`, claude-router.ts:55) is working
 **Deferred until a need shows up.**
 - `superagent_brief({ since })`: a cross-project digest. The console agent can build one from `superagent_status` and `superagent_history`.
 - `superagent_remember` / `superagent_forget`: operator notes and routing preferences in kv, written only by console tools, never by the Router.
-- `superagent_context({ project, thread })`: read a pasted T3 Code thread link with `t3.read` and save a digest as a note. This is the only way to use earlier threads the superagent did not start, unless the phase 0 `tools/list` probe finds a thread list or search tool.
+- `superagent_context({ project, thread })`: read a pasted T3 Code thread link with `t3.read` and save a digest as a note. The phase 0 probe 4 found `t3_thread_list` (one project or `allProjects`, cursor paging, a `settled` filter) and `t3_thread_search`, both open to the CLI-issued token and both returning each thread's `projectId` (tests/live/contract.spec.ts, probe 4). The search was seen matching a title. That it then looks at branch, PR, project and message text is taken from its tool description, not observed; the same description says it covers active threads only, skips subagent threads and is not exhaustive. So this tool lists a project's earlier threads with `t3_thread_list` instead of needing a pasted link, and uses the search only as a shortcut. Still deferred.
 - `parts` / `group` on `superagent_request`: several projects in one call. Partial failure (one part refused) would need defined behaviour first.
 - `superagent_route` for re-filing an ignored request: calling `superagent_request` again does the same.
 - Codex sessions outside T3 Code (~/.codex): private transcripts in an undocumented format. Open question 10.
@@ -327,7 +329,7 @@ State dir stays `~/.superagent-t3` by default (config.ts:133). Database `<stateD
 2. Inherited hints never override another explicit choice; Router choices (3b) only for `work` projects.
 3. `bindProject` final check and an atomic binding.
 4. Launch: registration, realpath root, toplevel, common dir and directory ownership.
-5. t3code refuses a worktree path that is not a git worktree and an unknown projectId (contract.spec.ts:128-131). Whether it also refuses project A's worktree launched under project B is to check (phase 0 probe). Either way, a worktree of A launched as A passes even if B was meant, so layers 1-3 are the real guard.
+5. t3code refuses a worktree path that is not a git worktree and an unknown projectId (contract.spec.ts:128-131). The phase 0 probe 1 showed it also refuses project A's worktree launched under project B, with the same `invalid_request` (tests/live/contract.spec.ts:461). It accepts any worktree of the same repository under either id, including a project whose root is a linked worktree of another (probe 3). Either way, a worktree of A launched as A passes even if B was meant, so layers 1-3 are the real guard.
 6. Visibility: `superagent_request` returns the resolved project, console acknowledgements are prefixed `[<key>]`, TicketView and the attention app show a project label.
 7. With `checkWorktrees` on, FakeT3 enforces what the phase 0 probe observes, so tests catch mismatches.
 
@@ -351,7 +353,7 @@ Hooks used, all existing:
 
 Nothing is added to core `Ticket` or `Execution` types. Settings is not touched (its schemas are `.strict()`, and policyVersion hashes sources).
 
-New test **tests/vendor-intact.spec.ts** hashes every file under vendor/dsh, with nothing excluded, against **tests/fixtures/vendor-dsh.sha256**. The manifest lives outside vendor/dsh so the vendored tree gains no file. /Users/hextor/coding/COMMON/superagent is not a git repository, so the manifest only pins the current state. It does not prove the tree equals UPSTREAM 6337fc8 plus the one recorded change in vendor/dsh/src/policy.ts (README "Develop"); that is to check by diffing against the upstream commit once.
+New test **tests/vendor-intact.spec.ts** hashes every file under vendor/dsh, with nothing excluded, against **tests/fixtures/vendor-dsh.sha256**. The manifest lives outside vendor/dsh so the vendored tree gains no file. The manifest pins the tree as it is. The repository is now under git (branch feat/multi-project), so git history also shows vendor edits once committed; the test still catches uncommitted ones. It does not prove the tree equals UPSTREAM 6337fc8 plus the one recorded change in vendor/dsh/src/policy.ts (README "Develop"); that is to check by diffing against the upstream commit once.
 
 ---
 
@@ -379,6 +381,20 @@ Tests:
 - Live: the four probes, with results recorded in the README.
 
 Done when: a harness test that launches with a wrong project id fails in memory; probe 2 settles D13; probe 3 settles how catalogued git-worktree projects are routed; probe 4 settles whether earlier T3 Code threads can be listed.
+
+**Results (2026-11-04, t3code 0.1.6, `T3_LIVE=1 npx vitest run tests/live/contract.spec.ts`).** The probes are the describe block "t3code with several projects" (tests/live/contract.spec.ts:429-573), with "Observed:" comments.
+1. Probe 1, foreign worktree: refused. A real worktree of widgets launched under gadgets' id, and gadgets' main checkout under widgets' id, both get `invalid_request` "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.", the same refusal as a plain folder, a missing folder or a subfolder of a worktree. t3code checks the resolved path (symlinks followed, trailing slash dropped) against the project root's `git worktree list`. The main checkout is in that list, so a launch there is accepted; the executor never launches there. An unknown project id gets `invalid_request` "The project was not found." A clientRequestId t3code already answered returns the same thread under any listed project id, whatever the path; under a project id that is not listed it is refused with `orchestration_error` "The operation could not be completed.", which `T3Error.transient` counts as worth retrying.
+2. Probe 2, worktree outside the checkout's parent: accepted and run normally. D13 holds: `<stateDir>/worktrees/<project-slug>/`.
+3. Probe 3, project root that is a linked worktree: `t3_project_create` accepts it. Because `git worktree list` is the same from every worktree of a repository, t3code accepts a worktree made from the main checkout under the linked project's id and the reverse. So t3code cannot keep two projects of one repository apart. Routing consequence for phase 1: the registry groups T3 Code projects by common dir. When the main checkout is registered, it is the one routable project for that repository, and a registered linked worktree of it shows as folded into it (like a catalogue `git-worktree` entry, D10). When only a linked worktree is registered, it is routable as itself, and its worktrees are made from its root. Both share one `agent/*` branch namespace and one `.git/info/exclude`. Separately, `t3_project_create` refuses a root that is already registered, also with a trailing slash, but does not follow symlinks: a symlinked form of a registered root becomes a second project for the same folder, and that folder's worktrees launch under either id. The rule above does not pick between two such projects; the registry dedupes by realpath root first and gives them status `ambiguous` unless an override names one (3.1).
+4. Probe 4, `tools/list`: `t3_thread_list` and `t3_thread_search` exist and work for the CLI-issued token. The list takes `projectId` or `allProjects` (without either, outside a T3 thread, it answers `target_required`) and returns threads newest first with `projectId`, title, status, link, `createdBy` and `creationSource`. The search matched by title in the probe; a match on message text was not seen with the scripted agent and is not relied on. Earlier T3 Code threads can be listed; see the `superagent_context` note in 3.4. Not checked: threads made in the web app rather than over `/mcp`, since the isolated server has none.
+
+**As built, and where it differs from the scope above.**
+- FakeT3 (tests/fake-t3.ts) records `projectId` on each thread (null for scratch). `checkWorktrees` makes `launch` apply t3code's rule from probe 1: the project id must be listed, and the resolved path must be in `git worktree list` of the project's root. A foreign worktree is refused by that rule, and a worktree of the same repository is accepted, as in t3code. A refused launch stores nothing under its clientRequestId. `addProject()` refuses a known id or an already registered root, compared as t3code compares it (trailing slash dropped, symlinks not followed); `removeProject()` keeps the threads. A replayed clientRequestId under a project id that is not listed is refused with `orchestration_error`, as in t3code. `listProjects()` now returns copies.
+- The harness turns `checkWorktrees` on for any FakeT3 that leaves it unset (`t3.checkWorktrees ??= true` in `harness()`), because callers build the FakeT3 and pass it in. SlotT3 in tests/workload/driver.ts passes `checkWorktrees: false`, so driver.ts changed too, which the file list above did not name. The workload also passes with the check on; phase 3a can turn it on there with the projectId property. The `/unused` fixtures build their executors without the harness and are unchanged.
+- `checkout(name = 'widgets', dir?)`: with `dir` from an earlier checkout, the repository goes into that temp dir and is removed with it.
+- tests/vendor-intact.spec.ts compares every file under vendor/dsh with tests/fixtures/vendor-dsh.sha256 (`shasum -a 256` format; the spec's header has the command that writes it) and checks on a temp copy that a changed byte, an added dotfile and a removed file all show. A root .gitattributes marks vendor/dsh and the manifest `-text`, so a Windows clone with core.autocrlf gets the same bytes; the spec checks that attribute.
+- The AGENTS.md / repositories.json update that phase 1 names is outside this repository and waits for Hector's OK.
+- Outside the phase scope, to get the live suite green: two contract tests ("waits until a run ends", "sends in each mode") and one read-tracking test failed on and off, also on the unchanged tree. Under load t3code 0.1.6 shows a run as `running` before its ACP agent has the prompt, and a send in mode auto until then queues instead of steering (seen in 9 of 25 tries in a scratch probe). Those tests now also wait for the scripted agent's log to show the prompt (25 of 25 steered), and the wait test accepts `starting` as well as `running` for a run that has not ended. For the executor this means a follow-up sent just after a launch can be queued, not steered; read tracking already handles a queued run.
 
 ### Phase 1. Read-only registry, state files, lock
 
@@ -589,7 +605,7 @@ DeepSeek's summary of the paper lists parts this port does not have yet. These t
 - Workers keep `SUPERAGENT_MODEL` by default.
 - t3code stores `workspaceRoot` as given (contract.spec.ts:107); realpath on both sides.
 - Hint precedence is enforced in `bindProject`, not only in `route()`.
-- Worktrees outside the checkout's parent are a live probe, not a fact.
+- Worktrees outside the checkout's parent are a live probe, not a fact. (Phase 0: the probe showed t3code accepts them.)
 - Console request threads are already separate per request (console-source.ts:14).
 - Correct console-tools lines: `superagent_request` at :43 (schema :150-153), `superagent_answer` at :48 (follow-up :71).
 - A random old token means a new console thread on upgrade; `intro-v2` matters only when the token was set.

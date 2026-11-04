@@ -1,6 +1,6 @@
 /** A super agent wired to a t3code (the in-memory fake, or any `T3Client`) and a real git checkout, for the tests. */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -14,6 +14,7 @@ import { startHttp } from '../src/http/server.ts'
 import type { Gh } from '../src/sources/github.ts'
 import type { ModelCall } from '../src/router/claude-router.ts'
 import type { T3Client } from '../src/t3/client.ts'
+import { FakeT3 } from './fake-t3.ts'
 
 export const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
@@ -29,13 +30,17 @@ export function removeCheckout(place: { dir: string }): void {
   try { rmSync(place.dir, { recursive: true, force: true, maxRetries: 3 }) } catch { /* left for the OS to clear */ }
 }
 
-/** A temporary git repository with one commit; the worktrees of a harness on it go beside it, in the same directory. */
-export function checkout(): { dir: string; root: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'superagent-'))
-  made.add(dir)
-  const root = join(dir, 'widgets')
+/**
+ * A temporary git repository `name` with one commit; the worktrees of a harness on it go beside it, in the same directory.
+ * With `dir`, the directory of an earlier checkout, the repository goes there instead of a new directory, so several
+ * repositories share one temp dir and are removed with it.
+ */
+export function checkout(name = 'widgets', dir?: string): { dir: string; root: string } {
+  if (dir === undefined) made.add(dir = mkdtempSync(join(tmpdir(), 'superagent-')))
+  const root = join(dir, name)
+  if (existsSync(root)) throw new Error(`${root} exists`)
   execFileSync('git', ['init', '-q', '-b', 'main', root])
-  writeFileSync(join(root, 'README.md'), '# widgets\n')
+  writeFileSync(join(root, 'README.md'), `# ${name}\n`)
   git(root, '-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.')
   git(root, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init')
   return { dir, root }
@@ -48,11 +53,13 @@ export interface Harness { runtime: Runtime; http: Server; base: string; errors:
 
 /**
  * Starts a Runtime on `t3` with its HTTP server on a free port. `deps.timing` replaces the fast default timing, and
- * `deps.project` the t3code project, for a live t3code.
+ * `deps.project` the t3code project, for a live t3code. A FakeT3 that leaves `checkWorktrees` unset gets it turned on, so
+ * a launch with the wrong project id or a path that is not one of the project's worktrees fails as it would in t3code.
  */
 export async function harness(t3: T3Client, place: { dir: string; root: string }, database = ':memory:', overrides: Partial<Config> = {},
   deps: { gh?: Gh; model?: ModelCall; timing?: Timing; project?: string } = {}): Promise<Harness> {
   const errors: string[] = []
+  if (t3 instanceof FakeT3) t3.checkWorktrees ??= true
   const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', projectRoot: place.root, worktreeRoot: join(place.dir, 'worktrees'), baseRef: 'HEAD',
     router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' },
     repository: 'acme/widgets', port: 0, publicUrl: '', consoleToken: 'console-secret', watchdogMinutes: 0, database, operator: 'hector', maxWorkers: 2,

@@ -108,7 +108,7 @@ When a worker waits on a person, its ticket shows in the attention queue:
 npm run check
 ```
 
-This runs the typecheck and the tests that need no t3code: an end-to-end run against an in-memory t3code with a real git checkout, the MCP contract the client sends, and the synthetic workload (below). `vendor/dsh/UPSTREAM` records the prototype commit the core was copied from; `vendor/dsh/src/policy.ts` has one change, an inlined constant.
+This runs the typecheck and the tests that need no t3code: an end-to-end run against an in-memory t3code with a real git checkout, the MCP contract the client sends, and the synthetic workload (below). `vendor/dsh/UPSTREAM` records the prototype commit the core was copied from; `vendor/dsh/src/policy.ts` has one change, an inlined constant. `tests/vendor-intact.spec.ts` hashes every file under `vendor/dsh` against `tests/fixtures/vendor-dsh.sha256`, so any edit to the vendored core fails the suite (`.gitattributes` keeps those files' line endings as committed); after a deliberate update, write the manifest again with the command in that spec's header.
 
 ### Live tests against a real t3code
 
@@ -117,6 +117,17 @@ npm run test:live
 ```
 
 This starts its own isolated `t3 serve` for each suite (a temporary base directory and port, a scripted ACP agent as the only provider), so it never touches `~/.t3` or a running t3code. It needs `t3` on `PATH`, or `T3_BIN` set to the binary. Set `T3_LIVE_KEEP=1` to keep the temporary folders. The suites are in `tests/live/`: the contract of every `/mcp` tool the super agent uses, end-to-end runs with approvals and questions, a worker whose agent process crashes, read tracking, and the workload below. Approvals are answered the way t3code's web app does. Telemetry is off for every test server. The pull request link test runs t3's runtime binary (`~/.t3/runtime/versions/<version>/t3`, only read and run) with a temporary HOME, no GitHub tokens or git config, and a proxy that refuses every request.
+
+#### Several projects on one t3code
+
+The contract suite's "t3code with several projects" block probes what multi-project routing (docs/multi-project-plan.md) depends on. With t3code 0.1.6 it showed:
+
+- **A worktree of another project is refused.** A launch whose `worktreePath` is not in `git worktree list` of the project's root gets `invalid_request` "worktreePath must be one of the project's git worktrees", whether the path is another repository's worktree, a plain folder, a missing folder or a subfolder of a worktree. The path is resolved first, so a symlinked form of a worktree's path is accepted. An unknown project id gets `invalid_request` "The project was not found." A replayed clientRequestId under an unknown project id gets `orchestration_error`.
+- **Worktrees can live anywhere.** A worktree outside the checkout's parent folder, as under `<state dir>/worktrees/`, is accepted and runs normally.
+- **Projects of one repository are not kept apart.** A linked worktree can be registered as a project of its own, and t3code then accepts each project's worktrees under the other's id, because both have the same `git worktree list`. The super agent has to tell them apart itself. A root that is already registered is refused again, also with a trailing slash, but a symlinked form of it becomes a second project for the same folder.
+- **Threads can be listed and searched.** `t3_thread_list` (with `projectId` or `allProjects`) and `t3_thread_search` exist and work for a CLI-issued token; each row carries the thread's `projectId`. The search's own description says it covers active threads only and is not exhaustive.
+
+The in-memory t3code (`tests/fake-t3.ts`) applies the same launch check when built with `checkWorktrees: true`; the test harness turns it on.
 
 ### Acceptance: the synthetic workload
 

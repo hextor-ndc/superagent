@@ -1,5 +1,6 @@
 /** An in-memory t3code for tests: threads, runs and the calls the super agent made. */
-import { mkdtempSync, rmSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll } from 'vitest'
@@ -7,7 +8,10 @@ import { T3Error, type LaunchInput, type LaunchResult, type PendingRequest, type
   type T3Status, type ThreadRead, type WaitResult } from '../src/t3/client.ts'
 
 interface FakeThread {
-  id: string; title: string; link: string; worktreePath: string | null; branch: string | null; pinned: boolean
+  id: string; title: string; link: string
+  /** The project the thread was launched in; null for a scratch thread. */
+  projectId: string | null
+  worktreePath: string | null; branch: string | null; pinned: boolean
   runs: { id: string; status: T3Status }[]
   messages: { id: string; text: string; clientRequestId: string }[]
   pullRequests: string[]
@@ -29,6 +33,17 @@ function removeScratch(dir: string): void {
   try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }) } catch { /* left for the OS to clear */ }
 }
 
+export interface FakeT3Options {
+  /**
+   * Refuse launches the way t3code 0.1.6 does (tests/live/contract.spec.ts, "t3code with several projects"): an unknown
+   * project id, and a worktree path that is not in `git worktree list` of the project's root after resolving symlinks, with
+   * `T3Error('t3_thread_launch', 'invalid_request')`. A worktree of another repository is refused by the same rule; one of
+   * the same repository is accepted, as t3code accepts it. Left unset, launches take any project and path, as before;
+   * `harness()` turns it on for a FakeT3 that does not set it.
+   */
+  checkWorktrees?: boolean
+}
+
 export class FakeT3 implements T3Client {
   readonly threads = new Map<string, FakeThread>()
   readonly calls: { tool: string; args: unknown }[] = []
@@ -40,7 +55,9 @@ export class FakeT3 implements T3Client {
   private seq = 0
   /** One temporary folder per FakeT3, made on the first scratch launch, that holds a folder for each scratch thread. */
   private scratchRoot?: string
-  constructor(readonly projects: ProjectSummary[]) {}
+  /** See `FakeT3Options.checkWorktrees`; `harness()` sets it when it is undefined. */
+  checkWorktrees: boolean | undefined
+  constructor(readonly projects: ProjectSummary[], options: FakeT3Options = {}) { this.checkWorktrees = options.checkWorktrees }
 
   private id(prefix: string) { return `${prefix}-${++this.seq}` }
   private once<T>(key: string, make: () => T): T {
@@ -53,21 +70,65 @@ export class FakeT3 implements T3Client {
     return thread
   }
 
-  async listProjects() { this.calls.push({ tool: 't3_project_list', args: {} }); return this.projects }
+  /** A copy, so a caller that keeps the list does not see later `addProject` and `removeProject` calls. */
+  async listProjects() { this.calls.push({ tool: 't3_project_list', args: {} }); return this.projects.map(project => ({ ...project })) }
+  /**
+   * Registers a project, as Hector adding a folder in t3code would. A known id is refused, and so is a root already
+   * registered, compared as t3code 0.1.6 compares it (contract.spec.ts, "refuses a registered root again"): trailing slashes
+   * dropped, symlinks not followed. So a symlinked form of a registered root becomes a second project for the same folder.
+   */
+  addProject(project: ProjectSummary): void {
+    if (this.projects.some(known => known.id === project.id)) throw new Error(`project ${project.id} exists`)
+    const root = (path: string) => path.replace(/(?<=.)\/+$/, '')
+    if (this.projects.some(known => root(known.workspaceRoot) === root(project.workspaceRoot))) {
+      throw new Error('invalid_request The workspace is already registered to a project.')
+    }
+    this.projects.push({ ...project })
+  }
+  /** Removes a project from the list. Its threads stay and keep their projectId; with `checkWorktrees`, new launches in it are refused. */
+  removeProject(id: string): void {
+    const index = this.projects.findIndex(project => project.id === id)
+    if (index < 0) throw new Error(`no project ${id}`)
+    this.projects.splice(index, 1)
+  }
   async launch(input: LaunchInput): Promise<LaunchResult> {
     this.calls.push({ tool: 't3_thread_launch', args: input })
-    return this.once(input.clientRequestId, () => this.create(input.title, input.worktreePath, input.branch ?? null, input.message, input.clientRequestId))
+    // A replay of an answered clientRequestId gets the stored thread whatever its path says, but t3code 0.1.6 still refuses it
+    // when the project id is not listed (contract.spec.ts, probe 1).
+    if (this.checkWorktrees && this.requests.has(input.clientRequestId) && !this.projects.some(known => known.id === input.projectId)) {
+      throw new T3Error('t3_thread_launch', 'orchestration_error', 'The operation could not be completed.')
+    }
+    // A refusal stores nothing under the clientRequestId, so a retry is checked again.
+    return this.once(input.clientRequestId, () => {
+      if (this.checkWorktrees) this.checkLaunch(input)
+      return this.create(input.projectId, input.title, input.worktreePath, input.branch ?? null, input.message, input.clientRequestId)
+    })
+  }
+  /** What t3code checks before it accepts an `existing_worktree` launch; see `FakeT3Options.checkWorktrees`. */
+  private checkLaunch(input: LaunchInput): void {
+    const project = this.projects.find(known => known.id === input.projectId)
+    if (!project) throw new T3Error('t3_thread_launch', 'invalid_request', 'The project was not found.')
+    const refuse = () => new T3Error('t3_thread_launch', 'invalid_request', 'worktreePath must be one of the project\'s git worktrees. t3_worktree_list shows them.')
+    let path: string, listed: string
+    try {
+      path = realpathSync(input.worktreePath)
+      listed = execFileSync('git', ['-C', project.workspaceRoot, 'worktree', 'list', '--porcelain'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    } catch { throw refuse() }
+    const worktrees = listed.split('\n').filter(line => line.startsWith('worktree ')).map(line => line.slice('worktree '.length))
+    if (!worktrees.includes(path)) throw refuse()
   }
   async launchScratch(input: ScratchLaunchInput): Promise<LaunchResult> {
     this.calls.push({ tool: 't3_thread_launch', args: { scratch: true, ...input } })
-    return this.once(input.clientRequestId, () => this.create(input.title, mkdtempSync(join(this.scratch(), 'thread-')), null, input.message, input.clientRequestId))
+    return this.once(input.clientRequestId, () => this.create(null, input.title, mkdtempSync(join(this.scratch(), 'thread-')), null, input.message, input.clientRequestId))
   }
   private scratch(): string {
     if (!this.scratchRoot) scratchRoots.add(this.scratchRoot = mkdtempSync(join(tmpdir(), 'fake-t3-scratch-')))
     return this.scratchRoot
   }
-  private create(title: string, worktreePath: string | null, branch: string | null, message: string | undefined, requestId: string): LaunchResult {
-    const thread: FakeThread = { id: this.id('thread'), title, link: '', worktreePath, branch, pinned: false, runs: [], messages: [], pullRequests: [], pending: [] }
+  private create(projectId: string | null, title: string, worktreePath: string | null, branch: string | null, message: string | undefined,
+    requestId: string): LaunchResult {
+    const thread: FakeThread = { id: this.id('thread'), title, link: '', projectId, worktreePath, branch, pinned: false, runs: [], messages: [], pullRequests: [],
+      pending: [] }
     thread.link = `https://app.t3.codes/thread/${thread.id}`
     this.threads.set(thread.id, thread)
     let runId: string | null = null
