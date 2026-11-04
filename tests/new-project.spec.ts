@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { afterAll, afterEach, describe, expect, it } from 'vitest'
-import { addEntry, STEPS, t3Cli, updateFile, type Step, type T3Cli } from '../src/app/new-project.ts'
+import { addEntry, PART_WAY, STEPS, t3Cli, updateFile, type Step, type T3Cli } from '../src/app/new-project.ts'
 import { checkout, data, mcp, until } from './harness.ts'
 import { setup, workerLaunches, worktreesOf, type Setup } from './two-projects.ts'
 
@@ -318,10 +318,13 @@ describe('superagent_new_project', () => {
       const failed = await env.call(args)
       expect(failed.isError, step).toBe(true)
       expect(failed.text).toContain(`stopped before ${step}`)
+      // A failure part way says so, and a refusal does not: the panel's form tells them apart by it.
+      expect(failed.text).toContain(PART_WAY)
       // Other arguments are refused while the job is unfinished.
       const other = await env.call({ ...args, purpose: 'Something else.' })
       expect(other.isError, step).toBe(true)
       expect(other.text).toContain(`A new project at NDC/step-${step} was started on`)
+      expect(other.text).not.toContain(PART_WAY)
       const done = await env.call(args)
       expect(done.isError, `${step}: ${done.text}`).toBeUndefined()
       expect(done.data).toMatchObject({ key: `NDC/step-${step}`, status: 'ready', repeated: true, request: { status: 'accepted', project: `NDC/step-${step}` } })

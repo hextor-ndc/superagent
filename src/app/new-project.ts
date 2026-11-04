@@ -21,6 +21,9 @@ import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep 
 import { promisify } from 'node:util'
 import type { T3Client } from '../t3/client.ts'
 import { slug, type ProjectRegistry } from './projects.ts'
+import { goodName, NAME_RULE, PART_WAY } from './folder-name.ts'
+
+export { goodName, NAME_RULE, PART_WAY, SEGMENT } from './folder-name.ts'
 
 const run = promisify(execFile)
 
@@ -149,19 +152,26 @@ const ENTRY_FIELDS = ['path', 'purpose', 'flow', 'modules', 'notes', 'related', 
   'manifests', 'existing_docs', 'readme_created', 'git_checked_on'] as const
 /** Fields some entries have that a new project has nothing for (hashed source samples, later checks). */
 const OPTIONAL_FIELDS = new Set(['source_evidence', 'subprojects', 'retrieval_optimization_update', 'hosted_production_check'])
-/** One folder name: letters, digits, spaces and `. _ + -`, not starting with a dot or a dash and not ending in a dot or a space. */
-const SEGMENT = /^[A-Za-z0-9][A-Za-z0-9 ._+-]*$/
 /** What the operator still has to do in T3 Code for a project the super agent added: it cannot read or change these settings. */
 export const manualStep = (title: string): string => `In T3 Code, open the settings of the project "${title}" and turn off PR watching and `
   + '"continue threads after server update". The super agent cannot read or change these settings.'
 const DEFAULT_FLOW = 'New project: nothing is built yet.'
 
 /**
- * Runs or finishes a job. Throws, having written nothing, when the call is refused; throws with the step's error when a step
- * fails, and a second call with the same arguments then goes on from there.
+ * Runs or finishes a job. Throws, having written nothing, when the call is refused; throws with the step's error and
+ * `PART_WAY` when a step fails, and a second call with the same arguments then goes on from there.
  */
 export async function newProject(context: NewProjectContext, given: NewProjectInput): Promise<NewProjectResult> {
   const plan = await prepare(context, given)
+  try {
+    return await carryOut(context, plan)
+  } catch (error) {
+    throw new Error(`${message(error)} ${PART_WAY}`, { cause: error })
+  }
+}
+
+/** The steps of a job that `prepare` let through, each checking what is there before it acts. */
+async function carryOut(context: NewProjectContext, plan: Plan): Promise<NewProjectResult> {
   const { abs, folder, input, jobPath } = plan
   const env = context.env ?? process.env
   const now = context.now ?? (() => new Date())
@@ -255,11 +265,8 @@ async function prepare(context: NewProjectContext, given: NewProjectInput): Prom
   if (isAbsolute(typed) || typed.startsWith('~')) throw new Error(`${typed} is not relative: give the folder relative to the workspace ${workspace}, such as PERSONAL/garden.`)
   const segments = typed.split('/')
   if (segments.some(part => part === '..' || part === '.')) throw new Error(`${typed} contains "." or "..": give the folder as a plain path inside the workspace.`)
-  const bad = segments.find(part => !SEGMENT.test(part) || /[. ]$/.test(part) || part.endsWith('.lock') || part.length > 100)
-  if (bad !== undefined) {
-    throw new Error(`"${bad}" cannot be a folder name here: use letters, digits, spaces and . _ + -, not starting with a dot or a dash, `
-      + 'and not ending in a dot, a space or ".lock".')
-  }
+  const bad = segments.find(part => !goodName(part))
+  if (bad !== undefined) throw new Error(`"${bad}" cannot be a folder name here: ${NAME_RULE}`)
 
   // Each part of the path that exists, as it is on disk: a symlink is followed only to something that exists, and the new
   // folder itself is never one. Then the folder resolves inside the workspace: its nearest existing parent's real path, so a
@@ -325,6 +332,66 @@ async function prepare(context: NewProjectContext, given: NewProjectInput): Prom
   if (top && !(job && top === abs)) throw new Error(`${folder} would be inside the git checkout ${top}. Choose a folder outside it.`)
   if (!await identity(existsSync(abs) ? abs : existingReal, env)) throw new Error(noIdentity(folder))
   return { folder, abs, catalogue, input, hash, jobPath, ...job ? { job } : {} }
+}
+
+/** What the panel's New project form offers, as `superagent_new_project_options` returns it. */
+export interface NewProjectOptions {
+  /** Whether `superagent_new_project` can run at all: a catalogue is configured and it can be changed. */
+  enabled: boolean
+  /** Why it cannot, and how to change that; only when `enabled` is false. */
+  why?: string
+  enable?: string
+  /** The catalogue's workspace (its real path), which a new project's folder is relative to. */
+  workspace?: string
+  /**
+   * The top-level folders of the workspace the catalogue files projects under, that a new project may go in: on disk, not a
+   * symlink, not catalogued themselves, not inside a git checkout, and not denied (`ARCHIVE/`, projects.json, ticket worktrees).
+   */
+  groups: string[]
+  /** Whether a new project may go at the top of the workspace itself, by the same rules. */
+  top_level: boolean
+  /** The rule for the new folder's name; the tool checks it again. */
+  name_rule: string
+  /** Why every call would be refused for now (the t3 CLI cannot run, git has no identity), though the form is shown. */
+  warning?: string
+}
+
+/**
+ * What the panel's New project form needs, read only: whether new projects are enabled, the workspace, the folders a new
+ * project can go in, and the folder name rule. `superagent_new_project` stays the authority: it checks everything again.
+ */
+export async function newProjectOptions(context: Pick<NewProjectContext, 'catalogue' | 'projects' | 'cli' | 'env'>): Promise<NewProjectOptions> {
+  const name_rule = `A folder name must ${NAME_RULE}`
+  const off = (why: string, enable: string): NewProjectOptions => ({ enabled: false, why, enable, groups: [], top_level: false, name_rule })
+  const catalogue = context.catalogue
+  if (!catalogue) {
+    return off('No catalogue is configured, and new projects are added to it.', 'Set SUPERAGENT_CATALOGUE to the repositories.json that '
+      + 'lists the folders on this machine, and start the super agent again.')
+  }
+  const read = readCatalogue(catalogue)
+  if ('problem' in read) return off(`${catalogue} cannot be changed by superagent_new_project: ${read.problem}.`, 'Fix the file, then reload this page.')
+  const workspace = real(read.data.workspace)
+  if (!workspace) return off(`The catalogue's workspace ${read.data.workspace} does not exist.`, 'Fix "workspace" in the catalogue, then reload this page.')
+  const env = context.env ?? process.env
+  const inGit = (dir: string) => run('git', ['-C', dir, 'rev-parse', '--show-toplevel'], { env, timeout: 10_000 }).then(() => true, () => false)
+  const catalogued = new Set(read.data.repositories.map(item => item.path.toLowerCase()))
+  const tops = [...new Set(read.data.repositories.flatMap(item => item.path.includes('/') ? [item.path.split('/')[0]!] : []))]
+  let groups: string[]
+  let topLevel: boolean
+  try {
+    const open = async (name: string) => {
+      const abs = join(workspace, name)
+      if (!goodName(name) || catalogued.has(name.toLowerCase()) || !lstatOf(abs)?.isDirectory()) return false
+      return !context.projects.denial(abs) && !await inGit(abs)
+    }
+    groups = (await Promise.all(tops.map(async name => await open(name) ? [name] : []))).flat().sort(compare)
+    topLevel = !context.projects.denial(workspace) && !await inGit(workspace)
+  } catch (error) {
+    // projects.json or the catalogue cannot be read by the registry, which refuses every call the same way.
+    return off(message(error), 'Fix the file, then reload this page.')
+  }
+  const warning = context.cli.problem() ?? (await identity(workspace, env) ? undefined : noIdentity('a new project'))
+  return { enabled: true, workspace, groups, top_level: topLevel, name_rule, ...warning ? { warning } : {} }
 }
 
 /** Whether git has a name and an email to commit with, from the operator's own git config. None is ever made up. */

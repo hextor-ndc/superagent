@@ -11,6 +11,7 @@
  * service is killed (SIGKILL, so the lock is stale) while both workers run, started again, and must finish both tickets.
  * Then a ticket filed in the wrong project is rerouted (an answer on the old ticket is refused), and requests naming a denied
  * or unknown project are refused. t3code's scratch project, which the console thread puts in its list, is not listed.
+ * The console's tool list has `superagent_new_project_form` with its MCP App resource, as `superagent_attention` has.
  * Last, `superagent_new_project` starts `PERSONAL/garden` in the temp catalogue (repositories.json and REPOSITORIES.md in the
  * server's folder, which is the catalogue's workspace): the folder, its git repository, the T3 Code project through the t3
  * CLI on this server's base dir, both catalogue entries, and a first request whose worker runs in the new project's worktree.
@@ -29,6 +30,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { McpT3Client } from '../../src/t3/client.ts'
+import { ATTENTION_URI, MCP_APP_MIME, NEW_PROJECT_URI, newProjectPage } from '../../src/mcp/attention-app.ts'
 import { eventually, freePort, live, poll, skipReason, startT3, t3Bin, type T3Server } from './t3-server.ts'
 
 const REPO = fileURLToPath(new URL('../..', import.meta.url))
@@ -284,6 +286,17 @@ describe.skipIf(!live)(`superagent with two projects on a real t3code${live ? ''
     // By path and by T3 Code id the same project resolves.
     expect(await call('superagent_projects', { query: gadgets.root })).toMatchObject({ projects: [expect.objectContaining({ key: 'gadgets' })] })
     expect(existsSync(join(stateDir, 'worktrees', 'vault'))).toBe(false)
+  }, TEST_MS)
+
+  it('offers the New project form as an MCP App in the console tool list, next to the attention queue', async () => {
+    const { tools } = await service!.console.listTools()
+    const form = tools.find(tool => tool.name === 'superagent_new_project_form')
+    expect(form?._meta).toEqual({ ui: { resourceUri: NEW_PROJECT_URI }, 'ui/resourceUri': NEW_PROJECT_URI })
+    expect(tools.find(tool => tool.name === 'superagent_attention')?._meta).toEqual({ ui: { resourceUri: ATTENTION_URI }, 'ui/resourceUri': ATTENTION_URI })
+    const page = await service!.console.readResource({ uri: NEW_PROJECT_URI })
+    expect(page.contents).toEqual([{ uri: NEW_PROJECT_URI, mimeType: MCP_APP_MIME, text: newProjectPage('app') }])
+    // With the temp catalogue, which files nothing under a folder yet, new projects are on and only the top level is offered.
+    expect(await call('superagent_new_project_form')).toMatchObject({ enabled: true, workspace: realpathSync(server.dir), groups: [], top_level: true })
   }, TEST_MS)
 
   it('starts a new project in the catalogue and runs its first request in the new project\'s own worktree', async () => {

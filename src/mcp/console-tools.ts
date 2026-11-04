@@ -1,6 +1,6 @@
 /**
  * Point 2: the console tools, which the agent of the Superagent thread in t3code uses to run the super agent for the
- * operator. `superagent_attention` also carries the MCP App of point 3.
+ * operator. `superagent_attention` and `superagent_new_project_form` also carry the MCP Apps of point 3.
  */
 import { createHash } from 'node:crypto'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -13,7 +13,7 @@ import { BINDING_PREFIX, denied, rerouteKey, STATUSES, type ProjectBinding, type
 import type { NewProjectInput } from '../app/new-project.ts'
 import type { AddProjectInput, AddProjectResult } from '../app/add-project.ts'
 import type { PendingQuestion, PendingRequest } from '../t3/client.ts'
-import { ATTENTION_URI, MCP_APP_MIME, attentionPage } from './attention-app.ts'
+import { ATTENTION_URI, MCP_APP_MIME, NEW_PROJECT_URI, attentionPage, newProjectPage } from './attention-app.ts'
 import { ok } from './result.ts'
 import { alerts, dismissAlert, lastCheck } from './watchdog-tools.ts'
 
@@ -86,6 +86,7 @@ export function consoleActions(runtime: Runtime) {
         .catch((error: unknown) => ({ refused: error instanceof Error ? error.message : String(error) }))
       return { ...made, request: filed }
     },
+    superagent_new_project_options: () => runtime.newProjectOptions(),
     superagent_add_project: async ({ projects, request, wait_seconds = WAIT_SECONDS }: { projects: AddProjectInput[]; request?: string; wait_seconds?: number }) => {
       if (request?.trim() && projects.length !== 1) {
         throw new Error(`A first request goes with one project, and ${projects.length} were given: add them without \`request\`, then file each `
@@ -203,6 +204,11 @@ export function consoleActions(runtime: Runtime) {
   }
 }
 export type ConsoleAction = keyof ReturnType<typeof consoleActions>
+
+/** What `superagent_new_project_form` tells the console agent, which reads the tool's text and not the form. */
+const FORM_SHOWN = 'The New project form is shown to the operator in place of this tool call. Its Create button calls superagent_new_project '
+  + 'itself, with what the operator entered: do not call it for them, and wait for them to tell you what happened. If they say no form '
+  + 'is shown, ask them for the group, the repo name and a one-sentence purpose, then call superagent_new_project.'
 
 /** How long `superagent_request` waits for the Router's decision by default, and at most. */
 const WAIT_SECONDS = 20
@@ -390,6 +396,8 @@ export function consoleServer(runtime: Runtime): McpServer {
 
   server.registerResource('attention', ATTENTION_URI, { mimeType: MCP_APP_MIME, description: 'What waits for a person.' },
     async () => ({ contents: [{ uri: ATTENTION_URI, mimeType: MCP_APP_MIME, text: attentionPage('app') }] }))
+  server.registerResource('new-project', NEW_PROJECT_URI, { mimeType: MCP_APP_MIME, description: 'The New project form.' },
+    async () => ({ contents: [{ uri: NEW_PROJECT_URI, mimeType: MCP_APP_MIME, text: newProjectPage('app') }] }))
 
   server.registerTool('superagent_attention', {
     description: 'What waits for a person, first: questions to answer, approvals to give in T3 Code, results to review, blocked or failed tickets, and the '
@@ -441,6 +449,19 @@ export function consoleServer(runtime: Runtime): McpServer {
       wait_seconds: wait,
     },
   }, async args => ok(await actions.superagent_new_project(args)))
+  server.registerTool('superagent_new_project_options', {
+    description: 'What a new project can be, for the panel\'s New project form: whether superagent_new_project is enabled (SUPERAGENT_CATALOGUE '
+      + 'set and the catalogue writable) and why not, the catalogue\'s workspace, the top-level folders a new project can go in (ARCHIVE/ and '
+      + 'other denied folders left out), whether the workspace\'s top level can take one, and the folder name rule. Changes nothing.',
+    annotations: readOnly,
+  }, async () => ok(await actions.superagent_new_project_options()))
+  server.registerTool('superagent_new_project_form', {
+    description: 'Show the operator the New project form in this thread, when they ask to start a new project. They choose the group and '
+      + 'type the repo name, the purpose and the optional title, notes and first request; its Create button calls superagent_new_project '
+      + 'itself with exactly those values, so do not call it for them. The form is drawn by providers that render MCP Apps; with others, '
+      + 'ask the operator for the fields and call superagent_new_project. Returns what superagent_new_project_options returns. Changes nothing.',
+    annotations: readOnly, _meta: { ui: { resourceUri: NEW_PROJECT_URI }, 'ui/resourceUri': NEW_PROJECT_URI },
+  }, async () => ok({ form: FORM_SHOWN, ...await actions.superagent_new_project_options() }))
   server.registerTool('superagent_add_project', {
     description: 'Add folders the catalogue lists, and that are git checkouts, as T3 Code projects, so work can go there: the ones '
       + 'superagent_projects shows with status not-registered. It runs the t3 CLI only; it writes nothing into the repository or the catalogue. '
