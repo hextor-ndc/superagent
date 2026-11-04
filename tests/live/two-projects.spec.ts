@@ -11,6 +11,9 @@
  * service is killed (SIGKILL, so the lock is stale) while both workers run, started again, and must finish both tickets.
  * Then a ticket filed in the wrong project is rerouted (an answer on the old ticket is refused), and requests naming a denied
  * or unknown project are refused. t3code's scratch project, which the console thread puts in its list, is not listed.
+ * Last, `superagent_new_project` starts `PERSONAL/garden` in the temp catalogue (repositories.json and REPOSITORIES.md in the
+ * server's folder, which is the catalogue's workspace): the folder, its git repository, the T3 Code project through the t3
+ * CLI on this server's base dir, both catalogue entries, and a first request whose worker runs in the new project's worktree.
  *
  * Run with `T3_LIVE=1 npx vitest run tests/live/two-projects.spec.ts`; `TWO_PROJECTS_LOGS=1` prints the service's output.
  */
@@ -23,7 +26,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { McpT3Client } from '../../src/t3/client.ts'
-import { eventually, freePort, live, poll, skipReason, startT3, type T3Server } from './t3-server.ts'
+import { eventually, freePort, live, poll, skipReason, startT3, t3Bin, type T3Server } from './t3-server.ts'
 
 const REPO = fileURLToPath(new URL('../..', import.meta.url))
 const TEST_MS = 300_000
@@ -68,6 +71,9 @@ describe.skipIf(!live)(`superagent with two projects on a real t3code${live ? ''
       SUPERAGENT_PROJECT_ROOT: server.checkout, SUPERAGENT_STATE_DIR: stateDir, SUPERAGENT_ROUTER: 'rules', SUPERAGENT_MODEL: 'scripted/plain',
       SUPERAGENT_WATCHDOG_MINUTES: '0', SUPERAGENT_OPERATOR: 'hector', SUPERAGENT_CONSOLE_TOKEN: consoleToken, SUPERAGENT_PORT: String(port),
       SUPERAGENT_PUBLIC_URL: `http://127.0.0.1:${port}`, T3_MCP_URL: server.url, T3_MCP_TOKEN: token,
+      // superagent_new_project: the temp catalogue, the t3 CLI on this server's base dir only, and git with an identity of the test's own.
+      SUPERAGENT_CATALOGUE: join(server.dir, 'repositories.json'), T3_BIN: t3Bin, SUPERAGENT_T3_BASE_DIR: server.baseDir,
+      T3CODE_TELEMETRY_ENABLED: 'false', TMPDIR: server.dir, GIT_CONFIG_GLOBAL: join(server.dir, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
     })
     let output = ''
     const child = spawn(process.execPath, ['--no-warnings=ExperimentalWarning', '--import', 'tsx', 'src/main.ts', 'start'],
@@ -125,6 +131,12 @@ describe.skipIf(!live)(`superagent with two projects on a real t3code${live ? ''
     stateDir = join(server.dir, 'state')
     mkdirSync(stateDir, { recursive: true })
     writeFileSync(join(stateDir, 'projects.json'), JSON.stringify({ [vault.root]: { access: 'deny' } }, null, 2))
+    // An empty catalogue of the server's folder, and the index next to it, for superagent_new_project.
+    writeFileSync(join(server.dir, 'repositories.json'), `${JSON.stringify({ schema_version: 1, workspace: server.dir,
+      scope: '0 mapped entries: 0 Git repositories, 0 linked worktrees and 0 additional project or reference folders.', repositories: [] }, null, 2)}\n`)
+    writeFileSync(join(server.dir, 'REPOSITORIES.md'), ['# Index', '', '## Repository and project catalog', '', '### PERSONAL', '',
+      '| Project guide | Kind | Function | Main modules / where to look |', '|---|---|---|---|', '', '## Maintain this index', ''].join('\n'))
+    writeFileSync(join(server.dir, 'gitconfig'), '[user]\n\tname = Live Test\n\temail = live@example.test\n')
     port = await freePort()
     service = await startService()
   }, TEST_MS)
@@ -269,5 +281,48 @@ describe.skipIf(!live)(`superagent with two projects on a real t3code${live ? ''
     // By path and by T3 Code id the same project resolves.
     expect(await call('superagent_projects', { query: gadgets.root })).toMatchObject({ projects: [expect.objectContaining({ key: 'gadgets' })] })
     expect(existsSync(join(stateDir, 'worktrees', 'vault'))).toBe(false)
+  }, TEST_MS)
+
+  it('starts a new project in the catalogue and runs its first request in the new project\'s own worktree', async () => {
+    const args = { folder: 'PERSONAL/garden', purpose: 'Plan the vegetable garden by season.', request: '[R07] Write the spring plan [worker]', wait_seconds: 20 }
+    const made = await call('superagent_new_project', args) as Record<string, unknown> & { request: Record<string, unknown> }
+    const root = join(server.dir, 'PERSONAL', 'garden')
+    expect(made).toMatchObject({ key: 'PERSONAL/garden', status: 'ready', root, branch: 'main', catalogue: 'added', index: 'added',
+      scope: 'updated: 1 mapped entries: 1 Git repositories, 0 linked worktrees and 0 additional project or reference folders.',
+      request: { status: 'accepted', filed_in: 'PERSONAL/garden', project: 'PERSONAL/garden' } })
+    // The repository: main, one commit with the README and the map, by the identity in git's config.
+    expect(git(root, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main')
+    expect(git(root, 'rev-list', '--count', 'HEAD')).toBe('1')
+    expect(git(root, 'ls-files').split('\n')).toEqual(['README.md', 'REPO_MAP.md'])
+    expect(execFileSync('git', ['log', '-1', '--format=%an <%ae>'], { cwd: root, encoding: 'utf8' }).trim()).toBe('Live Test <live@example.test>')
+    // T3 Code itself lists the project the CLI added, under the id the tool returned.
+    const registered = await probe.listProjects()
+    expect(registered.filter(project => project.workspaceRoot === root)).toEqual([{ id: made.project_id, workspaceRoot: root, title: 'garden' }])
+    // The catalogue entries.
+    const catalogue = JSON.parse(readFileSync(join(server.dir, 'repositories.json'), 'utf8')) as { repositories: Record<string, unknown>[] }
+    expect(catalogue.repositories).toEqual([expect.objectContaining({ path: 'PERSONAL/garden', kind: 'git-repository', head: made.head, branch: 'main',
+      map: 'PERSONAL/garden/REPO_MAP.md' })])
+    expect(readFileSync(join(server.dir, 'REPOSITORIES.md'), 'utf8')).toContain('| [PERSONAL/garden](PERSONAL/garden/REPO_MAP.md) | git-repository |')
+    // The first request's worker runs in a worktree of the new repository, under the state dir, and finishes.
+    const thread = await threadOf(made.request.short as string)
+    expect(thread.projectId).toBe(made.project_id)
+    expect(thread.worktreePath.startsWith(`${realpathSync(join(stateDir, 'worktrees', 'personal-garden'))}${sep}`)).toBe(true)
+    expect(git(root, 'worktree', 'list')).toContain(thread.worktreePath)
+    expect(git(server.checkout, 'worktree', 'list')).not.toContain(thread.worktreePath)
+    expect((await ended(made.request.ticket_id as string)).outcome).toBe('completed')
+    // A repeated call finds everything done and adds nothing.
+    const again = await call('superagent_new_project', { ...args, wait_seconds: 0 }) as Record<string, unknown> & { request: Record<string, unknown> }
+    expect(again).toMatchObject({ repeated: true, catalogue: 'already there', index: 'already there', request: { repeated: true, trigger_id: made.request.trigger_id } })
+    expect((await probe.listProjects()).filter(project => project.workspaceRoot === root)).toHaveLength(1)
+    // A title that starts with a dash is the title, not an option of the CLI: it goes in one argument with --title.
+    const notes = join(server.dir, 'PERSONAL', 'notes')
+    const dashed = await call('superagent_new_project', { folder: 'PERSONAL/notes', purpose: 'Notes on the garden.', title: '--help' }) as Record<string, unknown>
+    expect(dashed).toMatchObject({ key: 'PERSONAL/notes', status: 'ready', title: '--help', root: notes })
+    expect((await probe.listProjects()).filter(project => project.workspaceRoot === notes)).toEqual([{ id: dashed.project_id, workspaceRoot: notes, title: '--help' }])
+    // ARCHIVE/ stays denied: refused, and nothing is made.
+    const archived = await raw('superagent_new_project', { folder: 'ARCHIVE/old-idea', purpose: 'An old idea.' })
+    expect(archived.isError).toBe(true)
+    expect(JSON.stringify(archived.content)).toContain('It is denied by default (ARCHIVE/).')
+    expect(existsSync(join(server.dir, 'ARCHIVE'))).toBe(false)
   }, TEST_MS)
 })

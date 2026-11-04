@@ -12,6 +12,7 @@ import type { Gh } from '../src/sources/github.ts'
 import type { ModelCall } from '../src/router/claude-router.ts'
 import { FakeT3 } from './fake-t3.ts'
 import { checkout, git, harness, until, type Harness, type Timing } from './harness.ts'
+import type { NewProjectDeps } from '../src/app/runtime.ts'
 
 export const commit = (cwd: string, file: string, text: string, message = file) => {
   writeFileSync(join(cwd, file), text)
@@ -43,7 +44,7 @@ export interface Setup {
  * widgets the legacy project (the default); `projects` is written as projects.json first.
  */
 export async function setup(options: { legacy?: Partial<LegacyProject> | false; projects?: Record<string, unknown>; database?: string; dir?: string
-  t3?: FakeT3; timing?: Timing; config?: Partial<Config>; model?: ModelCall; gh?: Gh } = {}): Promise<Setup> {
+  t3?: FakeT3; timing?: Timing; config?: Partial<Config>; model?: ModelCall; gh?: Gh; catalogue?: string; newProject?: NewProjectDeps } = {}): Promise<Setup> {
   const place = options.dir ? { dir: options.dir, root: join(options.dir, 'widgets') } : checkout('widgets')
   const dir = place.dir, widgets = place.root, gadgets = join(dir, 'gadgets')
   if (!options.dir) checkout('gadgets', dir)
@@ -53,10 +54,11 @@ export async function setup(options: { legacy?: Partial<LegacyProject> | false; 
   if (options.projects) { mkdirSync(stateDir, { recursive: true }); writeFileSync(join(stateDir, 'projects.json'), JSON.stringify(options.projects)) }
   const legacy: LegacyProject | undefined = options.legacy === false ? undefined
     : { root: widgets, worktreeRoot: join(dir, 'worktrees'), baseRef: 'HEAD', ...options.legacy }
-  const projects = await ProjectRegistry.load({ t3, stateDir, legacy, projectsFile: join(stateDir, 'projects.json') })
-  const made = await harness(t3, place, options.database ?? ':memory:', { legacy, ...options.config },
+  const projects = await ProjectRegistry.load({ t3, stateDir, legacy, projectsFile: join(stateDir, 'projects.json'),
+    ...options.catalogue ? { catalogue: options.catalogue } : {} })
+  const made = await harness(t3, place, options.database ?? ':memory:', { legacy, ...options.catalogue ? { catalogue: options.catalogue } : {}, ...options.config },
     { projects, project: 'p-widgets', timing: options.timing ?? fast, ...options.model ? { model: options.model } : {},
-      ...options.gh ? { gh: options.gh } : {} })
+      ...options.gh ? { gh: options.gh } : {}, ...options.newProject ? { newProject: options.newProject } : {} })
   const ticketOf = (trigger: Trigger) => until(() => made.runtime.repo.tickets.list().find(ticket => ticket.origin.triggerId === trigger.id)?.id,
     `the ticket of ${trigger.text}`)
   return { dir, widgets, gadgets, t3, made, ticketOf }

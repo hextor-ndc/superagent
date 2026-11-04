@@ -9,7 +9,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { afterAll } from 'vitest'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { bindingOf, ProjectRegistry, type ProjectBinding } from '../src/app/projects.ts'
-import { Runtime } from '../src/app/runtime.ts'
+import { Runtime, type NewProjectDeps } from '../src/app/runtime.ts'
 import type { Config } from '../src/config.ts'
 import { serve } from '../src/http/server.ts'
 import type { Gh } from '../src/sources/github.ts'
@@ -71,7 +71,7 @@ export interface Harness { runtime: Runtime; http: Server; base: string; errors:
  * a launch with the wrong project id or a path that is not one of the project's worktrees fails as it would in t3code.
  */
 export async function harness(t3: T3Client, place: { dir: string; root: string }, database = ':memory:', overrides: Partial<Config> = {},
-  deps: { gh?: Gh; model?: ModelCall; timing?: Timing; project?: string; projects?: ProjectRegistry } = {}): Promise<Harness> {
+  deps: { gh?: Gh; model?: ModelCall; timing?: Timing; project?: string; projects?: ProjectRegistry; newProject?: NewProjectDeps } = {}): Promise<Harness> {
   const errors: string[] = []
   if (t3 instanceof FakeT3) t3.checkWorktrees ??= true
   const stateDir = join(place.dir, 'state')
@@ -80,8 +80,10 @@ export async function harness(t3: T3Client, place: { dir: string; root: string }
     router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' },
     port: 0, publicUrl: '', consoleToken: 'console-secret', watchdogMinutes: 0, database, operator: 'hector', maxWorkers: 2,
     log: (message, error) => { errors.push(`${message} ${error instanceof Error ? error.message : error ?? ''}`) }, ...overrides }
-  const { timing = { waitMs: 10, idlePollMs: 10, continueAfterMs: 0 }, project = 'project-1', projects, ...rest } = deps
-  const runtime = new Runtime(config, t3, projects ?? { id: project, root: place.root }, timing, rest)
+  const { timing = { waitMs: 10, idlePollMs: 10, continueAfterMs: 0 }, project = 'project-1', projects, newProject, ...rest } = deps
+  // The real t3 CLI never runs in these tests: it would add projects to ~/.t3. A test that starts projects gives a stand-in.
+  const cli = newProject?.cli ?? { problem: () => 'No t3 CLI in these tests.', addProject: () => Promise.reject(new Error('No t3 CLI in these tests.')) }
+  const runtime = new Runtime(config, t3, projects ?? { id: project, root: place.root }, timing, { ...rest, newProject: { ...newProject, cli } })
   // As main.ts: the migration runs before HTTP opens. A failed one leaves nothing open.
   const http = await serve(runtime, 0).catch(async error => { await runtime.stop(); throw error })
   const base = `http://127.0.0.1:${(http.address() as AddressInfo).port}`

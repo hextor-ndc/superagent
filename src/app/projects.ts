@@ -11,7 +11,7 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { Trigger } from '../../vendor/dsh/src/core/index.ts'
@@ -33,7 +33,7 @@ export type Delivery = 'pr' | 'branch'
  * - `ready`: registered in T3 Code, a git checkout whose top level is the root, not denied;
  * - `not-registered`: catalogued only; T3 Code has no project for it;
  * - `no-git`: not a git checkout, or the root is not the checkout's top level;
- * - `denied`: by projects.json, by a default prefix (`ARCHIVE/`, `PERSONAL/`, `FAMILY/`), or because it is a folder of the super agent's own worktrees;
+ * - `denied`: by projects.json, by the default prefix `ARCHIVE/`, or because it is a folder of the super agent's own worktrees;
  * - `missing-checkout`: the folder no longer exists;
  * - `ambiguous`: one of several T3 Code projects with the same folder, and not the one projects.json names;
  * - `folded`: a linked worktree registered as a project of its own while its main checkout is registered too. t3code
@@ -79,7 +79,7 @@ export interface ProjectEntry {
   reason?: string
   /** The project `SUPERAGENT_PROJECT_ROOT` or `SUPERAGENT_PROJECT_ID` names. */
   legacy: boolean
-  /** Whether its catalogue purpose and notes may go to model APIs; off under `PERSONAL/` and `FAMILY/` until projects.json allows it. */
+  /** Whether its catalogue purpose and notes may go to model APIs; on unless projects.json sets `describe: false`. */
   describe: boolean
   /** Its own catalogue entry, or, when it has none, the catalogued folder it sits in; nothing is copied from that one. */
   catalogue?: CatalogueFacts | { insideCatalogued: string }
@@ -279,14 +279,13 @@ const CatalogueSchema = z.object({
 })
 
 /**
- * The defaults the operator accepted (plan, open question 2): `ARCHIVE/` is denied; `PERSONAL/` and `FAMILY/` are denied and
- * shown by key only. A projects.json entry with the same key replaces a default, and a more specific one overrides it; a
- * broader prefix in projects.json, such as the whole workspace, does not.
+ * The defaults the operator chose (plan, open question 2, answered 2026-11-04): only `ARCHIVE/` is denied. `PERSONAL/`,
+ * `FAMILY/` and `COMMON/` take work and are described like any other folder. A projects.json entry with the same key
+ * replaces a default, and a more specific one overrides it; a broader prefix in projects.json, such as the whole workspace,
+ * does not.
  */
 const DEFAULT_OVERRIDES: Record<string, ProjectOverride> = {
   'ARCHIVE/': { access: 'deny' },
-  'PERSONAL/': { access: 'deny', describe: false },
-  'FAMILY/': { access: 'deny', describe: false },
 }
 
 export interface ProjectRegistryOptions {
@@ -405,6 +404,35 @@ export class ProjectRegistry {
   hide(projectId: string): void {
     this.hidden.add(projectId)
     this.entries = this.entries.filter(entry => entry.id !== projectId)
+  }
+
+  /**
+   * Why work could never go to a folder that is not a project yet, by the rules a refresh applies to a project there: a
+   * folder of the super agent's own worktrees, or a deny by a path or prefix (the `ARCHIVE/` default, or projects.json).
+   * Undefined when it could take work. Reads the catalogue and projects.json again when they changed, and throws when either
+   * cannot be read. `superagent_new_project` asks before it makes the folder.
+   *
+   * @param path - the folder's real path, or, while it does not exist, its nearest existing parent's real path joined with the rest.
+   */
+  denial(path: string): string | undefined {
+    const options = this.options
+    if (!options) return undefined
+    const catalogue = options.catalogue ? this.readCatalogue(options.catalogue) : undefined
+    const overrides = options.projectsFile ? this.readOverrides(options.projectsFile) : {}
+    const rules = overrideRules(overrides, catalogue?.workspace, new Set(), options.log)
+    const legacyWorktrees = options.legacy?.worktreeRoot ?? this.entries.find(entry => entry.legacy)?.worktreeRoot
+    const roots = [legacyWorktrees, join(options.stateDir, 'worktrees'), ...rules.flatMap(rule => rule.override.worktreeRoot ?? [])]
+      .filter((dir): dir is string => !!dir).map(realOrParent)
+    const inside = roots.find(dir => within(path, dir))
+    if (inside) return `It is inside ${inside}, where the super agent keeps ticket worktrees.`
+    if ([basename(path), basename(dirname(path))].some(name => name.endsWith('-superagent'))) {
+      return 'It is a "-superagent" folder, or one directly in it, where the super agent keeps ticket worktrees.'
+    }
+    let deniedBy: string | undefined
+    for (const rule of rules.filter(item => item.kind !== 'id' && matches(item, undefined, path)).sort(bySpecificity)) {
+      if (rule.override.access) deniedBy = rule.override.access === 'deny' ? rule.key : undefined
+    }
+    return deniedBy ? `It is denied by ${overrides[deniedBy] ? 'projects.json' : 'default'} (${deniedBy}).` : undefined
   }
 
   /** Reports refreshes to the Watchdog's health entries under `projects`. */
@@ -546,7 +574,7 @@ async function assemble(input: AssembleInput): Promise<{ entries: ProjectEntry[]
   for (const draft of drafts) {
     const matched = rules.filter(rule => matches(rule, draft.project.id, draft.root)).sort(bySpecificity)
     // The legacy project works whatever a prefix says; only an override for it by id or path can deny it. A prefix's other
-    // fields, such as describe: false under PERSONAL/, still apply to it.
+    // fields, such as a projects.json describe: false on its folder, still apply to it.
     for (const rule of matched) {
       const { access: _access, ...rest } = rule.override
       const override: ProjectOverride = draft.legacy && rule.kind === 'prefix' ? rest : rule.override
@@ -784,6 +812,12 @@ async function pool<T>(items: T[], size: number, work: (item: T) => Promise<void
 
 const compare = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0
 const real = (path: string): string | undefined => { try { return realpathSync.native(path) } catch { return undefined } }
+/** A path's real path, or, while it does not exist, its nearest existing parent's real path joined with the rest. */
+function realOrParent(path: string): string {
+  let existing = resolve(path)
+  while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing)
+  return join(real(existing) ?? existing, relative(existing, resolve(path)))
+}
 const within = (path: string, dir: string): boolean => path === dir || path.startsWith(dir.endsWith(sep) ? dir : `${dir}${sep}`)
 /** A file's identity for re-reading: its modification time and size; undefined when it does not exist. */
 function fileStamp(path: string): string | undefined {

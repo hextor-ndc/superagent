@@ -80,16 +80,17 @@ describe('the project registry', () => {
     expect(byKey(registry, 'apps')).toMatchObject({ status: 'no-git', catalogue: { purpose: 'All the apps.' } })
     expect(byKey(registry, 'gone')).toMatchObject({ status: 'missing-checkout' })
     expect(byKey(registry, 'Vanished')).toMatchObject({ status: 'missing-checkout' })
-    // The default denies: ARCHIVE/ even for a project the catalogue does not list, PERSONAL/ with its catalogue text withheld.
+    // The one default deny: ARCHIVE/, even for a project the catalogue does not list. PERSONAL/ takes work and is described
+    // like any other folder (plan, open question 2, answered 2026-11-04).
     expect(byKey(registry, 'Old')).toMatchObject({ status: 'denied', access: 'deny', reason: 'Denied by default (ARCHIVE/).' })
-    expect(byKey(registry, 'PERSONAL/diary')).toMatchObject({ status: 'denied', describe: false })
+    expect(byKey(registry, 'PERSONAL/diary')).toMatchObject({ status: 'ready', access: 'named', describe: true, catalogue: { purpose: 'Private diary.' } })
     // The super agent's own worktree folders are never projects.
     expect(registry.list().some(entry => entry.key === 'sa-testrepo-superagent')).toBe(false)
     expect(byKey(registry, 'Stray')).toMatchObject({ status: 'denied', reason: expect.stringContaining('where the super agent keeps ticket worktrees') })
 
-    expect(registry.ready().map(entry => entry.key)).toEqual(['apps/widgets', 'Gadgets'])
+    expect(registry.ready().map(entry => entry.key)).toEqual(['apps/widgets', 'Gadgets', 'PERSONAL/diary'])
     expect(registry.list()[0]!.status).toBe('ready')
-    expect(registry.summary()).toBe('2 ready, 1 not-registered, 3 no-git, 3 denied, 2 missing-checkout')
+    expect(registry.summary()).toBe('3 ready, 1 not-registered, 3 no-git, 2 denied, 2 missing-checkout')
     expect(registry.state()).toMatchObject({ refreshedAt: expect.any(String) })
     expect(registry.legacyProblem()).toBeUndefined()
   })
@@ -103,7 +104,8 @@ describe('the project registry', () => {
     ws.overrides({
       'apps/widgets': { access: 'work', aliases: ['shop'], baseRef: 'release', dirty: 'refuse', delivery: 'pr' },
       'p-gadgets': { access: 'deny' },
-      // A more specific key wins over the PERSONAL/ default.
+      // A prefix denies a folder and withholds its text; a more specific key wins over it.
+      'PERSONAL/': { access: 'deny', describe: false },
       'PERSONAL/diary': { access: 'named', describe: true },
       [ws.at('PERSONAL/blog')]: { aliases: ['blog'] },
     })
@@ -114,7 +116,7 @@ describe('the project registry', () => {
     expect(byKey(registry, 'apps/widgets')).toMatchObject({ status: 'ready', access: 'work', aliases: ['shop'], baseRef: 'release', dirty: 'refuse', delivery: 'branch' })
     expect(byKey(registry, 'Gadgets')).toMatchObject({ status: 'denied', reason: 'Denied by projects.json (p-gadgets).' })
     expect(byKey(registry, 'PERSONAL/diary')).toMatchObject({ status: 'ready', access: 'named', describe: true })
-    expect(byKey(registry, 'Blog')).toMatchObject({ status: 'denied', aliases: ['blog'], describe: false })
+    expect(byKey(registry, 'Blog')).toMatchObject({ status: 'denied', aliases: ['blog'], describe: false, reason: 'Denied by projects.json (PERSONAL/).' })
 
     ws.overrides('{"apps/widgets": {"access": "everyone"}}')
     await expect(registry.refresh()).rejects.toThrow(/projects\.json is not valid: apps\/widgets\.access/)
@@ -137,9 +139,34 @@ describe('the project registry', () => {
       project('p-kept', ws.at('ARCHIVE/kept'), 'Kept'), project('p-diary', ws.at('PERSONAL/diary'), 'Diary'), project('p-photos', ws.at('FAMILY/photos'), 'Photos')]))
     expect(byKey(registry, 'Widgets')).toMatchObject({ status: 'ready', access: 'work' })
     expect(byKey(registry, 'Old')).toMatchObject({ status: 'denied', access: 'deny', reason: 'Denied by default (ARCHIVE/).' })
-    expect(byKey(registry, 'Diary')).toMatchObject({ status: 'denied', describe: false })
-    expect(byKey(registry, 'FAMILY/photos')).toMatchObject({ status: 'denied', describe: false, reason: 'Denied by default (FAMILY/).' })
+    // PERSONAL/ and FAMILY/ have no default, so the broader prefix applies to them.
+    expect(byKey(registry, 'Diary')).toMatchObject({ status: 'ready', access: 'work', describe: true })
+    expect(byKey(registry, 'FAMILY/photos')).toMatchObject({ status: 'ready', access: 'work', describe: true })
     expect(byKey(registry, 'Kept')).toMatchObject({ status: 'ready', access: 'named' })
+  })
+
+  it('lets PERSONAL/, FAMILY/ and COMMON/ take work and describes them, and denies only ARCHIVE/ by default', async () => {
+    const ws = workspace()
+    for (const path of ['PERSONAL/diary', 'FAMILY/photos', 'COMMON/tools', 'ARCHIVE/old']) checkout(path, ws.dir)
+    checkout('PERSONAL/notes', ws.dir)
+    ws.write([{ path: 'PERSONAL/diary', purpose: 'Private diary.', notes: 'Kept by hand.' }, { path: 'FAMILY/photos', purpose: 'Family photos.' },
+      { path: 'COMMON/tools', purpose: 'Shared tools.' }, { path: 'ARCHIVE/old', purpose: 'Old work.' }, { path: 'PERSONAL/notes', purpose: 'Notes.' }])
+    const registry = await ws.load(new FakeT3([project('p-diary', ws.at('PERSONAL/diary'), 'Diary'), project('p-photos', ws.at('FAMILY/photos'), 'Photos'),
+      project('p-tools', ws.at('COMMON/tools'), 'Tools'), project('p-old', ws.at('ARCHIVE/old'), 'Old')]))
+    for (const key of ['PERSONAL/diary', 'FAMILY/photos', 'COMMON/tools']) {
+      expect(byKey(registry, key)).toMatchObject({ status: 'ready', access: 'named', describe: true })
+    }
+    expect(byKey(registry, 'PERSONAL/diary').catalogue).toMatchObject({ purpose: 'Private diary.', notes: 'Kept by hand.' })
+    // A catalogued folder T3 Code does not have yet is one to add, not a denied one.
+    expect(byKey(registry, 'PERSONAL/notes')).toMatchObject({ status: 'not-registered', access: 'named', describe: true })
+    expect(byKey(registry, 'ARCHIVE/old')).toMatchObject({ status: 'denied', access: 'deny', reason: 'Denied by default (ARCHIVE/).' })
+    // A folder that is not a project yet: only ARCHIVE/ and the worktree folders are refused (superagent_new_project asks this).
+    expect(registry.denial(join(ws.real('PERSONAL'), 'garden'))).toBeUndefined()
+    expect(registry.denial(join(ws.real('ARCHIVE'), 'garden'))).toBe('It is denied by default (ARCHIVE/).')
+    expect(registry.denial(join(ws.real('state'), 'worktrees', 'x'))).toMatch(/^It is inside .*worktrees, where the super agent keeps ticket worktrees\.$/)
+    ws.overrides({ 'FAMILY/': { access: 'deny' }, 'ARCHIVE/garden': { access: 'named' } })
+    expect(registry.denial(join(ws.real('FAMILY'), 'garden'))).toBe('It is denied by projects.json (FAMILY/).')
+    expect(registry.denial(join(ws.real('ARCHIVE'), 'garden'))).toBeUndefined()
   })
 
   it('puts a project\'s worktrees where projects.json says, and never takes a project inside that folder', async () => {
@@ -293,25 +320,25 @@ describe('the project registry', () => {
 
   it('denies a registered linked worktree of a denied repository, wherever the worktree folder is', async () => {
     const ws = workspace()
-    checkout('PERSONAL/diary', ws.dir)
-    git(ws.at('PERSONAL/diary'), 'worktree', 'add', '-q', '-b', 'side', ws.at('apps/diary-side'))
-    ws.write([{ path: 'PERSONAL/diary' }, { path: 'apps/diary-side' }])
-    // Its main checkout registered too, and denied by the PERSONAL/ default: the worktree is denied, not ready.
-    const both = await ws.load(new FakeT3([project('p-diary', ws.at('PERSONAL/diary'), 'Diary'), project('p-side', ws.at('apps/diary-side'), 'Side')]))
-    expect(byKey(both, 'PERSONAL/diary')).toMatchObject({ status: 'denied' })
+    checkout('ARCHIVE/diary', ws.dir)
+    git(ws.at('ARCHIVE/diary'), 'worktree', 'add', '-q', '-b', 'side', ws.at('apps/diary-side'))
+    ws.write([{ path: 'ARCHIVE/diary' }, { path: 'apps/diary-side' }])
+    // Its main checkout registered too, and denied by the ARCHIVE/ default: the worktree is denied, not ready.
+    const both = await ws.load(new FakeT3([project('p-diary', ws.at('ARCHIVE/diary'), 'Diary'), project('p-side', ws.at('apps/diary-side'), 'Side')]))
+    expect(byKey(both, 'ARCHIVE/diary')).toMatchObject({ status: 'denied' })
     expect(byKey(both, 'apps/diary-side')).toMatchObject({ status: 'denied',
-      reason: `A linked worktree of ${ws.real('PERSONAL/diary')}, which is denied: Denied by default (PERSONAL/).` })
+      reason: `A linked worktree of ${ws.real('ARCHIVE/diary')}, which is denied: Denied by default (ARCHIVE/).` })
     // Registered alone, it is denied by the rule on its repository's folder.
     const alone = await ws.load(new FakeT3([project('p-side', ws.at('apps/diary-side'), 'Side')]))
     expect(byKey(alone, 'apps/diary-side')).toMatchObject({ status: 'denied',
-      reason: `A linked worktree of ${ws.real('PERSONAL/diary')}, which is denied by default (PERSONAL/).` })
+      reason: `A linked worktree of ${ws.real('ARCHIVE/diary')}, which is denied by default (ARCHIVE/).` })
     // An override by id that lets the registered main checkout take work lifts it for the worktree too, which folds into it.
     ws.overrides({ 'p-diary': { access: 'named' } })
-    expect(byKey(await ws.load(new FakeT3([project('p-diary', ws.at('PERSONAL/diary'), 'Diary'), project('p-side', ws.at('apps/diary-side'), 'Side')])),
+    expect(byKey(await ws.load(new FakeT3([project('p-diary', ws.at('ARCHIVE/diary'), 'Diary'), project('p-side', ws.at('apps/diary-side'), 'Side')])),
       'apps/diary-side')).toMatchObject({ status: 'folded' })
     // Once projects.json lets the repository's folder take work, the worktree folds into its main checkout, or works alone.
-    ws.overrides({ 'PERSONAL/diary': { access: 'named' } })
-    expect(byKey(await ws.load(new FakeT3([project('p-diary', ws.at('PERSONAL/diary'), 'Diary'), project('p-side', ws.at('apps/diary-side'), 'Side')])),
+    ws.overrides({ 'ARCHIVE/diary': { access: 'named' } })
+    expect(byKey(await ws.load(new FakeT3([project('p-diary', ws.at('ARCHIVE/diary'), 'Diary'), project('p-side', ws.at('apps/diary-side'), 'Side')])),
       'apps/diary-side')).toMatchObject({ status: 'folded' })
     expect(byKey(await ws.load(new FakeT3([project('p-side', ws.at('apps/diary-side'), 'Side')])), 'apps/diary-side')).toMatchObject({ status: 'ready' })
   })
@@ -328,15 +355,16 @@ describe('the project registry', () => {
     expect((await ws.load(t3, { root: widgets, baseRef: 'HEAD', repository: 'acme/widgets' })).legacy()).toMatchObject({ delivery: 'branch' })
   })
 
-  it('keeps a prefix\'s describe: false for a legacy project under PERSONAL/, while it works there', async () => {
+  it('keeps a projects.json prefix\'s describe: false for a legacy project under it, while it works there', async () => {
     const ws = workspace()
     const { root: diary } = checkout('PERSONAL/diary', ws.dir)
     ws.write([{ path: 'PERSONAL/diary', purpose: 'Private diary.', notes: 'Private.' }])
+    ws.overrides({ 'PERSONAL/': { access: 'deny', describe: false } })
     const t3 = new FakeT3([project('p-diary', diary, 'Diary')])
     const registry = await ws.load(t3, { root: diary, baseRef: 'HEAD' })
     expect(registry.legacy()).toMatchObject({ status: 'ready', access: 'work', legacy: true, describe: false })
     // projects.json can still allow it, by its path.
-    ws.overrides({ 'PERSONAL/diary': { describe: true } })
+    ws.overrides({ 'PERSONAL/': { access: 'deny', describe: false }, 'PERSONAL/diary': { describe: true } })
     expect((await ws.load(t3, { root: diary, baseRef: 'HEAD' })).legacy()).toMatchObject({ access: 'work', describe: true })
   })
 

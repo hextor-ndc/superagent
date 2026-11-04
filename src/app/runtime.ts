@@ -19,6 +19,7 @@ import { Jobs } from './jobs.ts'
 import { StoredOutbox } from './outbox.ts'
 import { Health } from './health.ts'
 import { migrateProjects, SCHEMA_KEY, type ProjectsSchema } from './migrate-projects.ts'
+import { newProject, t3Cli, type NewProjectInput, type NewProjectResult, type Step, type T3Cli } from './new-project.ts'
 import { BINDING_PREFIX, bindingKey, bindingOf, deniedProject, ProjectRegistry, rerouteKey, resolveProject, type BoundBy, type ProjectBinding,
   type ProjectEntry, type ProjectRules, type Rerouted } from './projects.ts'
 import { Store } from './store.ts'
@@ -59,6 +60,12 @@ export const IGNORED_FOR_MS = 24 * 60 * 60_000
 /** Where a card or a tool says a request would go: the project its accept would bind to, or why it would be refused. */
 export type ProjectPreview = { id: string; key: string; title: string; by: BoundBy } | { refused: string }
 
+/**
+ * What `superagent_new_project` runs with besides the configuration: the t3 CLI (from `T3_BIN` and `SUPERAGENT_T3_BASE_DIR` by
+ * default), and for tests git's environment, a hook before each step and a shorter wait for T3 Code's list.
+ */
+export interface NewProjectDeps { cli?: T3Cli; env?: NodeJS.ProcessEnv; beforeStep?: (step: Step) => void; listWaitMs?: number }
+
 /** Timing for the executor and for the look at the Watchdog thread; tests make them short. */
 export type RuntimeTiming = Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs' | 'pendingCheckMs' | 'projectsMaxAgeMs' | 'launchRetryMs'> & {
   /** The pause between looks at what the Watchdog thread waits on; 60 s by default. */
@@ -96,14 +103,19 @@ export class Runtime {
   readonly workProject?: ProjectEntry
   /** The last review list and when it was made; it asks git once per completed ticket, so it is kept for a while. */
   private review?: { at: number; items: ReviewItem[] }
+  /** What `superagent_new_project` runs with: the t3 CLI, and in tests git's environment and a hook before each step. */
+  private readonly starter: NewProjectDeps & { cli: T3Cli }
+  /** The `superagent_new_project` call that runs, which the next one waits for. */
+  private starting: Promise<unknown> = Promise.resolve()
 
   /**
    * @param projects - the registry main.ts loaded, or one project `{ id, root }`, which becomes `ProjectRegistry.single()` with the
    *   legacy settings in `config.legacy`.
    */
   constructor(readonly config: Config, readonly t3: T3Client, projects: ProjectRegistry | { id: string; root: string },
-    { watchdogPendingMs, ...timing }: RuntimeTiming = {}, deps: { gh?: Gh; model?: ModelCall } = {}) {
+    { watchdogPendingMs, ...timing }: RuntimeTiming = {}, deps: { gh?: Gh; model?: ModelCall; newProject?: NewProjectDeps } = {}) {
     const log = config.log
+    this.starter = { ...deps.newProject, cli: deps.newProject?.cli ?? t3Cli({ bin: config.t3Bin ?? 't3', ...config.t3BaseDir ? { baseDir: config.t3BaseDir } : {} }) }
     if (!config.consoleToken) throw new Error('No console token: main.ts sets one with ensureConsoleToken before the Runtime starts.')
     this.projects = projects instanceof ProjectRegistry ? projects : ProjectRegistry.single({ ...projects,
       ...config.legacy?.worktreeRoot ? { worktreeRoot: config.legacy.worktreeRoot } : {}, baseRef: config.legacy?.baseRef ?? 'HEAD',
@@ -283,6 +295,17 @@ export class Runtime {
     return { entry, by, hint }
   }
 
+  /**
+   * Starts a new project in the catalogue, or finishes one an earlier call started (src/app/new-project.ts). Calls run one at
+   * a time, so two calls for one folder never interleave their steps.
+   */
+  newProject(input: NewProjectInput): Promise<NewProjectResult> {
+    const job = this.starting.then(() => newProject({ catalogue: this.config.catalogue, stateDir: this.config.stateDir, projects: this.projects,
+      t3: this.t3, ...this.starter }, input))
+    this.starting = job.catch(() => {})
+    return job
+  }
+
   /** Resumes the work a previous run left (Tickets in t3code threads, messages not yet sent), then starts the passes. */
   start(): void {
     this.projects.start()
@@ -331,9 +354,14 @@ export class Runtime {
     if (!detail.items.length) {
       await this.t3.send(launched.threadId, CONSOLE_INTRO, `${requestId}:intro`, 'queue')
         .then(() => this.repo.kv.set(CONSOLE_INTRO_KEY, CONSOLE_INTRO_VERSION), error => this.config.log('introducing the console failed', error))
-    } else if (version < CONSOLE_INTRO_VERSION) {
-      await this.t3.send(launched.threadId, CONSOLE_INTRO_V2, `${requestId}:intro-v2`, 'queue')
-        .then(() => this.repo.kv.set(CONSOLE_INTRO_KEY, CONSOLE_INTRO_VERSION), error => this.config.log('updating the console\'s introduction failed', error))
+    } else {
+      // Each update once, in order; a failed send leaves the version where it was, so the next start sends it again.
+      for (const [at, text] of [[2, CONSOLE_INTRO_V2], [3, CONSOLE_INTRO_V3]] as const) {
+        if ((this.repo.kv.get<number>(CONSOLE_INTRO_KEY) ?? version) >= at) continue
+        const sent = await this.t3.send(launched.threadId, text, `${requestId}:intro-v${at}`, 'queue')
+          .then(() => { this.repo.kv.set(CONSOLE_INTRO_KEY, at); return true }, error => { this.config.log('updating the console\'s introduction failed', error); return false })
+        if (!sent) break
+      }
     }
   }
   /** The scratch project a console or Watchdog thread is in is t3code's own, not a project for work (plan, 3.3). */
@@ -524,7 +552,7 @@ const WATCHDOG_REARM = 'The superagent has not seen a Watchdog check for a while
 
 /** kv: the version of the introduction the console thread has; 1 for a thread introduced before it was kept. */
 const CONSOLE_INTRO_KEY = 'console:intro'
-const CONSOLE_INTRO_VERSION = 2
+const CONSOLE_INTRO_VERSION = 3
 
 /** How the console agent files work across projects (plan, 3.2), in the introduction and in the update for an older thread. */
 const PROJECT_RULES = [
@@ -535,13 +563,20 @@ const PROJECT_RULES = [
     + '`pending` is normal while the Router decides, so check superagent_attention or superagent_ticket with the trigger id later.',
   'If a ticket went to the wrong project, use superagent_reroute: it stops the ticket and files the same request in the right one.',
 ]
+/** How the console agent starts a new project, in the introduction and in the update for an older thread. */
+const NEW_PROJECT_RULES = [
+  'To start a new project, use superagent_new_project with the folder relative to the catalogue\'s workspace (such as PERSONAL/garden) '
+    + 'and a one-sentence purpose; ask the operator for both when they are not clear. It can also file a first request there. If it '
+    + 'fails part way, call it again with the same arguments to finish. Tell the operator the manual step it returns.',
+]
 const CONSOLE_INTRO = [
   'This is the Superagent console. You help the operator run the superagent, which works on tickets in their own T3 Code threads.',
   'Use the `superagent` MCP tools: superagent_attention first (what waits for a person), superagent_status, superagent_ticket, '
-    + 'superagent_request to start work, superagent_projects (the T3 Code projects and why each can or cannot take work), '
+    + 'superagent_request to start work, superagent_projects (the T3 Code projects and why each can or cannot take work), superagent_new_project, '
     + 'superagent_answer to answer a ticket\'s question, superagent_reroute, superagent_stop, superagent_retry, '
     + 'superagent_note, superagent_pause, superagent_messages and superagent_dismiss_alert (for the Watchdog\'s alerts).',
   ...PROJECT_RULES,
+  ...NEW_PROJECT_RULES,
   'A ticket at person/approve waits on an approval in its T3 Code thread: only T3 Code can grant it, so link the thread and say so.',
   'Keep answers short. Do not do ticket work in this thread: start a request instead, and link each ticket\'s thread when you mention it.',
   'Reply with one line saying you are ready.',
@@ -551,5 +586,12 @@ const CONSOLE_INTRO_V2 = [
   'An update to your instructions: the superagent now works in several T3 Code projects, and each ticket keeps the project it was filed in.',
   ...PROJECT_RULES,
   'superagent_ticket also takes the trigger id superagent_request returns, and superagent_attention lists requests ignored in the last day.',
+  'Reply with one line saying you have it.',
+].join('\n')
+/** What changed in the introduction since version 2. */
+const CONSOLE_INTRO_V3 = [
+  'An update to your instructions: folders under PERSONAL/ and FAMILY/ now take work like any other project, and their purpose and notes are '
+    + 'shown; only ARCHIVE/ stays denied unless projects.json says otherwise.',
+  ...NEW_PROJECT_RULES,
   'Reply with one line saying you have it.',
 ].join('\n')
