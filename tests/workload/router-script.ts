@@ -2,7 +2,9 @@
  * Phase 4: a scripted model in place of Claude for the model-backed Router, which routes the workload by its labels
  * (tests/workload/workload.ts). It reads the JSON items of the last user message, as the real Router reads its batch:
  * - an explicit candidate whose message carries a request label (`[R07]`) that no ticket on its thread has: accept, with
- *   the label as the title's start and the worktree name;
+ *   the label as the title's start and the worktree name. When the message names a project with a `{project:<key>}` tag,
+ *   the card's `project_hint` must show that project, else the candidate is ignored with the mismatch as the reason, so the
+ *   request gets no ticket and the checks fail (docs/multi-project-plan.md, phase 3a);
  * - a follow_up notice (a person's message an open ticket's worker has) whose message carries a stop label (`[R09-s]`):
  *   orchestrator_route stop with the ticket titled `[R09]` among those it reached, as the prototype's notice asks; any other
  *   follow_up: nothing, its worker decides it;
@@ -17,6 +19,7 @@
 import type Anthropic from '@anthropic-ai/sdk'
 import type { ModelCall } from '../../src/router/claude-router.ts'
 import { labelsOf, requestLabel } from './worker-plan.mjs'
+import { projectTag } from './workload.ts'
 
 type Params = Anthropic.Beta.Messages.MessageCreateParamsNonStreaming
 type Block = { type: 'text'; text: string } | { type: 'tool_use'; id: string; name: string; input: unknown }
@@ -24,6 +27,7 @@ interface CardTrigger { trigger_id: string; text: string; from: string }
 interface Item {
   type: string; trigger_id?: string; strength?: 'explicit' | 'inferred'; triggers?: CardTrigger[]; related_tickets?: { id: string; title: string }[]
   ticket?: { id: string }; attention?: { question: string }; state?: string; summary?: string
+  project_hint?: { key: string }; project_refused?: string
   text?: string; delivered_to?: { ticket_id: string; title: string }[]
 }
 
@@ -65,7 +69,11 @@ export function workloadRouter(clock: () => number, rules: readonly string[]): {
           continue
         }
         const taken = !!label && (card.related_tickets ?? []).some(ticket => ticket.title.startsWith(`[${label}]`))
-        if (label && !taken) {
+        const project = projectTag(all)
+        if (label && !taken && project && card.project_hint?.key !== project) {
+          routes.push({ kind: 'ignore', trigger_id: card.trigger_id, reason: `${label} names ${project}, and the card shows `
+            + `${card.project_hint?.key ?? `no project (${card.project_refused ?? 'no hint'})`}.` })
+        } else if (label && !taken) {
           routes.push({ kind: 'accept', trigger_id: card.trigger_id, title: `[${label}] ${firstLine(requestLabel(text) ? text : all)}`,
             worktree_name: label.toLowerCase(), acknowledgement: `On it: ${label}.` })
         } else routes.push({ kind: 'ignore', trigger_id: card.trigger_id, reason: taken ? `${label} already has its ticket.` : 'Discussion; no new work.' })
@@ -103,5 +111,5 @@ export function workloadRouter(clock: () => number, rules: readonly string[]): {
   return { call, calls }
 }
 
-const firstLine = (text: string): string => text.split('\n').find(line => line.trim())?.replace(/\[[^\]]*\]/g, '').replace(/\{plan:[^}]*\}/, '')
+const firstLine = (text: string): string => text.split('\n').find(line => line.trim())?.replace(/\[[^\]]*\]/g, '').replace(/\{plan:[^}]*\}/, '').replace(/\{project:[^}]*\}/, '')
   .replace(/@\S+/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'Request'

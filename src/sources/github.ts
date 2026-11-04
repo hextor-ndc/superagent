@@ -44,6 +44,13 @@ export interface GithubOptions {
   gh: Gh
   /** `owner/name`. */
   repository: string
+  /**
+   * The T3 Code project id the repository maps to now (the legacy project, D20). Every Trigger carries it as an explicit hint,
+   * `meta.project` with `meta.projectBy: 'source'`, so its ticket is bound there whatever else the request's thread holds.
+   * Read for each Trigger, since the id changes when the folder is removed and added again in T3 Code; undefined adds no hint,
+   * and the accept then takes the legacy project's default, which says what is wrong with it.
+   */
+  project?: () => string | undefined
   /** The agent account's login: mentions of it address the agent, and its own messages are dropped. */
   login: string
   engine: () => Pick<EngineForSources, 'receive' | 'bindThread' | 'threadClosed'>
@@ -157,7 +164,9 @@ export class GithubSource {
     const at = Date.parse(trigger.at)
     const since = (from: number | undefined) => from !== undefined && at >= from
     if (!trigger.addressed && !since(following.get(Number(trigger.meta.number))) && !since(observing.get(rowOf(trigger.meta)))) return
-    try { this.options.engine().receive(trigger) } catch (error) { this.options.log?.(`taking in ${trigger.id} failed`, error) }
+    const project = this.options.project?.()
+    const hinted = project ? { ...trigger, meta: { ...trigger.meta, project, projectBy: 'source' } } : trigger
+    try { this.options.engine().receive(hinted) } catch (error) { this.options.log?.(`taking in ${trigger.id} failed`, error) }
   }
 
   /**

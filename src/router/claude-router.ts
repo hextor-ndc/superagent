@@ -11,7 +11,8 @@ import Anthropic from '@anthropic-ai/sdk'
 import { z } from 'zod'
 import { threadKey, type Assessor, type Candidate, type Engine, type Ticket, type Trigger, type WorkerReport } from '../../vendor/dsh/src/core/index.ts'
 import type { Settings } from '../../vendor/dsh/src/policy.ts'
-import type { TicketView } from '../app/runtime.ts'
+import type { ProjectBinding } from '../app/projects.ts'
+import type { ProjectPreview, TicketView } from '../app/runtime.ts'
 import type { Health } from '../app/health.ts'
 import type { Store } from '../app/store.ts'
 import { policySection, routerInstructions } from './prompt.ts'
@@ -41,6 +42,14 @@ export interface ClaudeRouterOptions {
   store: Store
   settings: () => Settings
   view: (ticket: Ticket) => TicketView
+  /** How a ticket's work is delivered (its binding's `delivery`), so a `branch` result is not held to pull-request rules. */
+  delivery?: (ticketId: string) => 'pr' | 'branch' | undefined
+  /** A ticket's project, as bound at its accept; the attach guard compares it with a request's project. */
+  projectOf?: (ticketId: string) => ProjectBinding | undefined
+  /** Where an accept of a candidate's Triggers would be bound, or why it would be refused; shown on its card as `project_hint`. */
+  projectPreview?: (triggers: Trigger[]) => ProjectPreview
+  /** Why a ticket takes no more messages after `superagent_reroute`; the attach guard refuses such a ticket. */
+  rerouted?: (ticketId: string) => string | undefined
   /** Calls the Messages API; tests pass a scripted model. */
   call?: ModelCall
   model?: string
@@ -69,7 +78,9 @@ export class ClaudeRouter implements Router {
   private routing = false
 
   constructor(private readonly options: ClaudeRouterOptions) {
-    this.tools = routerTools({ engine: options.engine, store: options.store, settings: options.settings, view: options.view })
+    this.tools = routerTools({ engine: options.engine, store: options.store, settings: options.settings, view: options.view,
+      ...options.projectOf ? { projectOf: options.projectOf } : {}, ...options.projectPreview ? { projectPreview: options.projectPreview } : {},
+      ...options.rerouted ? { rerouted: options.rerouted } : {} })
     this.call = options.call ?? defaultCall()
   }
 
@@ -92,7 +103,7 @@ export class ClaudeRouter implements Router {
     if (!kind) return
     const summary = report.summary.length > REPORT_CHARS ? `${report.summary.slice(0, REPORT_CHARS)}…` : report.summary
     this.add({ id: `${kind}:${ticket.id}:${Date.now()}`, text: JSON.stringify({ type: kind, ticket: this.options.view(ticket), state: report.state,
-      summary, ...report.question ? { attention: { question: report.question } } : {},
+      summary, ...this.options.delivery?.(ticket.id) === 'branch' ? { delivery: 'branch' } : {}, ...report.question ? { attention: { question: report.question } } : {},
       ...report.answers ? { answers_trigger_id: report.answers } : {},
       next: kind === 'worker_attention' ? 'Ask the person with orchestrator_reply purpose=attention, copying the question into human_action.'
         : report.state === 'ready' ? 'Tell the requester the result with orchestrator_reply purpose=result, unless a matched rule says otherwise.'
@@ -213,12 +224,18 @@ export class ClaudeRouter implements Router {
     }
   }
 
-  /** A candidate as the Router reads it: its batch, its Thread's tickets, and what to do next. */
+  /**
+   * A candidate as the Router reads it: its batch, the project an accept would go to (`project_hint`, or `project_refused` with
+   * why an accept would be refused), its Thread's tickets with their projects, and what to do next.
+   */
   private candidateCard(candidate: Candidate) {
     const primary = candidate.triggers.findLast(trigger => trigger.human) ?? candidate.triggers.at(-1)!
     const disposition = this.options.store.triggers.disposition(primary.id)
     const handedBack = disposition?.handbacks?.map(item => ({ ticket_id: item.ticketId, reason: item.reason }))
-    return { type: 'candidate', trigger_id: primary.id, strength: candidate.strength, thread: candidate.thread.key,
+    const preview = this.options.projectPreview?.(candidate.triggers)
+    const project = !preview ? {} : 'refused' in preview ? { project_refused: preview.refused }
+      : { project_hint: { key: preview.key, title: preview.title, by: preview.by } }
+    return { type: 'candidate', trigger_id: primary.id, strength: candidate.strength, thread: candidate.thread.key, ...project,
       triggers: candidate.triggers.map(trigger => ({ trigger_id: trigger.id, from: trigger.actor.id, source: trigger.source, at: trigger.at,
         thread: threadKey(trigger.threads[0]!), text: trigger.text.length > 1500 ? `${trigger.text.slice(0, 1500)}… (orchestrator_eval_read)` : trigger.text,
         ...trigger.url ? { url: trigger.url } : {} })),

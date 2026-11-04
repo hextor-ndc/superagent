@@ -9,16 +9,17 @@
  * Run with `T3_LIVE=1 npx vitest run tests/live`.
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { ProjectRegistry } from '../../src/app/projects.ts'
 import { Runtime, type TicketView } from '../../src/app/runtime.ts'
 import { loadConfig } from '../../src/config.ts'
-import { startHttp } from '../../src/http/server.ts'
+import { serve } from '../../src/http/server.ts'
 import { McpT3Client, type ThreadRead } from '../../src/t3/client.ts'
 import { eventually, live, skipReason, startT3, type Access, type T3Server } from './t3-server.ts'
 
@@ -40,21 +41,25 @@ describe.skipIf(!live)(`superagent on a real t3code${live ? '' : ` (skipped: ${s
   let made: Superagent | undefined
   let n = 0
 
-  /** The super agent as main.ts builds it, from the environment, with this suite's t3code and a fresh database. */
-  async function superagent(access: Access): Promise<Superagent> {
+  /**
+   * The super agent as main.ts builds it, from the environment, with this suite's t3code and a fresh database. With
+   * `project: false` no SUPERAGENT_PROJECT_ROOT is set, as for a console-only start.
+   */
+  async function superagent(access: Access, { project = true } = {}): Promise<Superagent> {
     const errors: string[] = []
     const id = ++n
     const token = await server.token(access)
-    const config = { ...loadConfig({ SUPERAGENT_PROJECT_ROOT: server.checkout, SUPERAGENT_MODEL: 'scripted/plain', SUPERAGENT_ROUTER: 'rules',
-      SUPERAGENT_WATCHDOG_MINUTES: '0', SUPERAGENT_OPERATOR: 'hector', SUPERAGENT_CONSOLE_TOKEN: `console-${id}`, SUPERAGENT_STATE_DIR: join(server.dir, `state-${id}`),
-      SUPERAGENT_WORKTREE_ROOT: join(server.dir, `worktrees-${id}`), T3_MCP_URL: server.url, T3_MCP_TOKEN: token }),
+    const config = { ...loadConfig({ ...project ? { SUPERAGENT_PROJECT_ROOT: server.checkout, SUPERAGENT_WORKTREE_ROOT: join(server.dir, `worktrees-${id}`) } : {},
+      SUPERAGENT_MODEL: 'scripted/plain', SUPERAGENT_ROUTER: 'rules', SUPERAGENT_WATCHDOG_MINUTES: '0', SUPERAGENT_OPERATOR: 'hector',
+      SUPERAGENT_CONSOLE_TOKEN: `console-${id}`, SUPERAGENT_STATE_DIR: join(server.dir, `state-${id}`), T3_MCP_URL: server.url, T3_MCP_TOKEN: token }),
     database: ':memory:', port: 0, log: (message: string, error?: unknown) => { errors.push(`${message} ${error instanceof Error ? error.message : error ?? ''}`) } }
     const t3 = new McpT3Client({ url: config.t3Url, token: config.t3Token, ...config.model ? { modelSelection: config.model } : {} })
-    const project = (await t3.listProjects()).find(item => resolve(item.workspaceRoot) === config.projectRoot)
-    expect(project?.id).toBe(server.projectId)
-    const runtime = new Runtime(config, t3, { id: project!.id, root: config.projectRoot },
-      { waitMs: 2000, idlePollMs: 500, continueAfterMs: 1000, pendingCheckMs: 1000 })
-    const http = await startHttp(runtime, 0)
+    // The project registry, as main.ts loads it: the legacy project is the one SUPERAGENT_PROJECT_ROOT names.
+    const projects = await ProjectRegistry.load({ t3, stateDir: config.stateDir, legacy: config.legacy, projectsFile: config.projectsFile })
+    if (project) expect(projects.legacy()?.id).toBe(server.projectId)
+    const runtime = new Runtime(config, t3, projects, { waitMs: 2000, idlePollMs: 500, continueAfterMs: 1000, pendingCheckMs: 1000 })
+    // As main.ts: the migration runs before HTTP opens.
+    const http = await serve(runtime, 0)
     const base = `http://127.0.0.1:${(http.address() as AddressInfo).port}`
     // The public URL is known once the server listens; the scripted agents reach it on loopback.
     config.publicUrl = base
@@ -108,6 +113,32 @@ describe.skipIf(!live)(`superagent on a real t3code${live ? '' : ` (skipped: ${s
     expect(result.text).toContain(`[Open in T3 Code](${entry.link})`)
     expect(entry.link).toMatch(new RegExp(`^${server.origin}/`))
     expect(await attention(agent)).toEqual([])
+    expect(agent.errors).toEqual([])
+  }, TEST_MS)
+
+  it('starts with no project configured, lists the T3 Code project as ready, and runs a request there with branch delivery', async () => {
+    const agent = made = await superagent('full-access', { project: false })
+    expect(agent.runtime.workProject).toBeUndefined()
+    await agent.runtime.ensureConsole()
+    const listed = await call(agent, 'superagent_projects', { refresh: true })
+    expect(listed.projects).toEqual(expect.arrayContaining([expect.objectContaining({ id: server.projectId, key: 'widgets', status: 'ready',
+      root: realpathSync(server.checkout), base_ref: 'main', access: 'named', delivery: 'branch' })]))
+    // The one ready project is the default when no legacy project is set (D21); its worktrees go under the state dir (D13).
+    await call(agent, 'superagent_request', { text: '[R09] Tidy the README [worker]' })
+    const ticket = await ticketOf(agent)
+    const entry = agent.runtime.executor.thread(ticket.id)!
+    expect(agent.runtime.binding(ticket.id)).toMatchObject({ projectId: server.projectId, by: 'single', delivery: 'branch' })
+    expect(entry.worktreePath).toBe(join(agent.runtime.config.stateDir, 'worktrees', 'widgets', ticket.execution!.name))
+    expect(execFileSync('git', ['worktree', 'list'], { cwd: server.checkout, encoding: 'utf8' })).toContain(realpathSync(entry.worktreePath))
+    // The whole first message: t3code cuts each item to 4000 characters unless asked for more.
+    const first = (await agent.t3.read(entry.threadId!, { maxCharsPerItem: 100_000 } as never)).items[0]!.text
+    expect(first).toContain('## Delivery requirements')
+    expect(first).toContain('Deliverable: commit your change on the ticket branch in this worktree. Do not push')
+    expect(first).not.toContain('DSH_SUPERAGENT_GITHUB_REPOSITORY')
+    const done = await eventually(async () => agent.runtime.repo.tickets.get(ticket.id)?.ended, 'the ticket to end', 60_000)
+    expect(done.outcome).toBe('completed')
+    // The scripted worker commits nothing, so its branch is in main already and there is nothing to review.
+    expect((await call(agent, 'superagent_attention')).to_review).toEqual([])
     expect(agent.errors).toEqual([])
   }, TEST_MS)
 

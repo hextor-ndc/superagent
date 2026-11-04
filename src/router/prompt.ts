@@ -21,6 +21,19 @@ const DEPLOYMENT = [
     + 'orchestrator_trigger_requeue and orchestrator_thread_unsubscribe. There is no shell, no skill tool and no settings tool here: '
     + 'where the instructions below mention one, the operator does that from the T3 Code console instead.',
   'The console Source is the operator typing in T3 Code; its replies stay in T3 Code.',
+  'A worker report or question that says delivery "branch" is from a ticket in a project without pull requests: its worker commits on the '
+    + 'ticket branch and does not push or open a pull request, and the operator reviews and merges the branch locally. For such a ticket, a '
+    + 'ready report that names the branch and its last commit SHA is a complete result: deliver it, and do not ask for a pull request or '
+    + 'for evidence in one.',
+  'This deployment serves several T3 Code projects, one git repository each, and every ticket keeps the project it was accepted '
+    + 'into. Where the instructions above say "the deployment\'s repository" or "this project", read the project a candidate card '
+    + 'shows in project_hint, or, for a ticket, the project in its view. You do not choose projects: the operator names one in the '
+    + 'console, GitHub requests belong to the watched repository\'s project, and a request that names none goes to the default one. '
+    + 'A card with project_refused cannot be accepted; ignore it with that reason.',
+  'Never attach a request to a ticket in another project; the tool refuses it. A message a worker hands back as belonging to '
+    + 'another project must not be accepted, since its ticket would be filed in the project it came from: attach it to an open ticket '
+    + 'of that other project when it is about that ticket\'s work, else ignore it with a reason that names that project, so the '
+    + 'operator can file it there.',
   'When a batch needs nothing from you, end your turn with one short line and no tool call.',
 ].join('\n')
 

@@ -36,8 +36,10 @@ interface Made { runtime: Runtime; t3: FakeT3; base: string; errors: string[]; c
 async function made(overrides: Partial<Config> = {}, pendingCheckMs = 20, place = checkout(),
   t3 = new FakeT3([{ id: 'project-1', workspaceRoot: place.root }])): Promise<Made> {
   const errors: string[] = []
-  const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', projectRoot: place.root, worktreeRoot: join(place.dir, 'worktrees'),
-    baseRef: 'HEAD', router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' }, repository: 'acme/widgets', port: 0,
+  const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', stateDir: join(place.dir, 'state'),
+    projectsFile: join(place.dir, 'state', 'projects.json'),
+    legacy: { root: place.root, worktreeRoot: join(place.dir, 'worktrees'), baseRef: 'HEAD', repository: 'acme/widgets' },
+    router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' }, port: 0,
     publicUrl: '', consoleToken: 'console-secret', watchdogMinutes: 0, database: ':memory:', operator: 'hector', maxWorkers: 2,
     log: (message, error) => { errors.push(`${message} ${error instanceof Error ? error.message : error ?? ''}`) }, ...overrides }
   const runtime = new Runtime(config, t3, { id: 'project-1', root: place.root },

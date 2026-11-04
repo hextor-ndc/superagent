@@ -11,7 +11,7 @@ import type { Assignment, Ticket, TicketInput } from '../vendor/dsh/src/core/ind
 import { T3Executor, type TicketThread } from '../src/executor/t3-executor.ts'
 import type { SendResult, T3Status, WaitResult } from '../src/t3/client.ts'
 import { FakeT3 } from './fake-t3.ts'
-import { until } from './harness.ts'
+import { singleProject, until } from './harness.ts'
 
 /**
  * A FakeT3 whose sends in mode `auto` act as t3code's: one sent while the active run is still starting queues a run, and a
@@ -98,7 +98,7 @@ describe('read tracking', () => {
         },
         turnEnded: () => record('turnEnded'),
       }),
-      settings: () => ({}) as never, project: { id: 'project-1', root: '/unused' }, worktreeRoot: '/unused', workerUrl: token => `http://worker/${token}`,
+      settings: () => ({}) as never, ...singleProject({ id: 'project-1', root: '/unused', worktreeRoot: '/unused' }), workerUrl: token => `http://worker/${token}`,
       maxWorkers: () => 2, waitMs: 5, idlePollMs: 5, pendingCheckMs: 1000, continueAfterMs: 1, log: message => { logged.push(message) },
       state: { load: () => [entry], save: item => { saves.push(structuredClone(item)) } },
     })

@@ -4,9 +4,11 @@
  * the model's choice into an Engine command, which may refuse it.
  */
 import { z } from 'zod'
-import { UserError, reasonText, threadKey, type Decision, type Engine, type Ticket } from '../../vendor/dsh/src/core/index.ts'
+import { UserError, reasonText, threadKey, type Decision, type Engine, type Ticket, type Trigger } from '../../vendor/dsh/src/core/index.ts'
 import { assessmentOutcome, RuleAssessmentSchema, type Settings } from '../../vendor/dsh/src/policy.ts'
-import type { TicketView } from '../app/runtime.ts'
+import { CONSOLE } from '../app/console-source.ts'
+import { projectHint, type ProjectBinding } from '../app/projects.ts'
+import type { ProjectPreview, TicketView } from '../app/runtime.ts'
 import type { Store } from '../app/store.ts'
 
 export interface RouterToolHost {
@@ -14,6 +16,12 @@ export interface RouterToolHost {
   store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'decisions'>
   settings: () => Settings
   view: (ticket: Ticket) => TicketView
+  /** A ticket's project, as bound at its accept. */
+  projectOf?: (ticketId: string) => ProjectBinding | undefined
+  /** Where an accept of these Triggers would be bound now, or why it would be refused (`Runtime.projectPreview`). */
+  projectPreview?: (triggers: Trigger[]) => ProjectPreview
+  /** Why a ticket takes no more messages after `superagent_reroute`; undefined for a ticket that was not rerouted. */
+  rerouted?: (ticketId: string) => string | undefined
 }
 
 export interface RouterTool<S extends z.ZodType = z.ZodType> { name: string; description: string; schema: S; run: (args: z.infer<S>) => unknown }
@@ -120,7 +128,7 @@ export function routerTools(host: RouterToolHost): RouterTool[] {
         if (!candidate) return { error: 'No Eval holds this trigger now; it was decided or requeued.' }
         const outcome = assessmentOutcome({ ...assessment, worktree_name: assessment.worktree_name ?? undefined }, host.settings(), candidate.strength)
         const named = outcome.kind === 'accept' ? { ...outcome, name: assessment.worktree_name ?? assessment.title,
-          ...assessment.acknowledgement ? { acknowledgement: assessment.acknowledgement } : {} } : outcome
+          ...assessment.acknowledgement ? { acknowledgement: acknowledgement(host, candidate.triggers, assessment.acknowledgement) } : {} } : outcome
         return fromDecision(engine().decide(trigger_id, { ...named, evalId: candidate.evalId }))
       },
     }),
@@ -157,17 +165,53 @@ export function routerTools(host: RouterToolHost): RouterTool[] {
   ]
 }
 
+/**
+ * The acknowledgement an accept posts, with the project it goes to in front (`[<key>] `) when the request came from the
+ * console, so the operator sees where the work landed (plan, 3.7). GitHub replies are public and get no prefix, since a key
+ * can be a local folder's path.
+ */
+function acknowledgement(host: RouterToolHost, triggers: Trigger[], text: string): string {
+  if (!host.projectPreview || !triggers.some(trigger => trigger.source === CONSOLE)) return text
+  const preview = host.projectPreview(triggers)
+  if ('refused' in preview) return text
+  const prefix = `[${preview.key}]`
+  return text.trimStart().startsWith(prefix) ? text : `${prefix} ${text}`
+}
+
+/**
+ * Why `trigger` may not be attached to `ticketId`: the request names a project explicitly (the operator's `project`, or the
+ * GitHub repository's), and the ticket is bound to another one. The Engine's attach knows nothing of projects. A hint a
+ * follow-up inherited does not count, so a worker's handback can still go to a ticket in another project.
+ */
+function crossProject(host: RouterToolHost, ticketId: string, trigger: Trigger | undefined): string | undefined {
+  const hint = trigger && projectHint(trigger)
+  if (!trigger || !hint || hint.by === 'inherited' || !host.projectPreview) return undefined
+  const binding = host.projectOf?.(host.store.tickets.get(ticketId)?.id ?? ticketId)
+  if (!binding) return undefined
+  const preview = host.projectPreview([trigger])
+  if ('refused' in preview) return `The request names project ${hint.project}, which cannot take work: ${preview.refused}`
+  if (preview.id === binding.projectId) return undefined
+  return `The request names project ${preview.key}, and ticket ${ticketId} is in ${binding.key}: a request is never attached to a ticket in `
+    + 'another project. Accept it as its own ticket, or ignore it.'
+}
+
 function route(host: RouterToolHost, item: RouteItem) {
   const engine = host.engine()
   const note = item.note ? { note: item.note } : {}
   switch (item.kind) {
     case 'accept': {
+      const triggers = engine.candidate(item.trigger_id)?.triggers ?? [host.store.triggers.get(item.trigger_id) ?? []].flat()
       const decision = engine.decide(item.trigger_id, { kind: 'accept', title: item.title!, scope: item.title!, reason: { code: 'explicitRouted' },
-        acknowledgement: item.acknowledgement!, name: item.worktree_name!, ...note })
+        acknowledgement: acknowledgement(host, triggers, item.acknowledgement!), name: item.worktree_name!, ...note })
       if (decision.kind !== 'accept' || !decision.ticketId) return { refused: `Ticket was not created: ${reasonText(decision.reason)}` }
       return fromDecision(decision)
     }
     case 'attach': {
+      // An attach would resume a rerouted ticket that had ended, in the project it was moved out of.
+      const moved = host.rerouted?.(host.store.tickets.get(item.ticket_id!)?.id ?? item.ticket_id!)
+      if (moved) return { refused: `${moved} Attach the message to that ticket, or accept it as its own.` }
+      const refused = crossProject(host, item.ticket_id!, host.store.triggers.get(item.trigger_id))
+      if (refused) return { refused }
       const ticket = engine.attach(item.ticket_id!, item.trigger_id, item.note ?? undefined)
       return { reason: 'Attached: the ticket follows the trigger\'s thread and receives it', ticket_id: ticket.id }
     }

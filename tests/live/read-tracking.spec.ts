@@ -7,11 +7,13 @@
  * Run with `T3_LIVE=1 npx vitest run tests/live`.
  */
 import { execFileSync } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Assignment, Ticket, TicketInput } from '../../vendor/dsh/src/core/index.ts'
 import { T3Executor, type TicketThread } from '../../src/executor/t3-executor.ts'
 import type { McpT3Client } from '../../src/t3/client.ts'
+import { singleProject } from '../harness.ts'
 import { eventually, live, poll, skipReason, startT3, type T3Server } from './t3-server.ts'
 
 const TEST_MS = 120_000
@@ -26,7 +28,19 @@ describe.skipIf(!live)(`read tracking on a real t3code${live ? '' : ` (skipped: 
     return await t3.launch({ projectId: server.projectId, title: `[T-${name}] ${message.slice(0, 30)}`, message, worktreePath: path,
       branch: `agent/${name}`, clientRequestId: `launch:${name}` })
   }
-  const running = (threadId: string) => poll(async () => (await t3.read(threadId, { limit: 1 })).thread.status === 'running', 'the run to start')
+  /** How many prompts carrying `marker` the scripted agents have received, from their log. */
+  const prompted = (marker: string) => (existsSync(server.agentLog) ? readFileSync(server.agentLog, 'utf8').split('\n') : [])
+    .filter(line => / prompt \{/.test(line) && (JSON.parse(line.slice(line.indexOf('{'))) as { markers: string[] }).markers.includes(marker)).length
+  /**
+   * Launches `message` and polls until its run shows `running` and its agent has the prompt. Observed: under load t3code shows
+   * a run as `running` before its agent has the prompt, and until the agent has it a send in mode auto queues instead of steering.
+   */
+  const launchRunning = async (message: string, marker: string) => {
+    const before = prompted(marker)
+    const launched = await launch(message)
+    await poll(async () => prompted(marker) > before && (await t3.read(launched.threadId, { limit: 1 })).thread.status === 'running', 'the agent to get the prompt')
+    return launched
+  }
 
   beforeAll(async () => {
     server = await startT3()
@@ -38,8 +52,7 @@ describe.skipIf(!live)(`read tracking on a real t3code${live ? '' : ` (skipped: 
   }, 30_000)
 
   it('answers a wait for a queued run with a 0 ms timeout at once, and follows that run by id once it starts', async () => {
-    const launched = await launch('long [slow 3000]')
-    await running(launched.threadId)
+    const launched = await launchRunning('long [slow 3000]', 'slow 3000')
     const queued = await t3.send(launched.threadId, 'queued [slow 1500]', 'send:queued:1', 'queue')
     expect(queued).toMatchObject({ delivery: 'queued', status: 'queued' })
     const started = Date.now()
@@ -54,8 +67,7 @@ describe.skipIf(!live)(`read tracking on a real t3code${live ? '' : ` (skipped: 
   }, TEST_MS)
 
   it('counts a follow-up t3code queued as read once its run is seen started, before the turn end of that run', async () => {
-    const launched = await launch('long [slow 6000]')
-    await running(launched.threadId)
+    const launched = await launchRunning('long [slow 6000]', 'slow 6000')
     const at = new Date().toISOString()
     const assignment: Assignment = { id: 'assignment-1', state: 'running', createdAt: at, startedAt: at }
     const ticket = { id: 'ticket-1', title: 'work', assignments: [assignment], inputs: [] as TicketInput[], undelivered: [] as string[], createdAt: at,
@@ -75,7 +87,7 @@ describe.skipIf(!live)(`read tracking on a real t3code${live ? '' : ` (skipped: 
         inputsRead: (_ticketId: string, ids: string[]) => record('read', ids),
         turnEnded: () => record('turnEnded'),
       }),
-      settings: () => ({}) as never, project: { id: server.projectId, root: server.checkout }, worktreeRoot: server.dir, workerUrl: token => `http://worker/${token}`,
+      settings: () => ({}) as never, ...singleProject({ id: server.projectId, root: server.checkout, worktreeRoot: server.dir }), workerUrl: token => `http://worker/${token}`,
       maxWorkers: () => 2, waitMs: 1000, idlePollMs: 200, pendingCheckMs: 60_000, log: (text, error) => { logged.push(`${text}: ${String(error)}`) },
       state: { load: () => [entry], save: () => {} },
     })

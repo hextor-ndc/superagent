@@ -1,0 +1,4 @@
+# tests/vendor-intact.spec.ts hashes vendor/dsh byte for byte against the manifest, so neither may get line endings converted
+# on checkout (core.autocrlf on Windows).
+vendor/dsh/** -text
+tests/fixtures/vendor-dsh.sha256 -text

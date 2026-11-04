@@ -4,7 +4,8 @@
  *   talks to t3code over the MCP Apps postMessage protocol and calls the console tools for its buttons;
  * - as the plain panel at `/panel/<token>`, for t3code's browser tab, where it uses this service's HTTP API.
  * A worker thread that waits in t3code shows its approvals with a link to approve them in T3 Code (nothing here can grant
- * one), and its questions with their options and an Answer button.
+ * one), and its questions with their options and an Answer button. Below them, "To review / merge" lists finished tickets of
+ * projects without pull requests whose branch is not merged yet, with the commands that clean up after them.
  */
 export const ATTENTION_URI = 'ui://superagent/attention'
 export const MCP_APP_MIME = 'text/html;profile=mcp-app'
@@ -32,6 +33,7 @@ h1{font-size:15px;margin:0 0 10px}.empty{color:var(--muted);padding:8px 0}
 button,a.btn{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--chip);color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer;text-decoration:none}
 textarea{width:100%;box-sizing:border-box;margin-top:6px;font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px}
 .note{color:var(--muted);font-size:12px;margin-top:10px}
+h2{font-size:13px;margin:16px 0 4px;color:var(--muted)}code{display:block;font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-all;margin:2px 0 0}
 </style></head><body>
 <h1>Needs a person</h1><div id="list"><div class="empty">Loading…</div></div><div class="note" id="note"></div>
 <script>
@@ -68,9 +70,15 @@ function alertHtml(a){const computed=String(a.id).startsWith('pending:');
     +'<div class="actions">'+(computed?'':'<button data-do="dismiss">Dismiss</button>')
     +(a.link?'<a class="btn'+(computed?' primary':'')+'" href="'+esc(a.link)+'" target="_blank" rel="noopener">'+(computed?'Answer in T3 Code':'Open thread')+'</a>':'')
     +'</div></div>'}
-function render(data){const items=(data&&data.tickets)||[],alerts=(data&&data.alerts)||[];const list=document.getElementById('list');
-  if(!items.length&&!alerts.length){list.innerHTML='<div class="empty">Nothing waits for a person.</div>';return}
-  list.innerHTML=alerts.map(alertHtml).join('')+items.map(ticketHtml).join('')}
+function reviewHtml(r){return '<div class="row review"><div class="top"><span class="id">'+esc(r.short)+'</span><strong>'+esc(r.title)+'</strong>'
+  +'<span class="stage review">'+esc(r.project)+'</span></div><p class="s">Branch '+esc(r.branch)+', not in '+esc(r.into)+' yet.'
+  +(r.summary?' '+esc(r.summary):'')+'</p>'+(r.cleanup||[]).map(c=>'<code>'+esc(c)+'</code>').join('')
+  +(r.link?'<div class="actions"><a class="btn" href="'+esc(r.link)+'" target="_blank" rel="noopener">Open thread</a></div>':'')+'</div>'}
+function render(data){const items=(data&&data.tickets)||[],alerts=(data&&data.alerts)||[],review=(data&&data.to_review)||[];
+  const list=document.getElementById('list');
+  if(!items.length&&!alerts.length&&!review.length){list.innerHTML='<div class="empty">Nothing waits for a person.</div>';return}
+  list.innerHTML=alerts.map(alertHtml).join('')+items.map(ticketHtml).join('')
+    +(review.length?'<h2>To review / merge</h2>'+review.map(reviewHtml).join(''):'')}
 // The answer boxes: one under each T3 Code question, or one for the question the worker asked in its report.
 function openBoxes(row){if(row.querySelector('textarea'))return false;const qs=row.querySelectorAll('.pq');
   const add=(before,qid,multi)=>{const box=document.createElement('textarea');box.rows=qid?2:3;box.placeholder=multi?'Your answers, one per line':'Your answer';

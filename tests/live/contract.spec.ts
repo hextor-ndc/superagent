@@ -9,7 +9,7 @@
  * or the fake did not expect.
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
@@ -58,6 +58,16 @@ describe.skipIf(!live)(`t3code /mcp contract${live ? '' : ` (skipped: ${skipReas
     execFileSync('git', ['worktree', 'add', '-q', '-b', `agent/${name}`, path, 'HEAD'], { cwd: server.checkout })
     return { path, branch: `agent/${name}` }
   }
+  /**
+   * How many prompts carrying `marker` the scripted agents have received. Observed: under load t3code shows a run as `running`
+   * before its agent has the prompt, and until the agent has it a send in mode auto queues instead of steering, so a test that
+   * needs a turn that is really running waits for this count to grow as well.
+   */
+  const prompted = (marker: string) => (existsSync(server.agentLog) ? agentEvents(server.agentLog) : [])
+    .filter(event => event.event === 'prompt' && (event.data.markers as string[]).includes(marker)).length
+  /** Polls until the thread shows `running` and the agent has received one more prompt with `marker` than `before`. */
+  const reallyRunning = (threadId: string, marker: string, before: number) => poll(async () => prompted(marker) > before
+    && (await full.read(threadId, { limit: 1 })).thread.status === 'running', 'the agent to get the prompt')
   const launch = async (as: McpT3Client, message: string, extra: { runtimeMode?: string; clientRequestId?: string } = {}) => {
     const { path, branch } = worktree()
     const launched = await as.launch({ projectId: server.projectId, title: `[T-${worktrees}] ${message.slice(0, 30)}`, message, worktreePath: path, branch,
@@ -139,7 +149,10 @@ describe.skipIf(!live)(`t3code /mcp contract${live ? '' : ` (skipped: ${skipReas
 
   it('waits until a run ends, or times out with the run still running', async () => {
     const launched = await launch(full, 'slow [slow 2500]')
-    expect(await full.wait(launched.threadId, 300)).toMatchObject({ status: 'running', timedOut: true, runId: launched.runId })
+    // Observed: under load the run can still be `starting` when the wait times out.
+    const timedOut = await full.wait(launched.threadId, 300)
+    expect(timedOut).toMatchObject({ timedOut: true, runId: launched.runId })
+    expect(['starting', 'running']).toContain(timedOut.status)
     expect(await settle(full, launched.threadId)).toMatchObject({ status: 'completed', timedOut: false })
     // With a runId, the wait is for that run, even after later ones.
     await full.send(launched.threadId, 'second', 'send:wait:2', 'auto')
@@ -181,8 +194,9 @@ describe.skipIf(!live)(`t3code /mcp contract${live ? '' : ` (skipped: ${skipReas
   }, TEST_MS)
 
   it('sends in each mode, once per clientRequestId', async () => {
+    const before = prompted('slow 4000')
     const launched = await launch(full, 'long [slow 4000]')
-    await poll(async () => (await full.read(launched.threadId, { limit: 1 })).thread.status === 'running', 'the run to start')
+    await reallyRunning(launched.threadId, 'slow 4000', before)
     // auto steers a running turn: the message joins the same run.
     const steered = await full.send(launched.threadId, 'steer by auto', 'send:mode:1', 'auto')
     expect(steered).toMatchObject({ delivery: 'steered', runId: launched.runId })
@@ -209,8 +223,9 @@ describe.skipIf(!live)(`t3code /mcp contract${live ? '' : ` (skipped: ${skipReas
     // restart interrupts a running turn and runs the message instead. Observed in probes: while the run is still `starting`
     // (just after a send, or after a steer) it is refused with thread_not_sendable, "has no running turn that can be restarted";
     // not asserted here because the window is a race. The super agent does not use restart.
+    const restartBefore = prompted('slow 8000')
     await full.send(launched.threadId, 'long [slow 8000]', 'send:mode:7', 'auto')
-    await poll(async () => (await full.read(launched.threadId, { limit: 1 })).thread.status === 'running', 'the run to start')
+    await reallyRunning(launched.threadId, 'slow 8000', restartBefore)
     const restarted = await full.send(launched.threadId, 'restart', 'send:mode:9', 'restart')
     expect(restarted.delivery).toBe('restarted')
     await settle(full, launched.threadId)
@@ -418,6 +433,157 @@ describe.skipIf(!live)(`t3code /mcp contract${live ? '' : ` (skipped: ${skipReas
       expect(schemas.has(call.tool), call.tool).toBe(true)
       for (const key of Object.keys(call.args)) expect(schemas.get(call.tool), `${call.tool}.${key}`).toContain(key)
     }
+  }, TEST_MS)
+})
+
+/**
+ * The probes behind docs/multi-project-plan.md, phase 0: what t3code checks when one server holds several projects. A second
+ * project `gadgets` is created with the full-access client, its checkout nested one folder deeper than `widgets` so that a
+ * folder inside the server's temp folder is still outside its parent.
+ */
+describe.skipIf(!live)(`t3code with several projects${live ? '' : ` (skipped: ${skipReason})`}`, () => {
+  let server: T3Server, full: McpT3Client, approval: McpT3Client
+  let gadgets: { id: string; root: string }
+  let made = 0
+  const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' }).trim()
+  /** A real `git worktree add` from `root` at `path`, on a new `agent/` branch. */
+  const worktree = (root: string, path: string) => {
+    const branch = `agent/m${++made}`
+    git(root, 'worktree', 'add', '-q', '-b', branch, path, 'HEAD')
+    return { path, branch }
+  }
+  /** A launch of `path` under `projectId` with a fresh clientRequestId; the caller settles it or expects a refusal. */
+  const launchAt = (projectId: string, path: string, title: string) =>
+    full.launch({ projectId, title, message: title, worktreePath: path, clientRequestId: `multi:${++made}` })
+  /** The project a launch went to: t3code returns it beside the fields `LaunchResult` declares. */
+  const projectOf = (launched: object) => (launched as { projectId?: string }).projectId
+  const create = async (title: string, workspaceRoot: string) =>
+    (await full.call<{ id: string; workspaceRoot: string }>('t3_project_create', { title, workspaceRoot }))
+
+  beforeAll(async () => {
+    server = await startT3()
+    full = await server.client('full-access', 'plain')
+    approval = await server.client('approval-required', 'plain')
+    const root = join(server.dir, 'repos', 'gadgets')
+    execFileSync('git', ['init', '-q', '-b', 'main', root])
+    writeFileSync(join(root, 'README.md'), '# gadgets\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-q', '-m', 'init')
+    gadgets = { id: (await create('gadgets', root)).id, root }
+  }, TEST_MS)
+  afterAll(async () => { await server?.close() }, 30_000)
+
+  it('refuses a worktree of one project launched under another project\'s id (probe 1)', async () => {
+    const widgetsTree = worktree(server.checkout, join(server.dir, 'worktrees', 'm-widgets'))
+    const refusal = { code: 'invalid_request', transient: false, message: expect.stringContaining('worktreePath must be one of the project\'s git worktrees') }
+    // Observed: a real worktree of widgets under gadgets' id is refused before anything runs, with the same refusal as a
+    // folder that is no worktree at all; so is gadgets' own checkout under widgets' id.
+    expect(await error(launchAt(gadgets.id, widgetsTree.path, 'widgets tree as gadgets'))).toMatchObject(refusal)
+    expect(await error(launchAt(server.projectId, gadgets.root, 'gadgets root as widgets'))).toMatchObject(refusal)
+    // Observed: the check is against the project's `git worktree list`, by exact path: a folder inside a worktree, a missing
+    // folder and a plain folder are refused alike. An unknown project id is refused with "The project was not found."
+    mkdirSync(join(widgetsTree.path, 'sub'))
+    expect(await error(launchAt(server.projectId, join(widgetsTree.path, 'sub'), 'subfolder'))).toMatchObject(refusal)
+    expect(await error(launchAt(server.projectId, join(server.dir, 'missing'), 'missing'))).toMatchObject(refusal)
+    expect(await error(launchAt('no-such-project', widgetsTree.path, 'unknown project')))
+      .toMatchObject({ code: 'invalid_request', message: expect.stringContaining('The project was not found.') })
+    // Observed: t3code resolves the path first, so a path through a symlink or with a trailing slash names the same worktree.
+    // The project's main checkout is one of its worktrees too, so a launch there is accepted: the executor never launches
+    // there, since its worktrees are always new folders.
+    const viaLink = join(server.dir, 'link-to-m-widgets')
+    symlinkSync(widgetsTree.path, viaLink)
+    const linked = await launchAt(server.projectId, viaLink, 'through a symlink')
+    expect(projectOf(linked)).toBe(server.projectId)
+    const slashed = await launchAt(server.projectId, `${widgetsTree.path}/`, 'trailing slash')
+    const replayed = `multi:${++made}`
+    const main = await full.launch({ projectId: server.projectId, title: 'main checkout', message: 'main checkout', worktreePath: server.checkout,
+      clientRequestId: replayed })
+    for (const launched of [linked, slashed, main]) await settle(full, launched.threadId)
+    // Observed: a clientRequestId t3code already answered gets the same thread again under any listed project id, whatever
+    // the path says; under a project id that is not listed it is refused with orchestration_error, not invalid_request.
+    const again = { title: 'main checkout', message: 'main checkout', clientRequestId: replayed }
+    expect((await full.launch({ ...again, projectId: gadgets.id, worktreePath: join(server.dir, 'nowhere') })).threadId).toBe(main.threadId)
+    expect(await error(full.launch({ ...again, projectId: 'no-such-project', worktreePath: server.checkout })))
+      .toMatchObject({ code: 'orchestration_error', message: expect.stringContaining('The operation could not be completed.') })
+  }, TEST_MS)
+
+  it('launches a worktree kept outside the checkout\'s parent folder, as under <stateDir>/worktrees (probe 2)', async () => {
+    // gadgets is <dir>/repos/gadgets; this worktree is under <dir>/state, which is outside <dir>/repos.
+    const outside = worktree(gadgets.root, join(server.dir, 'state', 'worktrees', 'gadgets', 'm-outside'))
+    const launched = await full.launch({ projectId: gadgets.id, title: 'outside', message: 'hello from outside', worktreePath: outside.path,
+      branch: outside.branch, clientRequestId: `multi:${++made}` })
+    // Observed: accepted and run like any other worktree; t3code does not care where a worktree's folder is.
+    expect(await settle(full, launched.threadId)).toMatchObject({ status: 'completed' })
+    const read = await full.read(launched.threadId)
+    expect(read.thread).toMatchObject({ worktreePath: outside.path, branch: outside.branch, status: 'completed' })
+    expect((read.thread as { projectId?: string }).projectId).toBe(gadgets.id)
+    expect(texts(read)).toEqual(['user_message: hello from outside', 'assistant_message: echo[plain]: hello from outside'])
+  }, TEST_MS)
+
+  it('takes a linked worktree as a project root, and treats every worktree of one repository as one set (probe 3)', async () => {
+    const root = join(server.dir, 'widgets-linked')
+    git(server.checkout, 'worktree', 'add', '-q', '-b', 'feature/linked', root, 'HEAD')
+    // Observed: t3_project_create accepts a linked worktree as a project's root, and its own checkout is not refused as
+    // already registered, although the main checkout's project lists it among its worktrees.
+    const project = await create('widgets-linked', root)
+    expect(project.workspaceRoot).toBe(root)
+    const fromLinked = worktree(root, join(server.dir, 'worktrees', 'm-from-linked'))
+    const own = await launchAt(project.id, fromLinked.path, 'linked tree as linked')
+    expect(await settle(full, own.threadId)).toMatchObject({ status: 'completed' })
+    // Observed: `git worktree list` is the same from every worktree of a repository, so t3code accepts a worktree made from the
+    // main checkout under the linked project's id and the reverse. It cannot tell the two projects apart; the service's own
+    // binding and common-dir check have to.
+    const fromMain = worktree(server.checkout, join(server.dir, 'worktrees', 'm-from-main'))
+    const crossed = [await launchAt(project.id, fromMain.path, 'main tree as linked'), await launchAt(server.projectId, fromLinked.path, 'linked tree as widgets')]
+    for (const launched of crossed) expect(await settle(full, launched.threadId)).toMatchObject({ status: 'completed' })
+    expect(crossed.map(projectOf)).toEqual([project.id, server.projectId])
+  }, TEST_MS)
+
+  it('refuses a registered root again, also with a trailing slash, but takes a symlinked form of it as a second project (probe 3)', async () => {
+    const refused = { code: 'invalid_request', message: expect.stringContaining('The workspace is already registered to a project.') }
+    // Observed: t3code drops a trailing slash before it compares roots, but does not follow symlinks.
+    expect(await error(create('gadgets again', gadgets.root))).toMatchObject(refused)
+    expect(await error(create('gadgets slashed', `${gadgets.root}/`))).toMatchObject(refused)
+    const link = join(server.dir, 'link-to-gadgets')
+    symlinkSync(gadgets.root, link)
+    const duplicate = await create('gadgets through a link', link)
+    expect(duplicate).toMatchObject({ workspaceRoot: link })
+    expect(duplicate.id).not.toBe(gadgets.id)
+    // Observed: so one folder is two projects, and gadgets' worktrees launch under either id.
+    const tree = worktree(gadgets.root, join(server.dir, 'state', 'worktrees', 'gadgets', 'm-duplicate'))
+    const launched = await launchAt(duplicate.id, tree.path, 'gadgets tree as its duplicate')
+    expect(projectOf(launched)).toBe(duplicate.id)
+    expect(await settle(full, launched.threadId)).toMatchObject({ status: 'completed' })
+  }, TEST_MS)
+
+  it('lists and searches threads in every project, also for a CLI-issued token (probe 4)', async () => {
+    const raw = new Client({ name: 'contract', version: '0' })
+    await raw.connect(new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers: { authorization: `Bearer ${await server.token('approval-required')}` } } }))
+    const tools = (await raw.listTools()).tools
+    await raw.close()
+    // Observed: t3code 0.1.6 has both a thread list and a thread search, besides t3_thread_read. The search's own description
+    // says it covers active threads only and is not exhaustive, so earlier threads are found with the list.
+    expect(tools.map(tool => tool.name)).toEqual(expect.arrayContaining(['t3_thread_list', 't3_thread_search', 't3_thread_read', 't3_worktree_list']))
+    expect(tools.find(tool => tool.name === 't3_thread_search')?.description).toMatch(/^Search active threads[^]*Not exhaustive/)
+    const tree = worktree(gadgets.root, join(server.dir, 'state', 'worktrees', 'gadgets', 'm-listed'))
+    const launched = await launchAt(gadgets.id, tree.path, 'findable gadgets thread')
+    await settle(full, launched.threadId)
+    type Listed = { threadId: string; projectId: string; title: string; status: string; link: string; createdBy: string; creationSource: string }
+    const listed = await approval.call<{ threads: Listed[]; nextCursor: unknown; total: number }>('t3_thread_list', { allProjects: true, limit: 100 })
+    // Observed: with allProjects it lists every project's threads newest first, each with its projectId, title, status and
+    // link. Threads started over /mcp say so in createdBy and creationSource.
+    expect(listed.threads[0]).toMatchObject({ threadId: launched.threadId, projectId: gadgets.id, title: 'findable gadgets thread',
+      createdBy: 'agent', creationSource: 'mcp', link: expect.stringMatching(new RegExp(`^${server.origin}/`)) })
+    expect(listed.threads.map(thread => thread.projectId)).toEqual(expect.arrayContaining([gadgets.id, server.projectId]))
+    const one = await approval.call<{ projectId: string; threads: Listed[] }>('t3_thread_list', { projectId: gadgets.id, limit: 100 })
+    expect(one.threads.length).toBeGreaterThan(0)
+    expect(one.threads.every(thread => thread.projectId === gadgets.id)).toBe(true)
+    // Observed: outside a T3 thread, the list needs projectId or allProjects.
+    expect(await error(approval.call('t3_thread_list', {}))).toMatchObject({ code: 'target_required' })
+    // Observed: the search matches titles (its source says which field matched) and carries the projectId too.
+    const found = await approval.call<{ matches: { threadId: string; projectId: string; title: string; source: string }[] }>('t3_thread_search',
+      { query: 'findable gadgets' })
+    expect(found.matches).toEqual([expect.objectContaining({ threadId: launched.threadId, projectId: gadgets.id, source: 'title' })])
   }, TEST_MS)
 })
 

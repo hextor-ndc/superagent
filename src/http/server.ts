@@ -17,6 +17,15 @@ import { workerServer } from '../mcp/worker-tools.ts'
 
 const MAX_BODY = 1024 * 1024
 
+/**
+ * Opens HTTP only once `runtime.prepare()` has finished, as main.ts does: the migration of the state must be done before a
+ * console request or a worker can reach the Runtime (docs/multi-project-plan.md, 3.6). A failed `prepare` opens nothing.
+ */
+export async function serve(runtime: Runtime, port: number, host = '127.0.0.1'): Promise<Server> {
+  await runtime.prepare()
+  return startHttp(runtime, port, host)
+}
+
 export function startHttp(runtime: Runtime, port: number, host = '127.0.0.1'): Promise<Server> {
   const server = createServer((req, res) => {
     handle(runtime, req, res).catch(error => {

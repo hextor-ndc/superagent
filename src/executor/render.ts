@@ -36,14 +36,44 @@ export interface ExecutionVariables {
   name: string
   directory: string
   branch: string
+  /** Only for `pr` delivery: the GitHub repository the pull request goes to. */
   repository?: string
   account?: string
   commitEmail?: string
+  /** How the work is delivered (D11); `pr` when not given, as before projects were kept per ticket. */
+  delivery?: 'pr' | 'branch'
+  /** What the worktree started from, when this service made it, with a note on the checkout's uncommitted changes it left out. */
+  base?: { ref: string; sha: string; note?: string }
+  /** The project the ticket is in. `purpose` only where the operator lets catalogue text reach a model. */
+  project?: { title: string; key: string; root: string; purpose?: string; map?: string }
+}
+
+/**
+ * The deliverable of a `branch` project (D11), appended to its Assignment and repeated as its Delivery requirements. The
+ * vendored brief says to push and open a pull request "unless the assignment explicitly requests a different deliverable"
+ * (vendor/dsh/prompts/work.md), which this is.
+ */
+export const BRANCH_DELIVERABLE = 'Deliverable: commit your change on the ticket branch in this worktree. Do not push and do not open a pull '
+  + 'request. Report ready with the branch name and the last commit SHA.'
+
+/** The section the worker brief calls "the Delivery requirements section". */
+function deliveryRequirements(variables: ExecutionVariables): string[] {
+  if (variables.delivery === 'branch') {
+    return ['## Delivery requirements', BRANCH_DELIVERABLE, 'This project takes no pull requests: the operator reviews the ticket branch and '
+      + 'merges it locally. Never push it, and never merge it into another branch.']
+  }
+  return ['## Delivery requirements', `Push the ticket branch and open a pull request${variables.repository ? ` in ${variables.repository}` : ''}, `
+    + 'as the instructions say. No merge CLI is named here, so a person merges every pull request.']
 }
 
 /** The first message of a worker's thread: who it is, its tools, its brief, its variables, then the assignment and its source. */
 export function assignmentMessage(ticket: Ticket, origin: Trigger | undefined, variables: ExecutionVariables, batch: Trigger[] = []): string {
-  const assignment = ticket.execution?.assignment ?? ''
+  // A `branch` deliverable goes last in the Assignment section, after any cut, and also for a ticket whose stored assignment
+  // has none: one accepted before its project switched to branch delivery (the migration binds those, docs/multi-project-plan.md 3.6).
+  const branch = variables.delivery === 'branch'
+  const stored = ticket.execution?.assignment ?? ''
+  const assignment = branch ? stored.replace(`\n${BRANCH_DELIVERABLE}`, '').replace(BRANCH_DELIVERABLE, '') : stored
+  const project = variables.project
   const lines = [
     `# Superagent ticket ${shortId(ticket.id)}: ${ticket.title}`,
     '',
@@ -62,12 +92,18 @@ export function assignmentMessage(ticket: Ticket, origin: Trigger | undefined, v
     `- DSH_SUPERAGENT_NAME=${variables.name}`,
     `- DSH_SUPERAGENT_DIR=${variables.directory}`,
     `- Branch: ${variables.branch}`,
+    ...variables.base ? [`- Base ${variables.base.ref} at ${variables.base.sha}`, ...variables.base.note ? [`- ${variables.base.note}`] : []] : [],
     ...variables.repository ? [`- DSH_SUPERAGENT_GITHUB_REPOSITORY=${variables.repository}`] : [],
     ...variables.account ? [`- DSH_SUPERAGENT_GITHUB_ACCOUNT=${variables.account}`] : [],
     ...variables.commitEmail ? [`- DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL=${variables.commitEmail}`] : [],
     '',
+    ...project ? ['## Project', `- ${project.title} (${project.key})`, `- Checkout: ${project.root}; your worktree is a worktree of it.`,
+      ...project.purpose ? [`- Purpose: ${project.purpose}`] : [], ...project.map ? [`- Map of the repository: ${project.map}`] : [], ''] : [],
+    ...deliveryRequirements(variables),
+    '',
     '## Assignment',
     ...assignment ? [assignment.length <= ASSIGNMENT_CHARS ? assignment : `${assignment.slice(0, ASSIGNMENT_CHARS)}… (read ticket/${ticket.id})`] : [],
+    ...branch ? [BRANCH_DELIVERABLE] : [],
     ...mandateInstructions(ticket.mandate) ? [mandateInstructions(ticket.mandate)] : [],
     '',
     '## Source request',
@@ -81,10 +117,12 @@ export function assignmentMessage(ticket: Ticket, origin: Trigger | undefined, v
   return lines.join('\n')
 }
 
-const RESUMED = 'This ticket ended earlier and the message that follows, on its thread, resumed it under the same mandate. If it asks for '
-  + 'more within the original scope, inspect the worktree, git history and PR state and continue; if it asks for work beyond that scope or '
+const resumed = (inspect: string) => 'This ticket ended earlier and the message that follows, on its thread, resumed it under the same mandate. '
+  + `If it asks for more within the original scope, inspect ${inspect} and continue; if it asks for work beyond that scope or `
   + 'for another ticket, hand it back with orchestrator_trigger_handback and report dropped; if it needs nothing, such as thanks, '
   + 'report dropped without a message. Report ready when the follow-up is done. Do not repeat completed work.'
+/** A `branch` project has no pull request to look at. */
+const RESUMED = { pr: resumed('the worktree, git history and PR state'), branch: resumed('the worktree and git history') }
 
 function policyMessage(effect?: PolicyEffect): string {
   if (!effect) return 'Policy change: the access or admission rules changed. Check that the remaining work stays within the assignment.'
@@ -99,14 +137,14 @@ function policyMessage(effect?: PolicyEffect): string {
 }
 
 /** One Input as the worker reads it; undefined for legacy inputs that carry nothing to say. */
-export function inputMessage(input: TicketInput, trigger?: Trigger): string | undefined {
+export function inputMessage(input: TicketInput, trigger?: Trigger, delivery: 'pr' | 'branch' = 'pr'): string | undefined {
   if (input.kind === 'trigger') {
     const card = trigger ? triggerCard(trigger, input.note) : { trigger_id: input.triggerId, read: `trigger/${input.triggerId}` }
     return `New message on this ticket's threads${input.context ? ' (context only, not addressed to this ticket)' : ''}:\n`
       + `\`\`\`json\n${JSON.stringify(card, null, 2)}\n\`\`\``
   }
   if (input.kind === 'policy-changed') return policyMessage(input.effect)
-  if (input.kind === 'resumed') return RESUMED
+  if (input.kind === 'resumed') return RESUMED[delivery]
   if (input.kind === 'note') return `Note from the orchestrator, for context only: ${input.text}`
   return input.kind === 'text' ? input.text : undefined
 }

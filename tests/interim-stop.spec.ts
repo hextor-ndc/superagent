@@ -1,12 +1,15 @@
 /**
  * The rules router's stop on a ticket's own thread is kept in the store until the Engine decided it, as the model-backed
- * Router keeps its follow_up notice in its inbox: a shutdown before it ran, or a failed attempt, does not lose it.
+ * Router keeps its follow_up notice in its inbox: a shutdown before it ran, or a failed attempt, does not lose it. And the
+ * project its accepts go to (docs/multi-project-plan.md, phase 3a): the one a request names, else the default, else none.
  */
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { threadKey, type Trigger } from '../vendor/dsh/src/core/index.ts'
 import { consoleThread, consoleTrigger } from '../src/app/console-source.ts'
 import { FakeT3 } from './fake-t3.ts'
 import { checkout, harness, until, type Harness } from './harness.ts'
+import { named, setup, type Setup } from './two-projects.ts'
 
 describe('the rules router\'s stop', () => {
   let open: Harness[] = []
@@ -78,4 +81,34 @@ describe('the rules router\'s stop', () => {
     expect(errors.some(line => line.includes('database is locked'))).toBe(true)
     expect(runtime.repo.kv.list('interim-stop:')).toEqual([])
   }, 10_000)
+})
+
+describe('the rules router\'s project', () => {
+  let open: Setup[] = []
+  afterEach(async () => { for (const item of open) await item.made.close().catch(() => {}); open = [] })
+  const start = async (...args: Parameters<typeof setup>) => { const env = await setup(...args); open.push(env); return env }
+  const decided = (env: Setup, trigger: Trigger) => until(() => env.made.runtime.repo.decisions.byThread(threadKey(trigger.threads[0]!))[0], 'the decision')
+
+  it('accepts into the project a request names, else into the default one', async () => {
+    const env = await start()
+    const gadgets = named('Fix the gadget count', 'p-gadgets'), unnamed = consoleTrigger('hector', 'Fix the widget count')
+    env.made.runtime.engine.receive(gadgets)
+    env.made.runtime.engine.receive(unnamed)
+    expect(env.made.runtime.binding(await env.ticketOf(gadgets))).toMatchObject({ projectId: 'p-gadgets', by: 'operator' })
+    expect(env.made.runtime.binding(await env.ticketOf(unnamed))).toMatchObject({ projectId: 'p-widgets', by: 'legacy' })
+  })
+
+  it('ignores a request that names no project when there is no default, with what to do', async () => {
+    const env = await start({ legacy: false })
+    const unnamed = consoleTrigger('hector', 'Fix the count')
+    env.made.runtime.engine.receive(unnamed)
+    const decision = await decided(env, unnamed)
+    expect(decision.kind).toBe('ignore')
+    expect(decision.reason[0]!.values?.text ?? decision.reason[0]!.code).toMatch(/^Name the project: superagent_request with project=<key> \(superagent_projects lists them\)\./)
+    // One naming a project it can take is accepted there.
+    const gadgets = named('Fix the count', 'p-gadgets')
+    env.made.runtime.engine.receive(gadgets)
+    expect(env.made.runtime.binding(await env.ticketOf(gadgets))).toMatchObject({ projectId: 'p-gadgets', by: 'operator' })
+    expect(env.made.errors.filter(error => error.includes('failed'))).toEqual([])
+  })
 })

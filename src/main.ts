@@ -2,10 +2,12 @@
  * `superagent connect` signs the super agent in to t3code once; `superagent` (no command) starts it next to a running
  * `t3 serve`. See README.md, "Run it".
  */
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
+import { ProjectRegistry } from './app/projects.ts'
 import { Runtime } from './app/runtime.ts'
+import { acquireLock, ensureConsoleToken } from './app/state-files.ts'
 import { loadConfig, stateDir } from './config.ts'
-import { startHttp } from './http/server.ts'
+import { serve } from './http/server.ts'
 import { McpT3Client } from './t3/client.ts'
 import { connect, daysLeft, loadToken, saveToken } from './t3/connect.ts'
 
@@ -21,6 +23,10 @@ async function signIn(): Promise<void> {
 
 async function run(): Promise<void> {
   const config = loadConfig()
+  // Before anything else: two instances on one database would both resume every active ticket.
+  const lock = acquireLock(config.stateDir)
+  process.once('exit', lock.release)
+  config.consoleToken = ensureConsoleToken(config.stateDir, config.consoleToken)
   let token = config.t3Token
   if (!token) {
     const saved = await loadToken(config.tokenFile)
@@ -31,28 +37,42 @@ async function run(): Promise<void> {
     token = saved.token
   }
   const t3 = new McpT3Client({ url: config.t3Url, token, ...(config.model ? { modelSelection: config.model } : {}) })
-  const projects = await t3.listProjects()
-  const project = config.projectId
-    ? projects.find(item => item.id === config.projectId)
-    : projects.find(item => resolve(item.workspaceRoot) === config.projectRoot)
-  if (!project) throw new Error(`No T3 Code project ${config.projectId ?? `at ${config.projectRoot}`}. Add the folder as a project in T3 Code first.`)
+  const projects = await ProjectRegistry.load({ t3, stateDir: config.stateDir, legacy: config.legacy, catalogue: config.catalogue,
+    projectsFile: config.projectsFile, log: config.log })
+  // A configured project that does not resolve fails the start, as before; GitHub needs it for its repository.
+  const refused = config.legacy && !projects.legacy() ? projects.legacyProblem() ?? 'The project SUPERAGENT_PROJECT_ROOT names is not ready.'
+    : config.github && !projects.legacy() ? 'GitHub needs the project its repository belongs to: set SUPERAGENT_PROJECT_ROOT and SUPERAGENT_REPOSITORY.' : undefined
+  if (refused) { logProjects(projects); throw new Error(refused) }
 
-  const runtime = new Runtime(config, t3, { id: project.id, root: config.projectRoot })
-  const http = await startHttp(runtime, config.port)
+  const runtime = new Runtime(config, t3, projects)
+  // The migration of earlier state runs before HTTP opens and before any work resumes.
+  const http = await serve(runtime, config.port)
   runtime.start()
   await runtime.ensureConsole()
   await runtime.ensureWatchdog().catch(error => log(`starting the Watchdog failed: ${error instanceof Error ? error.message : String(error)}`))
-  log(`ready: router ${config.router.kind}${config.github ? `, GitHub ${config.repository} as ${config.github.login}` : ''}; `
+  // After the console's thread exists: it puts t3code's scratch project in T3 Code's list, which the registry leaves out.
+  logProjects(projects)
+  const unnamed = config.unnamedRequests === 'refuse' ? undefined : runtime.projectPreview([{ source: 'console', meta: {} }])
+  log(`ready: router ${config.router.kind}${config.github ? `, GitHub ${runtime.workProject?.repository} as ${config.github.login}` : ''}; `
+    + `unnamed requests go to ${unnamed && !('refused' in unnamed) ? unnamed.key : 'no project (they are refused)'}; `
     + `console ${runtime.console?.link ?? runtime.console?.threadId}, panel ${runtime.panelUrl()}`)
 
   const shutdown = async () => {
     http.close()
     await runtime.stop()
     await t3.close()
+    lock.release()
     process.exit(0)
   }
   process.once('SIGINT', shutdown)
   process.once('SIGTERM', shutdown)
+}
+
+/** Every T3 Code project with its status and why, then the counts, catalogued folders included, and the ready ones. */
+function logProjects(projects: ProjectRegistry): void {
+  const registered = projects.list().filter(entry => entry.id)
+  for (const entry of registered) log(`project ${entry.key} (${entry.id}): ${entry.status}${entry.legacy ? ', legacy' : ''}${entry.reason ? `: ${entry.reason}` : ''}`)
+  log(`projects: ${projects.summary()}; ready: ${projects.ready().map(entry => `${entry.key} at ${entry.root}`).join('; ') || 'none'}`)
 }
 
 const command = process.argv[2]
