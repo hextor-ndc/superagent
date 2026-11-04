@@ -394,6 +394,7 @@ export class MemoryWorkers implements Workers {
   async collect(): Promise<void> {}
   async close(): Promise<void> {
     for (const worker of this.workers.values()) await worker.client.close().catch(() => {})
+    await this.t3.close()
     if (this.place) removeCheckout(this.place)
   }
 

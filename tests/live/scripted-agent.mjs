@@ -13,6 +13,9 @@
  * - `[permission <kind>]`: ask `session/request_permission` for a tool call of that kind (execute, edit, read, ...);
  * - `[question]`: ask `elicitation/create` with one multiple-choice question, as t3code's dev replay agent does;
  * - `[fail]`: answer the prompt with a JSON-RPC error, which t3code records as a failed turn;
+ * - `[crash]`: say a little, then exit with code 1 in the middle of the turn, as an agent process that dies would;
+ * - `[crash once]`: crash as `[crash]` the first time a session's folder sees it, and do nothing at later turns: it leaves
+ *   `.scripted-agent-crashed` in the folder, so a new agent process that takes over the thread does not crash again;
  * - `[worker]`: act as a superagent worker: read `.mcp.json` in the session's folder (src/executor/workspace.ts writes it),
  *   connect to its `superagent` server, acknowledge the request, and report ready at the end of the turn, after the turn's
  *   other markers. When tests/workload/worker-plan.mjs exists, its `runWorkerTurn` decides what the worker does instead: at
@@ -76,7 +79,7 @@ function userText(prompt) {
   const at = text.indexOf('<runtime_info>')
   return (at >= 0 ? text.slice(0, at) : text).trim()
 }
-const MARKERS = /\[(slow \d+|permission [a-z_]+|question|fail|worker)\]/g
+const MARKERS = /\[(slow \d+|permission [a-z_]+|question|fail|crash(?: once)?|worker)\]/g
 /** The message cards in a worker's prompt (src/executor/render.ts): JSON objects with a `trigger_id`. */
 function cards(text) {
   return [...text.matchAll(/```json\n([\s\S]*?)\n```/g)].flatMap(match => {
@@ -126,6 +129,12 @@ async function runTurn(id, { sessionId, prompt }) {
     for (const marker of markers) {
       if (abort.signal.aborted || turn.cancelled) break
       if (marker === 'fail') return send({ id, error: { code: -32603, message: 'scripted failure' } })
+      if (marker === 'crash' || marker === 'crash once') {
+        const crashed = join(session.cwd, CRASHED)
+        if (marker === 'crash once' && existsSync(crashed)) { turn.outcomes.push('crash once: already crashed'); continue }
+        if (marker === 'crash once') writeFileSync(crashed, `${process.pid}\n`)
+        await crash(sessionId)
+      }
       if (marker.startsWith('slow ')) {
         const end = Date.now() + Number(marker.slice(5))
         while (Date.now() < end && !abort.signal.aborted) { say(sessionId, '.'); await sleep(Math.min(100, end - Date.now()), abort.signal) }
@@ -152,6 +161,16 @@ async function runTurn(id, { sessionId, prompt }) {
   if (abort.signal.aborted || turn.cancelled) return send({ id, result: { stopReason: 'cancelled' } })
   say(sessionId, markers.length ? `done[${session.model}]: ${turn.outcomes.join('; ')}` : `echo[${session.model}]: ${text}`)
   send({ id, result: { stopReason: 'end_turn' } })
+}
+
+/** The file `[crash once]` leaves in a session's folder. */
+const CRASHED = '.scripted-agent-crashed'
+/** Ends this process mid-turn: some output first, so t3code has seen the turn running, then exit code 1 without an answer. */
+async function crash(sessionId) {
+  say(sessionId, 'about to crash')
+  log('crash', sessionId)
+  await new Promise(resolve => setTimeout(resolve, 300))
+  process.exit(1)
 }
 
 async function permission(sessionId, kind, signal) {
@@ -186,7 +205,8 @@ const QUESTION = {
 }
 async function question(sessionId, signal) {
   const answer = await request('elicitation/create', { sessionId, ...QUESTION }, signal)
-  log('question', JSON.stringify(answer))
+  // With the session's folder, so a test can tell which thread got which answer.
+  log('question', { cwd: sessions.get(sessionId)?.cwd, answer })
   if (answer?.cancelledByTurn) return 'question: cancelled'
   return answer?.action === 'accept' ? `answer: ${JSON.stringify(answer.content ?? {})}` : `question: ${answer?.action ?? 'no answer'}`
 }

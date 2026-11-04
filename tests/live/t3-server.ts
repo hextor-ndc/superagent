@@ -11,10 +11,11 @@
  * process from outside and takes the server and its folder down once that process is gone.
  */
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
-import { tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { delimiter, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { connect } from '../../src/t3/connect.ts'
@@ -37,6 +38,24 @@ export const t3Bin: string | undefined = (() => {
 export const live = process.env.T3_LIVE === '1' && !!t3Bin
 export const skipReason = process.env.T3_LIVE !== '1' ? 'set T3_LIVE=1 to run the live t3code suites'
   : !t3Bin ? 'no t3 binary on PATH (set T3_BIN)' : ''
+
+/**
+ * The t3 runtime itself: `t3Bin` when it is not the npm launcher, else the build the launcher starts,
+ * `~/.t3/runtime/versions/<launcher version>/t3`, which is only read and run. Undefined when that build is not installed.
+ */
+export const t3Runtime: string | undefined = (() => {
+  if (!t3Bin) return undefined
+  const real = realpathSync(t3Bin)
+  if (!real.endsWith('.mjs')) return real
+  try {
+    const { version } = JSON.parse(readFileSync(join(dirname(real), '..', 'package.json'), 'utf8')) as { version: string }
+    const runtime = join(homedir(), '.t3', 'runtime', 'versions', version, 't3')
+    accessSync(runtime, constants.X_OK)
+    return runtime
+  } catch { return undefined }
+})()
+/** Why a server without credentials (`StartOptions.noCredentials`) cannot start here; empty when it can. */
+export const noCredentialsSkipReason = !live ? skipReason : !t3Runtime ? 'the t3 runtime the launcher starts is not installed' : ''
 
 /** The scripted ACP agent the isolated server runs for every thread. */
 export const SCRIPTED_AGENT = fileURLToPath(new URL('./scripted-agent.mjs', import.meta.url))
@@ -66,10 +85,20 @@ export interface T3Server {
   cli(...args: string[]): Promise<string>
   /** The server's output so far, for failure messages. */
   output(): string
+  /** The hosts that requests sent through the refusing proxy were for (`StartOptions.noCredentials`); always empty without it. */
+  proxied(): string[]
+  /**
+   * Answers a pending approval as t3code's web app does, since `/mcp` cannot: with a bearer session the CLI issues from this
+   * base dir, a WebSocket ticket for that session, and the `runtime-request.respond` command on the app's RPC socket.
+   */
+  answerApproval(threadId: string, requestId: string, decision?: ApprovalDecision): Promise<void>
   /** Kills the server outright and starts it again on the same base dir and port, as a crash and restart would. */
   restart(): Promise<void>
   close(): Promise<void>
 }
+
+/** How the web app answers an approval: once, for the rest of the session, always, or not. */
+export type ApprovalDecision = 'accept' | 'acceptForSession' | 'acceptAlways' | 'decline' | 'cancel'
 
 export interface StartOptions {
   /** The ACP agent script; tests/live/scripted-agent.mjs by default. */
@@ -83,6 +112,18 @@ export interface StartOptions {
    * folder the agent writes to can live inside it and go with it.
    */
   environment?: Record<string, string> | ((dir: string) => Record<string, string>)
+  /**
+   * Runs t3 without any of this machine's credentials, for calls that may look something up on GitHub: the runtime itself
+   * (`t3Runtime`; the npm launcher would download one into the new HOME), with HOME and XDG_CONFIG_HOME in the temp folder, no
+   * GitHub tokens or SSH agent, and no global or system git config. HTTP(S)_PROXY point at a local proxy that refuses every
+   * request and records its host (`T3Server.proxied`), loopback excepted; it sees only clients that honour those variables.
+   * The CLI calls run the same way, and the agents the server starts inherit all of it. Telemetry is off for every server,
+   * so it never reaches the proxy. See `noCredentialsSkipReason`.
+   *
+   * macOS `sandbox-exec` cannot hold t3 instead: a sandboxed process may not run a setuid program, and t3 serve runs `/bin/ps`
+   * at start and exits when that fails.
+   */
+  noCredentials?: boolean
 }
 
 /** Kills each running server at once; only synchronous work runs on `exit`. A process killed by a signal has the reaper. */
@@ -91,6 +132,7 @@ process.once('exit', () => { for (const kill of running.values()) kill() })
 
 export async function startT3(options: StartOptions = {}): Promise<T3Server> {
   if (!t3Bin) throw new Error(skipReason)
+  if (options.noCredentials && noCredentialsSkipReason) throw new Error(noCredentialsSkipReason)
   const bin = t3Bin
   const models = options.models ?? ['plain', 'alt']
   const timeoutMs = options.timeoutMs ?? 60_000
@@ -107,11 +149,29 @@ export async function startT3(options: StartOptions = {}): Promise<T3Server> {
   const env = { ...process.env }
   // The server takes its home from --base-dir only; a stray variable must not point it elsewhere.
   delete env.T3CODE_HOME; delete env.T3CODE_PORT
+  // Otherwise t3code sends usage events for these throwaway servers to its telemetry host every 10 s.
+  env.T3CODE_TELEMETRY_ENABLED = 'false'
+  // t3 leaves a `t3-token-*` folder with a socket in the temp directory; in the server's folder it goes with the folder. Not a
+  // subfolder: the socket's path has to stay under macOS's 104 characters.
+  env.TMPDIR = dir
+  let proxy: RefusingProxy | undefined
+  /** The command that runs t3 with these arguments: the binary, or the runtime itself without credentials. */
+  const t3 = (args: string[]): [string, string[]] => [options.noCredentials ? t3Runtime! : bin, args]
   // The t3 CLI accepts `--base-dir` after the positional arguments too.
-  const cli = async (...args: string[]) => (await run(bin, [...args, '--base-dir', baseDir], { env, timeout: 60_000 })).stdout.trim()
+  const cli = async (...args: string[]) => (await run(...t3([...args, '--base-dir', baseDir]), { env, timeout: 60_000 })).stdout.trim()
   let projectId: string, port: number
-  // Nothing below has a server yet, so a failure here only has the folder to remove.
+  // Nothing below has a server yet, so a failure here only has the folder (and the proxy) to remove.
   try {
+    if (options.noCredentials) {
+      proxy = await refusingProxy()
+      const home = join(dir, 'home')
+      mkdirSync(join(home, '.config'), { recursive: true })
+      Object.assign(env, { HOME: home, XDG_CONFIG_HOME: join(home, '.config'), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+        GIT_TERMINAL_PROMPT: '0', NODE_USE_ENV_PROXY: '1', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' })
+      for (const name of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) env[name] = proxy.url
+      for (const name of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_HOST', 'GH_CONFIG_DIR', 'SSH_AUTH_SOCK',
+        'T3CODE_RELEASE_BASE_URL']) delete env[name]
+    }
     mkdirSync(join(baseDir, 'userdata'), { recursive: true })
     writeFileSync(join(baseDir, 'userdata', 'settings.json'), `${JSON.stringify({
       continueThreadsAfterServerUpdate: false,
@@ -139,6 +199,7 @@ export async function startT3(options: StartOptions = {}): Promise<T3Server> {
   } catch (error) {
     if (process.env.T3_LIVE_KEEP === '1') console.error(`kept ${dir}`)
     else rmSync(dir, { recursive: true, force: true })
+    proxy?.close()
     stopReaper()
     throw error
   }
@@ -148,8 +209,8 @@ export async function startT3(options: StartOptions = {}): Promise<T3Server> {
   let output = ''
   let child!: ChildProcess, exited!: Promise<void>
   const spawnServer = () => {
-    // Its own process group (the launcher's pid), which the server and the agents it starts join.
-    child = spawn(bin, ['serve', '--base-dir', baseDir, '--port', String(port), '--host', '127.0.0.1', '--no-browser', checkout],
+    // Its own process group (the launcher's pid, or the runtime's), which the server and the agents it starts join.
+    child = spawn(...t3(['serve', '--base-dir', baseDir, '--port', String(port), '--host', '127.0.0.1', '--no-browser', checkout]),
       { env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
     listGroup(child.pid)
     child.stdout!.on('data', chunk => { output += String(chunk) })
@@ -182,12 +243,15 @@ export async function startT3(options: StartOptions = {}): Promise<T3Server> {
   }, 't3 serve to listen', timeoutMs)
   spawnServer()
   const tokens = new Map<Access, Promise<string>>()
+  /** The web app's kind of session, for `answerApproval`: t3code refuses an `mcp-client` session on `/ws`. */
+  let appSession: Promise<string> | undefined
   const clients: McpT3Client[] = []
   let closed = false
 
   const server: T3Server = {
     url, origin, dir, baseDir, projectId, checkout, agentLog, cli,
     output: () => output,
+    proxied: () => [...proxy?.hosts ?? []],
     token(access) {
       let token = tokens.get(access)
       if (!token) {
@@ -205,6 +269,13 @@ export async function startT3(options: StartOptions = {}): Promise<T3Server> {
       clients.push(client)
       return client
     },
+    async answerApproval(threadId, requestId, decision = 'accept') {
+      if (!appSession) {
+        appSession = cli('auth', 'session', 'issue', '--scope', 'orchestration:read', '--scope', 'orchestration:operate', '--label', 'live tests', '--token-only')
+        appSession.catch(() => { appSession = undefined })
+      }
+      await dispatch(origin, await appSession, { type: 'runtime-request.respond', commandId: `live-test:${randomUUID()}`, threadId, requestId, decision })
+    },
     async restart() {
       await stopServer('SIGKILL')
       // The runtime file outlives a killed server; readiness waits for the new one to write it.
@@ -218,6 +289,7 @@ export async function startT3(options: StartOptions = {}): Promise<T3Server> {
       running.delete(server)
       await Promise.allSettled(clients.map(client => client.close()))
       await stopServer('SIGTERM')
+      proxy?.close()
       // T3_LIVE_KEEP=1 keeps the folder (server and agent logs, worktrees) for a look after a failure.
       if (process.env.T3_LIVE_KEEP === '1') console.error(`kept ${dir}`)
       else rmSync(dir, { recursive: true, force: true })
@@ -265,6 +337,53 @@ async function pairedToken(cli: (...args: string[]) => Promise<string>, mcpUrl: 
     await fetch((JSON.parse(body) as { redirectTo: string }).redirectTo)
   } })
   return saved.token
+}
+
+/**
+ * Sends one orchestration command as t3code's web app does: a WebSocket ticket for the session's bearer token
+ * (`/api/auth/websocket-ticket/rpc`), then `orchestration.dispatchCommand` on `/ws`, which speaks Effect RPC as JSON. The
+ * socket needs `orchestrationProtocol=2`, or t3code answers HTTP 426.
+ */
+async function dispatch(origin: string, sessionToken: string, command: { type: string } & Record<string, unknown>): Promise<void> {
+  const response = await fetch(`${origin}/api/auth/websocket-ticket/rpc`, { method: 'POST', headers: { authorization: `Bearer ${sessionToken}` } })
+  const body = await response.text()
+  if (!response.ok) throw new Error(`/api/auth/websocket-ticket/rpc: HTTP ${response.status} ${body}`)
+  const { ticket } = JSON.parse(body) as { ticket: string }
+  const socket = new WebSocket(`${origin.replace(/^http/, 'ws')}/ws?orchestrationProtocol=2&wsTicket=${encodeURIComponent(ticket)}`)
+  try {
+    const exit = await new Promise<{ _tag: string }>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${command.type}: no answer on /ws within 10 s`)), 10_000)
+      const end = (error?: Error, value?: { _tag: string }) => { clearTimeout(timer); if (error) reject(error); else resolve(value!) }
+      socket.addEventListener('open', () => socket.send(JSON.stringify({ _tag: 'Request', id: '1', tag: 'orchestration.dispatchCommand', payload: command, headers: [] })))
+      socket.addEventListener('message', event => {
+        const message = JSON.parse(String(event.data)) as { _tag: string; requestId?: string; exit?: { _tag: string }; defect?: unknown }
+        if (message._tag === 'Exit' && message.requestId === '1') end(undefined, message.exit)
+        else if (message._tag === 'Defect') end(new Error(`${command.type}: ${JSON.stringify(message.defect)}`))
+      })
+      socket.addEventListener('error', () => end(new Error(`${command.type}: /ws refused the connection`)))
+    })
+    if (exit._tag !== 'Success') throw new Error(`${command.type} failed: ${JSON.stringify(exit)}`)
+  } finally { socket.close() }
+}
+
+interface RefusingProxy { url: string; hosts: string[]; close(): void }
+/** An HTTP proxy on loopback that answers every request 403 and records the host it was for. */
+async function refusingProxy(): Promise<RefusingProxy> {
+  const hosts: string[] = []
+  const server = createServer(socket => {
+    socket.on('error', () => {})
+    socket.once('data', chunk => {
+      // `CONNECT host:443 HTTP/1.1` for HTTPS, `GET http://host/path HTTP/1.1` for plain HTTP.
+      const target = /^[A-Z]+ (\S+)/.exec(String(chunk))?.[1] ?? '?'
+      let host = target
+      try { if (target.includes('://')) host = new URL(target).host } catch { /* keep the raw target */ }
+      hosts.push(host)
+      socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+    })
+  })
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
+  const address = server.address()
+  return { url: `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`, hosts, close: () => { server.close() } }
 }
 
 /** A port nothing listens on, found by binding port 0; never the operator's own t3code port. */

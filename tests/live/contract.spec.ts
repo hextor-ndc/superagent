@@ -1,8 +1,9 @@
 /**
  * PLAN.md, ground rule 4: the contract between `McpT3Client` and a real `t3 serve`, pinned before moving to a new t3code
  * release. Every T3Client method runs against an isolated server (tests/live/t3-server.ts) whose threads run the scripted
- * ACP agent (tests/live/scripted-agent.mjs). `link_pull_requests` is only checked against the tool list: linking may
- * reach GitHub with the operator's credentials.
+ * ACP agent (tests/live/scripted-agent.mjs). `link_pull_request` is called only on a server started without this machine's
+ * credentials (`StartOptions.noCredentials`), with a pull request URL on a host that cannot resolve: linking may look the pull
+ * request up on its host.
  *
  * Run with `T3_LIVE=1 npx vitest run tests/live`. Comments marked "Observed" record t3code 0.1.6 behaviour that the design
  * or the fake did not expect.
@@ -14,7 +15,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { McpT3Client, T3Error, TERMINAL, type ThreadRead } from '../../src/t3/client.ts'
-import { INSTANCE, live, poll, skipReason, startT3, type Access, type T3Server } from './t3-server.ts'
+import { eventually, INSTANCE, live, noCredentialsSkipReason, poll, skipReason, startT3, type Access, type T3Server } from './t3-server.ts'
 
 const TEST_MS = 120_000
 /** Tool calls the clients of this suite sent, to check against t3code's input schemas. */
@@ -39,6 +40,11 @@ const settle = async (client: McpT3Client, threadId: string, ms = 30_000) => {
   }
 }
 const texts = (read: ThreadRead) => read.items.map(item => `${item.type}: ${item.text}`)
+/** The scripted agent's log lines as events: the process that wrote it, what happened, and its details. */
+const agentEvents = (log: string) => readFileSync(log, 'utf8').split('\n').flatMap(line => {
+  const match = /^\[scripted-agent (\d+)\] (\S+) (\{.*\})$/.exec(line)
+  return match ? [{ pid: Number(match[1]), event: match[2]!, data: JSON.parse(match[3]!) as Record<string, unknown> }] : []
+})
 
 describe.skipIf(!live)(`t3code /mcp contract${live ? '' : ` (skipped: ${skipReason})`}`, () => {
   let server: T3Server, full: McpT3Client, approval: McpT3Client
@@ -322,6 +328,61 @@ describe.skipIf(!live)(`t3code /mcp contract${live ? '' : ` (skipped: ${skipReas
     await settle(approval, editing.threadId)
   }, TEST_MS)
 
+  it('answers an approval the way t3code\'s web app does, which an MCP client cannot', async () => {
+    const launched = await launch(approval, 'run it [permission execute]')
+    await poll(async () => (await approval.pendingRequests(launched.threadId)).length === 1, 'the approval to be pending')
+    const [pending] = await approval.pendingRequests(launched.threadId)
+    // Observed: the web app's socket takes a ticket from a bearer session that the CLI issues (`t3 auth session issue`); an
+    // `mcp-client` session gets no ticket.
+    const refused = await fetch(`${server.origin}/api/auth/websocket-ticket/rpc`, { method: 'POST', headers: { authorization: `Bearer ${await server.token('full-access')}` } })
+    expect(refused.status).toBe(401)
+    await server.answerApproval(launched.threadId, pending!.requestId, 'accept')
+    expect(await settle(approval, launched.threadId)).toMatchObject({ status: 'completed' })
+    expect(texts(await approval.read(launched.threadId))).toContain('assistant_message: done[plain]: permission execute: allowed')
+    const activity = await approval.read(launched.threadId, { view: 'activity', limit: 100 })
+    expect(activity.items.find(item => item.type === 'approval_request')).toMatchObject({ status: 'completed' })
+    expect(await approval.pendingRequests(launched.threadId)).toEqual([])
+    // Observed: a request answered once is "resolved", and a second answer is refused.
+    await expect(server.answerApproval(launched.threadId, pending!.requestId, 'decline')).rejects.toThrow(/is resolved/)
+    // A declined approval reaches the agent as a rejection, and its turn goes on.
+    const declined = await launch(approval, 'run it [permission execute]')
+    await poll(async () => (await approval.pendingRequests(declined.threadId)).length === 1, 'the second approval')
+    await server.answerApproval(declined.threadId, (await approval.pendingRequests(declined.threadId))[0]!.requestId, 'decline')
+    expect(await settle(approval, declined.threadId)).toMatchObject({ status: 'completed' })
+    expect(texts(await approval.read(declined.threadId))).toContain('assistant_message: done[plain]: permission execute: rejected')
+  }, TEST_MS)
+
+  it('fails the run of an agent process that exits mid-turn, and starts a new agent at the third send after it', async () => {
+    const launched = await launch(full, 'boom [crash once]')
+    // Observed: the crash ends the run `failed`, not `interrupted`, with t3code's generic provider error.
+    expect(await settle(full, launched.threadId)).toMatchObject({ status: 'failed', runId: launched.runId, timedOut: false })
+    let activity = await full.read(launched.threadId, { view: 'activity', limit: 100 })
+    expect(activity.thread).toMatchObject({ status: 'failed', activeRunId: null, pendingRequestCount: 0 })
+    expect(texts(activity).slice(-2)).toEqual(['assistant_message: about to crash', 'error: Provider turn failed.'])
+    // Observed: t3code takes new sends at once but does not start a new agent for them. It first tries to resume the dead
+    // agent's session, which this agent cannot load (`loadSession: false`), so the next two runs fail before they start;
+    // the third starts a new agent process with a new session.
+    for (const n of [1, 2]) {
+      const sent = await full.send(launched.threadId, `after the crash ${n}`, `send:crash:${n}`)
+      expect(sent.delivery).toBe('started')
+      expect(await settle(full, launched.threadId)).toMatchObject({ status: 'failed', runId: sent.runId })
+      activity = await full.read(launched.threadId, { view: 'activity', limit: 100 })
+      expect(texts(activity).at(-1)).toBe('error: The provider could not start this turn. Retry the turn; if it keeps failing, check the provider setup and server logs.')
+    }
+    const third = await full.send(launched.threadId, 'after the crash 3', 'send:crash:3')
+    expect(await settle(full, launched.threadId)).toMatchObject({ status: 'completed', runId: third.runId })
+    const events = agentEvents(server.agentLog)
+    const agents = events.filter(event => event.event === 'session/new' && event.data.cwd === launched.path).map(event => event.pid)
+    expect(agents).toHaveLength(2)
+    expect(agents[1]).not.toBe(agents[0])
+    // Observed: the new agent's first prompt carries the thread's history, so it saw `[crash once]` again; the file that marker
+    // left in the worktree kept it from crashing twice.
+    const prompts = events.filter(event => event.event === 'prompt' && event.pid === agents[1])
+    expect(prompts).toEqual([expect.objectContaining({ data: expect.objectContaining({ markers: ['crash once'] }) })])
+    expect(prompts[0]!.data.chars).toBeGreaterThan('after the crash 3'.length * 10)
+    expect(texts(await full.read(launched.threadId)).at(-1)).toBe('assistant_message: done[plain]: crash once: already crashed')
+  }, TEST_MS)
+
   it('answers a pending question through t3_pending_request, and the turn goes on', async () => {
     const launched = await launch(approval, 'ask [question]')
     await poll(async () => (await approval.read(launched.threadId, { limit: 1 })).thread.pendingRequestCount === 1, 'the question to be pending')
@@ -357,6 +418,44 @@ describe.skipIf(!live)(`t3code /mcp contract${live ? '' : ` (skipped: ${skipReas
       expect(schemas.has(call.tool), call.tool).toBe(true)
       for (const key of Object.keys(call.args)) expect(schemas.get(call.tool), `${call.tool}.${key}`).toContain(key)
     }
+  }, TEST_MS)
+})
+
+describe.skipIf(!!noCredentialsSkipReason)(`t3code pull request links${noCredentialsSkipReason ? ` (skipped: ${noCredentialsSkipReason})` : ''}`, () => {
+  let server: T3Server, started: number
+  beforeAll(async () => { server = await startT3({ noCredentials: true }); started = Date.now() }, TEST_MS)
+  afterAll(async () => { await server?.close() }, 30_000)
+
+  it('links a pull request by URL, on a server without credentials, and looks nothing up', async () => {
+    const client = await server.client('full-access', 'plain')
+    const path = join(server.dir, 'worktrees', 'linked')
+    execFileSync('git', ['worktree', 'add', '-q', '-b', 'agent/linked', path, 'HEAD'], { cwd: server.checkout })
+    const launched = await client.launch({ projectId: server.projectId, title: 'linked', message: 'hello', worktreePath: path, branch: 'agent/linked',
+      clientRequestId: 'launch:linked' })
+    await settle(client, launched.threadId)
+    // `.invalid` never resolves (RFC 6761), and the server holds no credentials for it.
+    const url = 'https://github.invalid/acme/widgets/pull/7'
+    await client.linkPullRequests(launched.threadId, [url])
+    // Observed: any URL of the form /owner/repo/pull/N is a GitHub pull request on its own host (for GitHub Enterprise), and a
+    // second link of the same pull request is no error.
+    expect(await client.call('link_pull_request', { threadId: launched.threadId, url }))
+      .toEqual({ host: 'github.invalid', repository: 'acme/widgets', number: 7, url, alreadyLinked: true })
+    expect(await client.call('list_thread_pull_requests', { threadId: launched.threadId })).toMatchObject({
+      pullRequests: [{ host: 'github.invalid', repository: 'acme/widgets', number: 7, url, source: 'agent', state: null }] })
+    expect((await client.read(launched.threadId, { limit: 1 })).thread).toMatchObject({ pullRequests: [{ host: 'github.invalid', number: 7, url }] })
+    // Anything else is refused before it is linked: an issue URL, and repository and number in a project without a remote.
+    expect(await error(client.call('link_pull_request', { threadId: launched.threadId, url: 'https://github.invalid/acme/widgets/issues/7' })))
+      .toMatchObject({ message: expect.stringContaining('not a recognised pull request URL') })
+    expect(await error(client.call('link_pull_request', { threadId: launched.threadId, repository: 'acme/widgets', number: 8 })))
+      .toMatchObject({ message: expect.stringContaining('no recognised remote') })
+    // Observed: t3code then syncs the link's state from the project's host, and skips it for a project without a remote, so
+    // nothing is looked up; and nothing went through the proxy that a client honouring HTTP(S)_PROXY would have used.
+    await eventually(async () => server.output().includes('Change requests cannot be browsed for this project\'s host yet.'), 'the pull request sync to be skipped')
+    // Observed: t3code sends its telemetry every 10 s from start, through the proxy too, unless T3CODE_TELEMETRY_ENABLED is
+    // false (startT3 sets it). Holding past the first send keeps the check from passing only because the test was quick.
+    await new Promise(resolve => setTimeout(resolve, Math.max(0, started + 12_000 - Date.now())))
+    expect(server.proxied()).toEqual([])
+    await client.close()
   }, TEST_MS)
 })
 

@@ -116,7 +116,7 @@ This runs the typecheck and the tests that need no t3code: an end-to-end run aga
 npm run test:live
 ```
 
-This starts its own isolated `t3 serve` for each suite (a temporary base directory and port, a scripted ACP agent as the only provider), so it never touches `~/.t3` or a running t3code. It needs `t3` on `PATH`, or `T3_BIN` set to the binary. Set `T3_LIVE_KEEP=1` to keep the temporary folders. The suites are in `tests/live/`: the contract of every `/mcp` tool the super agent uses, end-to-end runs with approvals and questions, read tracking, and the workload below.
+This starts its own isolated `t3 serve` for each suite (a temporary base directory and port, a scripted ACP agent as the only provider), so it never touches `~/.t3` or a running t3code. It needs `t3` on `PATH`, or `T3_BIN` set to the binary. Set `T3_LIVE_KEEP=1` to keep the temporary folders. The suites are in `tests/live/`: the contract of every `/mcp` tool the super agent uses, end-to-end runs with approvals and questions, a worker whose agent process crashes, read tracking, and the workload below. Approvals are answered the way t3code's web app does. Telemetry is off for every test server. The pull request link test runs t3's runtime binary (`~/.t3/runtime/versions/<version>/t3`, only read and run) with a temporary HOME, no GitHub tokens or git config, and a proxy that refuses every request.
 
 ### Acceptance: the synthetic workload
 

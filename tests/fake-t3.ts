@@ -1,7 +1,8 @@
 /** An in-memory t3code for tests: threads, runs and the calls the super agent made. */
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { afterAll } from 'vitest'
 import { T3Error, type LaunchInput, type LaunchResult, type PendingRequest, type ProjectSummary, type ScratchLaunchInput, type SendResult, type T3Client,
   type T3Status, type ThreadRead, type WaitResult } from '../src/t3/client.ts'
 
@@ -13,6 +14,21 @@ interface FakeThread {
   pending: PendingRequest[]
 }
 
+/**
+ * The scratch folders of every FakeT3 in this module, removed after the spec file (and, failing that, when the process
+ * exits), so a test that never closes its FakeT3 leaves nothing behind. The Runtime writes the console's and the
+ * Watchdog's MCP configuration into a scratch thread's folder, so the folder has to exist while the test runs.
+ */
+const scratchRoots = new Set<string>()
+/** Removes the scratch folders of every FakeT3 made by this module, closed or not. */
+export function removeAllScratch(): void { for (const dir of scratchRoots) removeScratch(dir) }
+afterAll(removeAllScratch)
+process.once('exit', removeAllScratch)
+function removeScratch(dir: string): void {
+  scratchRoots.delete(dir)
+  try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }) } catch { /* left for the OS to clear */ }
+}
+
 export class FakeT3 implements T3Client {
   readonly threads = new Map<string, FakeThread>()
   readonly calls: { tool: string; args: unknown }[] = []
@@ -22,6 +38,8 @@ export class FakeT3 implements T3Client {
   failPendingReads = 0
   private readonly requests = new Map<string, unknown>()
   private seq = 0
+  /** One temporary folder per FakeT3, made on the first scratch launch, that holds a folder for each scratch thread. */
+  private scratchRoot?: string
   constructor(readonly projects: ProjectSummary[]) {}
 
   private id(prefix: string) { return `${prefix}-${++this.seq}` }
@@ -42,7 +60,11 @@ export class FakeT3 implements T3Client {
   }
   async launchScratch(input: ScratchLaunchInput): Promise<LaunchResult> {
     this.calls.push({ tool: 't3_thread_launch', args: { scratch: true, ...input } })
-    return this.once(input.clientRequestId, () => this.create(input.title, mkdtempSync(join(tmpdir(), 'scratch-')), null, input.message, input.clientRequestId))
+    return this.once(input.clientRequestId, () => this.create(input.title, mkdtempSync(join(this.scratch(), 'thread-')), null, input.message, input.clientRequestId))
+  }
+  private scratch(): string {
+    if (!this.scratchRoot) scratchRoots.add(this.scratchRoot = mkdtempSync(join(tmpdir(), 'fake-t3-scratch-')))
+    return this.scratchRoot
   }
   private create(title: string, worktreePath: string | null, branch: string | null, message: string | undefined, requestId: string): LaunchResult {
     const thread: FakeThread = { id: this.id('thread'), title, link: '', worktreePath, branch, pinned: false, runs: [], messages: [], pullRequests: [], pending: [] }
@@ -112,7 +134,11 @@ export class FakeT3 implements T3Client {
     if (index < 0) throw new Error(`invalid_request The pending user-input request was not found.`)
     thread.pending.splice(index, 1)
   }
-  async close() {}
+  /** Removes the scratch threads' folders. A scratch launch after this makes a new folder; the earlier threads keep their removed paths. */
+  async close() {
+    if (this.scratchRoot) removeScratch(this.scratchRoot)
+    this.scratchRoot = undefined
+  }
 
   /** The agent of a thread finishes its turn. */
   finishRun(threadId: string, status: T3Status = 'completed'): void {

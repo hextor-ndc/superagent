@@ -3,7 +3,8 @@
  * Router and the console Source, its real HTTP server, and worker threads that run the scripted ACP agent in real
  * worktrees. The agent plays the worker through the `superagent` MCP server its `.mcp.json` names (tests/live/scripted-agent.mjs),
  * following tests/workload/worker-plan.mjs: a request labelled `[R01]` is acknowledged with "Working on R01." and ends with
- * "R01 done.". It also covers approvals and questions that a worker's thread waits on in t3code, which reach the attention queue.
+ * "R01 done.". It also covers approvals and questions that a worker's thread waits on in t3code, which reach the attention queue
+ * (an approval is answered as t3code's web app does, `T3Server.answerApproval`), and a worker whose agent process crashes.
  *
  * Run with `T3_LIVE=1 npx vitest run tests/live`.
  */
@@ -24,6 +25,13 @@ import { eventually, live, skipReason, startT3, type Access, type T3Server } fro
 const TEST_MS = 120_000
 const data = (result: unknown) => (result as { structuredContent: Record<string, unknown> }).structuredContent
 const texts = (read: ThreadRead) => read.items.map(item => `${item.type}: ${item.text}`)
+/** What the scripted agents that ran in a folder were told when their questions were answered, from the agent log. */
+const answersIn = (log: string, cwd: string) => readFileSync(log, 'utf8').split('\n').flatMap(line => {
+  const at = line.indexOf('] question ')
+  if (at < 0) return []
+  const seen = JSON.parse(line.slice(at + 11)) as { cwd?: string; answer: unknown }
+  return seen.cwd === cwd ? [seen.answer] : []
+})
 
 interface Superagent { runtime: Runtime; t3: McpT3Client; http: Server; base: string; console: Client; errors: string[]; close(): Promise<void> }
 
@@ -135,8 +143,11 @@ describe.skipIf(!live)(`superagent on a real t3code${live ? '' : ` (skipped: ${s
     const waiting = await eventually(async () => (await attention(agent)).find(view => view.id === ticket.id && view.stage === 'person/question'),
       'person/question in the attention queue', 60_000)
     expect(waiting.pending!.questions).toMatchObject([{ id: 'choice', options: [{ label: 'Strict schemas' }, { label: 'UI flexibility' }] }])
-    expect(await call(agent, 'superagent_answer', { ticket_id: ticket.id, text: 'Strict schemas' }))
+    // Typed in lower case: superagent sends the option's label, and the agent gets exactly that.
+    expect(await call(agent, 'superagent_answer', { ticket_id: ticket.id, text: 'strict schemas' }))
       .toMatchObject({ delivered: 't3-question', request_id: waiting.pending!.questions[0]!.requestId })
+    await eventually(async () => answersIn(server.agentLog, entry.worktreePath).length > 0, 'the agent to get the answer')
+    expect(answersIn(server.agentLog, entry.worktreePath)).toEqual([{ action: 'accept', content: { choice: 'Strict schemas' } }])
     // The agent gets the answer in the same turn and only then reports ready, so the Ticket completes.
     const done = await eventually(async () => agent.runtime.repo.tickets.get(ticket.id)?.ended, 'the ticket to end', 60_000)
     expect(done.outcome).toBe('completed')
@@ -148,5 +159,70 @@ describe.skipIf(!live)(`superagent on a real t3code${live ? '' : ` (skipped: ${s
     await eventually(async () => (await agent.t3.read(entry.threadId!, { limit: 1 })).thread.activeRunId === null, 'the turn to end')
     expect(texts(await agent.t3.read(entry.threadId!))[0]).toContain('[R03] Pick a fixture style [worker] [question]')
     expect(await attention(agent)).toEqual([])
+  }, TEST_MS)
+
+  it('lets a person approve in t3code\'s web app, and the worker goes on to its ready report', async () => {
+    const agent = made = await superagent('approval-required')
+    await call(agent, 'superagent_request', { text: '[R05] Run the build [worker] [permission execute]' })
+    const ticket = await ticketOf(agent)
+    const entry = agent.runtime.executor.thread(ticket.id)!
+    const waiting = await eventually(async () => (await attention(agent)).find(view => view.id === ticket.id && view.stage === 'person/approve'),
+      'person/approve in the attention queue', 60_000)
+    const [approval] = waiting.pending!.approvals
+    expect(approval).toMatchObject({ text: 'echo hi' })
+    // A person approves in T3 Code; superagent has no part in it and learns of it from the thread.
+    await server.answerApproval(entry.threadId!, approval!.requestId, 'accept')
+    const done = await eventually(async () => agent.runtime.repo.tickets.get(ticket.id)?.ended, 'the ticket to end', 60_000)
+    expect(done.outcome).toBe('completed')
+    expect(agent.runtime.outbox.list(record => record.message.ticketId === ticket.id).map(record => record.message.text)
+      .find(text => text.startsWith('Done:'))).toContain('R05 done.')
+    const activity = (await agent.t3.read(entry.threadId!, { view: 'activity', limit: 100 })).items
+    expect(activity.find(item => item.type === 'approval_request')).toMatchObject({ status: 'completed' })
+    expect(await agent.t3.pendingRequests(entry.threadId!)).toEqual([])
+    expect(await attention(agent)).toEqual([])
+    expect(agent.runtime.executor.pending(ticket.id)).toEqual([])
+    expect(agent.errors).toEqual([])
+  }, TEST_MS)
+
+  it('tells a worker whose agent process crashed to go on, until t3code starts a new agent and it reports ready', async () => {
+    const agent = made = await superagent('full-access')
+    // The agent acknowledges, reports progress, and exits in the middle of the turn; the agent t3code starts later does not crash.
+    await call(agent, 'superagent_request', { text: '[R04] Survive a crash [worker] [crash once]' })
+    const ticket = await ticketOf(agent)
+    const entry = agent.runtime.executor.thread(ticket.id)!
+    // Never stuck: the Ticket ends, or its worker is reported failed for a person.
+    const settled = await eventually(async () => {
+      const now = agent.runtime.repo.tickets.get(ticket.id)
+      return now?.ended || now?.assignments.at(-1)?.report?.state === 'failed' ? now : undefined
+    }, 'the ticket to end or fail', 90_000)
+    expect(settled.ended?.outcome, settled.assignments.at(-1)?.report?.summary).toBe('completed')
+    expect(agent.runtime.outbox.list(record => record.message.ticketId === ticket.id).map(record => record.message.text)
+      .find(text => text.startsWith('Done:'))).toContain('R04 done.')
+    // t3code reports the crash as a failed run, and the next two runs fail to start (tests/live/contract.spec.ts): superagent
+    // told the worker to go on three times, the most it does, and the third reached a new agent process.
+    const sent = (await agent.t3.read(entry.threadId!, { limit: 100 })).items.filter(item => item.type === 'user_message').map(item => item.text)
+    expect(sent.filter(text => text?.startsWith('Your previous turn failed with an error.'))).toHaveLength(3)
+    const errors = (await agent.t3.read(entry.threadId!, { view: 'activity', limit: 100 })).items.filter(item => item.type === 'error').map(item => item.text)
+    expect(errors).toEqual(['Provider turn failed.', expect.stringContaining('could not start this turn'), expect.stringContaining('could not start this turn')])
+    expect(readFileSync(server.agentLog, 'utf8').split('\n').filter(line => line.includes(`session/new {"cwd":"${entry.worktreePath}"`))).toHaveLength(2)
+    expect(await attention(agent)).toEqual([])
+    expect(agent.errors).toEqual([])
+  }, TEST_MS)
+
+  it('reports a worker whose agent keeps crashing as failed, for a person, after telling it to go on three times', async () => {
+    const agent = made = await superagent('full-access')
+    // Every agent process crashes: the new one t3code starts gets the request again in the thread's history.
+    await call(agent, 'superagent_request', { text: '[R06] Crash every time [worker] [crash]' })
+    const ticket = await ticketOf(agent)
+    const failed = await eventually(async () => (await attention(agent)).find(view => view.id === ticket.id && view.stage === 'person/failed'),
+      'person/failed in the attention queue', 90_000)
+    expect(failed.summary).toBe('The worker\'s turn failed 4 times in a row in T3 Code. Open its thread to see the error.')
+    expect(agent.runtime.repo.tickets.get(ticket.id)?.ended).toBeUndefined()
+    const entry = agent.runtime.executor.thread(ticket.id)!
+    const errors = (await agent.t3.read(entry.threadId!, { view: 'activity', limit: 100 })).items.filter(item => item.type === 'error').map(item => item.text)
+    expect(errors).toEqual(['Provider turn failed.', expect.stringContaining('could not start this turn'), expect.stringContaining('could not start this turn'),
+      'Provider turn failed.'])
+    expect(agent.runtime.executor.busySince(ticket.id)).toBeUndefined()
+    expect(agent.errors).toEqual([])
   }, TEST_MS)
 })

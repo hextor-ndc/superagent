@@ -4,7 +4,7 @@
  *
  * The Engine calls the port inside its transactions, so every method only queues a job; jobs run on a later tick.
  */
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { latestAssignment, liveTicket, runningAssignment, waitsForPerson, type AssessmentOutcome, type Assignment, type EngineForExecutor,
   type Executor, type Repositories, type Ticket, type TicketInput } from '../../vendor/dsh/src/core/index.ts'
@@ -29,6 +29,14 @@ export interface TicketThread {
   endedRunId?: string
   /** Turns that failed in a row; reset by a turn that ends well. */
   failures?: number
+  /**
+   * The failed run whose handling (`failedTurn`) has not finished, saved with the failure it counts: the worker has not been
+   * told to go on yet, or the turn end that follows the Ticket's failed report has not been reported (`reported` says that
+   * report was made). A restart picks the handling up from here. Entries saved before it was kept have none. `requestId` is
+   * the request id the message telling the worker to go on goes under when it is not the run's (`continueRequestId`):
+   * an entry saved before `failing` was kept sent that message under the failure count.
+   */
+  failing?: { runId: string; reported?: boolean; requestId?: string }
   /**
    * Inputs handed to the thread that its worker has not read yet. One sent into a running or a new run is read at once, so
    * only those t3code queued behind another message wait here (see `queued`), and those that carried no message or were saved
@@ -78,6 +86,8 @@ export interface T3ExecutorOptions {
 
 /** How many times a worker whose turn failed is told to go on before its Ticket is reported failed, as in the prototype. */
 const CONTINUATIONS = 3
+/** How many times a stop's interrupt is tried again after a failure. */
+const STOP_RETRIES = 2
 
 const fromPerson = (input?: TicketInput): boolean => input?.kind === 'trigger' ? !!input.human && !input.context : input?.kind === 'text'
 /**
@@ -97,6 +107,16 @@ export class T3Executor implements Executor {
   private readonly watching = new Map<string, AbortController>()
   /** Stops in flight, by Ticket: a new launch of the same Ticket waits for them, so an interrupt never lands on its new turn. */
   private readonly stopping = new Map<string, Promise<void>>()
+  /**
+   * The stop jobs not done yet, by job key, with the failures counted so far: one queued again under the same key replaces the
+   * job's run function (see `Jobs`), so it keeps the record a launch may already wait on.
+   */
+  private readonly stops = new Map<string, { done: () => void; failures: number }>()
+  /**
+   * Tickets whose saved thread record may be one an earlier version saved in the pause after a failed turn (see `watch`). The
+   * first look at the thread after this service started settles it.
+   */
+  private readonly savedInPause = new Set<string>()
   /** What each busy Ticket's thread waits on a person for, as last seen; in memory only, so a restart finds it again on the next look. */
   private readonly waitingOn = new Map<string, PendingRequest[]>()
   /** When each busy Ticket's thread was last asked what it waits on. */
@@ -120,7 +140,10 @@ export class T3Executor implements Executor {
       options.health?.fail(`jobs:${key.split(':')[0]}`, error)
     }, options.defer, key => options.health?.recovered(`jobs:${key.split(':')[0]}`))
     this.slots = new WorkerSlots(() => [...this.busy], options.maxWorkers)
-    for (const entry of options.state?.load() ?? []) this.threads.set(entry.ticketId, entry)
+    for (const entry of options.state?.load() ?? []) {
+      this.threads.set(entry.ticketId, entry)
+      if (!entry.failing && entry.failures && entry.endedRunId) this.savedInPause.add(entry.ticketId)
+    }
   }
 
   /**
@@ -220,21 +243,41 @@ export class T3Executor implements Executor {
   }
   stop(ticket: Ticket, assignment: Assignment, reason: string): void {
     const ended = !liveTicket(ticket)
-    let done!: () => void
-    this.stopping.set(ticket.id, new Promise<void>(resolve => { done = resolve }))
-    this.jobs.enqueue(`stop:${ticket.id}:${assignment.id}`, async () => {
-      try {
-        this.watching.get(ticket.id)?.abort(); this.watching.delete(ticket.id)
-        this.busy.delete(ticket.id); this.busyAt.delete(ticket.id); this.clearPending(ticket.id); this.slots.free(ticket.id); this.slotFreed()
-        const entry = this.threads.get(ticket.id)
-        if (!entry?.threadId) return
-        // An ended Ticket's thread stops as its Stop button does. A Ticket that goes on (a retry or a restart) only has its
-        // turn interrupted, since a full stop would hold the messages its next Assignment sends.
-        await this.options.t3.interrupt(entry.threadId, { ...ended ? { stop: true } : {}, reason: reason.slice(0, 2000),
-          clientRequestId: `stop:${assignment.id}` })
-          .catch(error => { if (!(error instanceof T3Error && error.code === 'thread_not_interruptible')) throw error })
-      } finally { done() }
-    }, { retries: 2 })
+    this.stopJob(ticket.id, `stop:${ticket.id}:${assignment.id}`, async () => {
+      this.watching.get(ticket.id)?.abort(); this.watching.delete(ticket.id)
+      this.busy.delete(ticket.id); this.busyAt.delete(ticket.id); this.clearPending(ticket.id); this.slots.free(ticket.id); this.slotFreed()
+      const entry = this.threads.get(ticket.id)
+      if (!entry?.threadId) return
+      // An ended Ticket's thread stops as its Stop button does. A Ticket that goes on (a retry or a restart) only has its
+      // turn interrupted, since a full stop would hold the messages its next Assignment sends.
+      await this.options.t3.interrupt(entry.threadId, { ...ended ? { stop: true } : {}, reason: reason.slice(0, 2000),
+        clientRequestId: `stop:${assignment.id}` })
+        .catch(error => { if (!(error instanceof T3Error && error.code === 'thread_not_interruptible')) throw error })
+    })
+  }
+  /**
+   * Queues a stop's job under `key`, which a new launch of the Ticket waits for, together with the stops already in flight.
+   * The wait ends once the job ran without an error or failed for the last time, not at a failure it tries again after: the
+   * interrupt that try makes would land on the new launch's turn.
+   */
+  private stopJob(ticketId: string, key: string, run: () => Promise<void>): void {
+    let record = this.stops.get(key)
+    if (!record) {
+      let resolve!: () => void
+      const stopped = new Promise<void>(done => { resolve = done })
+      const made = { done: () => { if (this.stops.get(key) === made) this.stops.delete(key); resolve() }, failures: 0 }
+      this.stops.set(key, record = made)
+      const before = this.stopping.get(ticketId)
+      this.stopping.set(ticketId, before ? Promise.all([before, stopped]).then(() => {}) : stopped)
+    }
+    const stop = record
+    this.jobs.enqueue(key, async () => {
+      try { await run() } catch (error) {
+        if (++stop.failures > STOP_RETRIES) stop.done()
+        throw error
+      }
+      stop.done()
+    }, { retries: STOP_RETRIES })
   }
 
   async close(): Promise<void> {
@@ -244,13 +287,23 @@ export class T3Executor implements Executor {
     this.jobs.close()
   }
 
+  /**
+   * Starts a pending Assignment: a new thread, or a new message in the Ticket's thread. The Engine may stop it while the launch
+   * is out (the Ticket ends, and its Assignments with it, in the transaction that queues the stop). The stop job then finds no
+   * thread, or no run yet, to interrupt, so the launch looks again once its t3code call comes back and stops what it started
+   * itself (`stopStarted`); a stop before that call leaves the call out.
+   */
   private async launch(ticketId: string, assignmentId: string): Promise<void> {
     const ticket = this.options.repo.tickets.get(ticketId)
     const assignment = ticket?.assignments.find(item => item.id === assignmentId)
     if (!ticket || !liveTicket(ticket) || assignment?.state !== 'pending' || waitsForPerson(ticket)) return
-    await this.stopping.get(ticketId)
-    this.stopping.delete(ticketId)
+    const stopping = this.stopping.get(ticketId)
+    await stopping
+    // A stop queued meanwhile stays, for the next launch to wait on: it is a stop of this Assignment, which the looks below see.
+    if (this.stopping.get(ticketId) === stopping) this.stopping.delete(ticketId)
+    if (!this.waitsToStart(ticketId, assignmentId)) return
     this.slots.reserve(ticketId, 'launch')
+    let stopped = false
     try {
       const entry = this.threads.get(ticketId) ?? this.newEntry(ticket)
       let prepared: Prepared
@@ -260,11 +313,12 @@ export class T3Executor implements Executor {
           mcpUrl: this.options.workerUrl(entry.token) })
       } catch (error) {
         // A failed preparation fails the Ticket at once, as in the prototype: a retry or a person's message prepares again.
-        this.fail(ticketId, `Preparing the worktree failed: ${message(error)}`)
+        if (this.waitsToStart(ticketId, assignmentId)) this.fail(ticketId, `Preparing the worktree failed: ${message(error)}`)
         return
       }
       Object.assign(entry, { worktreePath: prepared.worktreePath, branch: prepared.branch })
       this.threads.set(ticketId, entry)
+      if (!this.waitsToStart(ticketId, assignmentId)) { stopped = true; return }
       const variables: ExecutionVariables = { ticketId, name: ticket.execution!.name, directory: prepared.worktreePath, branch: prepared.branch,
         repository: this.options.project.repository, account: this.options.account?.login, commitEmail: this.options.account?.commitEmail }
       const origin = this.options.repo.triggers.get(ticket.origin.triggerId)
@@ -282,18 +336,53 @@ export class T3Executor implements Executor {
         threadId = launched.threadId
         Object.assign(entry, { threadId, link: launched.link })
       }
+      if (!this.waitsToStart(ticketId, assignmentId)) {
+        // Stopped while the call was out: the thread is kept for the Ticket's later Assignments, and the run it started stops.
+        // The worker slot stays free, and the Engine hears nothing of an Assignment it has ended.
+        stopped = true
+        this.save(entry)
+        this.stopStarted(ticketId, assignmentId, threadId)
+        return
+      }
       entry.failures = 0
+      delete entry.failing
       this.save(entry)
       this.markBusy(ticketId)
       this.options.engine().assignmentStarted(ticketId, assignmentId)
       this.watch(ticketId, assignmentId)
     } catch (error) {
       if (error instanceof Later) throw error
+      // An Assignment stopped meanwhile has nothing left to start; a failure reported now would land on the Ticket's next one.
+      if (!this.waitsToStart(ticketId, assignmentId)) { stopped = true; return }
       if (error instanceof T3Error && !error.transient) { this.fail(ticketId, `Starting the T3 Code thread failed: ${error.message}`); return }
       throw error
     } finally {
+      // The stop job may have freed this reservation already; freeing it again is harmless, since slots are held by Ticket and
+      // no other job of this Ticket holds one while a launch runs (a delivery needs a running Assignment).
       this.slots.free(ticketId)
+      if (stopped) this.slotFreed()
     }
+  }
+  /** Whether an Assignment is still to start: its Ticket is open and the Engine has not ended it. */
+  private waitsToStart(ticketId: string, assignmentId: string): boolean {
+    const ticket = this.options.repo.tickets.get(ticketId)
+    return !!ticket && liveTicket(ticket) && ticket.assignments.find(item => item.id === assignmentId)?.state === 'pending'
+  }
+  /**
+   * Interrupts the run a launch started for an Assignment stopped while the launch was out, fully stopping the thread when the
+   * Ticket ended, as the stop job does. Both may interrupt the thread, in either order, and the second finds nothing to
+   * interrupt. This one has its own request id: t3code answers a repeated `stop:<assignmentId>` with the first answer, without
+   * interrupting again. It runs as a stop's job (`stopJob`), so a failure is tried again, and a new launch of the Ticket waits
+   * for it as for a stop.
+   */
+  private stopStarted(ticketId: string, assignmentId: string, threadId: string): void {
+    const ticket = this.options.repo.tickets.get(ticketId)
+    const ended = !ticket || !liveTicket(ticket)
+    const reason = ticket?.ended ? ticket.ended.reason ?? ticket.ended.outcome
+      : ticket?.assignments.find(item => item.id === assignmentId)?.endedReason ?? 'stopped'
+    this.stopJob(ticketId, `stop:${ticketId}:${assignmentId}:launch`, () => this.options.t3.interrupt(threadId, { ...ended ? { stop: true } : {},
+      reason: reason.slice(0, 2000), clientRequestId: `stop-launch:${assignmentId}` })
+      .catch(error => { if (!(error instanceof T3Error && error.code === 'thread_not_interruptible')) throw error }))
   }
 
   private async deliverNow(ticketId: string, assignmentId: string): Promise<void> {
@@ -307,7 +396,7 @@ export class T3Executor implements Executor {
       const text = inputs.flatMap(input => inputMessage(input, input.kind === 'trigger' ? this.options.repo.triggers.get(input.triggerId) : undefined) ?? [])
         .join('\n\n')
       const ids = inputs.map(input => input.id)
-      const sent = text ? await this.options.t3.send(entry.threadId, text, `deliver:${assignmentId}:${ids.join(',')}`.slice(0, 256)) : undefined
+      const sent = text ? await this.options.t3.send(entry.threadId, text, deliverRequestId(assignmentId, ids)) : undefined
       await this.ending.get(ticketId)
       // A stop that ran while the send was out (see the catch below) has freed the worker slot; nothing here may take it back.
       const now = this.options.repo.tickets.get(ticketId)
@@ -350,8 +439,19 @@ export class T3Executor implements Executor {
         const entry = this.threads.get(ticketId)
         if (!ticket || !entry?.threadId || latestAssignment(ticket)?.id !== assignmentId || latestAssignment(ticket)?.state === 'ended') break
         try {
-          const result = await t3.wait(entry.threadId, this.options.waitMs ?? 30_000)
+          // A failed turn whose handling a restart cut short is taken up again before anything else (see `failedTurn`).
+          const result = entry.failing ? { runId: entry.failing.runId, status: 'failed' as const, timedOut: false }
+            : await t3.wait(entry.threadId, this.options.waitMs ?? 30_000)
           if (controller.signal.aborted) break
+          // An entry saved before `failing` was kept, in the pause after a failed turn: its failure was counted and the run saved
+          // as ended before the worker was told to go on, which went under the failure count. Only the first look after this
+          // service started can find one: a failed run this version handled is saved the same way, but the message it sent
+          // started a later run, which the wait names instead.
+          const inPause = this.savedInPause.delete(ticketId)
+          if (inPause && !entry.failing && result.status === 'failed' && result.runId && result.runId === entry.endedRunId && entry.failures) {
+            entry.failing = { runId: result.runId, requestId: `continue:${assignmentId}:${entry.failures}` }
+            delete entry.endedRunId
+          }
           if (!result.timedOut && TERMINAL.has(result.status)) {
             this.options.health?.ok('t3code')
             const wasBusy = this.busy.delete(ticketId)
@@ -398,16 +498,35 @@ export class T3Executor implements Executor {
    *
    * A failed run that t3code had queued with Inputs may have failed before its model read them, and the wait cannot tell. Its
    * messages go again with the message that tells the worker to go on, and are read as that message is (see `deliverNow`).
+   *
+   * The handling survives a restart through `failing`, saved with the failure it counts. Until it is cleared the run is not
+   * saved as ended, and the watch of a resumed Ticket takes the handling up again from that record, by crash point:
+   * - before the count is saved, nothing is saved: the wait finds the run failed and not ended, and counts it as new;
+   * - in the pause, or with the message telling the worker to go on out (sent or not), the failure is not counted again, the
+   *   pause runs again, and the message goes again under the same request id, which t3code answers with the first answer if
+   *   the first send landed: the held Inputs are then handled from that answer as they would have been. The request id is made
+   *   from the failed run (`continueRequestId`), not the count: the count starts again after a turn that ends well, and a second failure of the same
+   *   Assignment under a used id would be answered without a new run;
+   * - once the message was sent and handled, `failing` is cleared and the run saved as ended, in one save;
+   * - over `CONTINUATIONS`, before the failed report, it is made; after it (`reported`), it is not made again;
+   * - in `turnEnded`, which follows the failed report, the turn end is reported again, since that saves its end last.
+   * A failed run handled to its end is saved as ended with `failing` cleared, and is never taken up again.
    */
   private async failedTurn(ticketId: string, assignmentId: string, entry: TicketThread, runId: string | null, signal: AbortSignal): Promise<boolean> {
-    if (runId) entry.endedRunId = runId
-    entry.failures = (entry.failures ?? 0) + 1
-    this.save(entry)
-    if (entry.failures > CONTINUATIONS) {
-      this.fail(ticketId, `The worker's turn failed ${CONTINUATIONS + 1} times in a row in T3 Code. Open its thread to see the error.`)
+    if (!runId || entry.failing?.runId !== runId) {
+      entry.failures = (entry.failures ?? 0) + 1
+      if (runId) entry.failing = { runId }
+      this.save(entry)
+    }
+    const failures = entry.failures ?? 1
+    if (failures > CONTINUATIONS) {
+      if (!entry.failing?.reported) {
+        this.fail(ticketId, `The worker's turn failed ${CONTINUATIONS + 1} times in a row in T3 Code. Open its thread to see the error.`)
+        if (entry.failing) { entry.failing.reported = true; this.save(entry) }
+      }
       return false
     }
-    await sleep((this.options.continueAfterMs ?? 15_000) * 2 ** (entry.failures - 1), signal)
+    await sleep((this.options.continueAfterMs ?? 15_000) * 2 ** (failures - 1), signal)
     // A stop during the pause (the Ticket ended, or its Assignment was replaced) leaves the worker stopped.
     if (signal.aborted) return false
     const held = runId ? entry.queued?.[runId] ?? [] : []
@@ -417,17 +536,21 @@ export class T3Executor implements Executor {
     try {
       const sent = await this.options.t3.send(entry.threadId!, 'Your previous turn failed with an error. Go on with the assignment from where it stopped.'
         + (again.length ? `\n\nThe messages below came for the turn that failed. They are sent again in case it failed before you read them:\n\n${again.join('\n\n')}` : ''),
-        `continue:${assignmentId}:${entry.failures}`)
+        (runId && entry.failing?.runId === runId ? entry.failing.requestId : undefined) ?? continueRequestId(assignmentId, runId, failures))
       // A stop while the send was out has freed the worker slot.
       if (signal.aborted) return false
       this.markBusy(ticketId)
-      if (held.length) {
-        this.forget(entry, held)
-        if (sent.delivery === 'queued') {
+      // The handling is done: the next save, below or in `markRead`, records it with what became of the held Inputs.
+      if (runId) entry.endedRunId = runId
+      delete entry.failing
+      this.forget(entry, held)
+      if (held.length && sent.delivery !== 'queued') this.markRead(ticketId, entry, held)
+      else {
+        if (held.length) {
           entry.unread.push(...held)
           entry.queued = { ...entry.queued, [sent.runId]: held }
-          this.save(entry)
-        } else this.markRead(ticketId, entry, held)
+        }
+        this.save(entry)
       }
       return true
     } catch (error) {
@@ -442,9 +565,6 @@ export class T3Executor implements Executor {
    * (`readBefore`), so the end is reported in a later millisecond than the reads.
    */
   private async turnEnded(ticketId: string, assignmentId: string, entry: TicketThread, result: { runId: string | null; status: T3Status }): Promise<void> {
-    if (result.runId) entry.endedRunId = result.runId
-    entry.failures = 0
-    this.save(entry)
     const queued = new Set(Object.values(entry.queued ?? {}).flat())
     const read = [...entry.unread.filter(id => !queued.has(id)), ...await this.takenIn(entry, result)]
     if (read.length) {
@@ -453,6 +573,12 @@ export class T3Executor implements Executor {
       await nextMillisecond(Date.now())
     }
     try { this.options.engine().turnEnded(ticketId, assignmentId) } catch (error) { this.options.log?.(`reporting the turn end of ${ticketId} failed`, error) }
+    // Saved last, so a restart before this reports the turn end again rather than never: the reads it records are kept once,
+    // and a turn end reported twice only moves the Assignment's idle time to the later one.
+    if (result.runId) entry.endedRunId = result.runId
+    entry.failures = 0
+    delete entry.failing
+    this.save(entry)
   }
 
   /**
@@ -505,6 +631,18 @@ export class T3Executor implements Executor {
     return { ticketId: ticket.id, worktreePath: ticket.execution!.directory, branch: '', token: randomBytes(24).toString('base64url'), unread: [] }
   }
 }
+
+/**
+ * The request id of the message that tells a worker to go on after its failed run `runId`: one per failed run, and short. t3code
+ * puts each message's request id, escaped again at every level, in the header of every history item it hands a new agent after
+ * a crash, under a size limit; with the full run id (which holds the thread id) the Assignment's first message fell out of it.
+ */
+export const continueRequestId = (assignmentId: string, runId: string | null, failures: number): string =>
+  `continue:${assignmentId}:${runId ? createHash('sha256').update(runId).digest('hex').slice(0, 10) : failures}`
+
+/** The request id of a delivery: its one Input's id, or a short hash of several, kept short for the same reason. */
+export const deliverRequestId = (assignmentId: string, ids: string[]): string =>
+  `deliver:${assignmentId}:${ids.length === 1 ? ids[0] : createHash('sha256').update(ids.join(',')).digest('hex').slice(0, 10)}`
 
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error)
 /** Waits, briefly, until the clock has passed the millisecond `at`. */
