@@ -4,9 +4,10 @@
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { liveTicket } from '../../vendor/dsh/src/core/index.ts'
+import { liveTicket, type Ticket } from '../../vendor/dsh/src/core/index.ts'
 import { CONSOLE, consoleThread, consoleTrigger } from '../app/console-source.ts'
 import type { Runtime } from '../app/runtime.ts'
+import type { PendingQuestion, PendingRequest } from '../t3/client.ts'
 import { ATTENTION_URI, MCP_APP_MIME, attentionPage } from './attention-app.ts'
 import { ok } from './result.ts'
 import { alerts, dismissAlert, lastCheck } from './watchdog-tools.ts'
@@ -44,17 +45,35 @@ export function consoleActions(runtime: Runtime) {
       const result = engine.receive(trigger)
       return { trigger_id: trigger.id, result, next: 'The ticket appears in superagent_status within seconds; its thread opens in the sidebar.' }
     },
-    superagent_answer: ({ ticket_id, text }: { ticket_id: string; text: string }) => {
+    superagent_answer: async ({ ticket_id, text, answers }: { ticket_id: string; text: string; answers?: Answers }) => {
       const found = ticket(ticket_id)
+      let pending = liveTicket(found) ? runtime.executor.pending(found.id) : []
+      const isQuestion = (request: PendingRequest): request is QuestionRequest => request.kind === 'question'
+      // `answers` names t3code questions: when the last look saw none, ask t3code now rather than send the text as a chat message.
+      if (answers && liveTicket(found) && !pending.some(isQuestion)) pending = await runtime.executor.lookPending(found.id)
+      const questions = pending.filter(isQuestion)
+      const thread = runtime.executor.thread(found.id)
+      if (answers && !(questions.length && thread?.threadId)) {
+        throw new Error(`${found.title} waits on no question in T3 Code; \`answers\` is only for those. To answer the worker, pass \`text\` alone.`)
+      }
+      if (questions.length && thread?.threadId) {
+        // The worker's thread waits in t3code on a question it asked there: the answer goes straight to it.
+        const { request, given } = chooseAnswers(found, questions, text, answers)
+        await runtime.t3.answerQuestion(thread.threadId, request.requestId, given)
+        runtime.executor.dropPending(found.id, request.requestId)
+        return { delivered: 't3-question' as const, request_id: request.requestId }
+      }
+      const approvals = pending.filter(request => request.kind === 'approval')
+      if (approvals.length && !found.attention) throw new Error(approvalOnly(found, approvals, thread?.link))
       const origin = runtime.repo.triggers.get(found.origin.triggerId)
       if (origin?.source === CONSOLE) {
         // A message on the Ticket's own console thread reaches its worker through its Subscription, as a reply in a chat would.
         const trigger = consoleTrigger(runtime.config.operator, text, consoleThread(origin.threads[0]!.id))
-        return { delivered: engine.receive(trigger), trigger_id: trigger.id }
+        return { delivered: engine.receive(trigger), trigger_id: trigger.id, ...approvals.length ? { approval: approvalOnly(found, approvals, thread?.link) } : {} }
       }
       // Tickets from GitHub or chat are answered where they were asked; from here, the answer reaches the worker as a note.
       engine.note(found.id, `The operator answered in T3 Code: ${text}`)
-      return { delivered: 'note' }
+      return { delivered: 'note' as const, ...approvals.length ? { approval: approvalOnly(found, approvals, thread?.link) } : {} }
     },
     superagent_stop: ({ ticket_id, reason }: { ticket_id: string; reason?: string }) => {
       const stopped = engine.stopTicket(ticket(ticket_id).id, reason ?? 'Stopped by the operator in T3 Code')
@@ -69,6 +88,45 @@ export function consoleActions(runtime: Runtime) {
 }
 export type ConsoleAction = keyof ReturnType<typeof consoleActions>
 
+/** Answers to a t3code question, by question id: one string, or several for a multiple choice. */
+type Answers = Record<string, string | string[]>
+type QuestionRequest = Extract<PendingRequest, { kind: 'question' }>
+
+/**
+ * Which pending t3code question the operator answers, and with what. `answers` names question ids; without it, `text` answers
+ * the one question there is. An answer that names an option by its label is sent as the option's value.
+ */
+function chooseAnswers(ticket: Ticket, requests: QuestionRequest[], text: string, answers?: Answers): { request: QuestionRequest; given: Answers } {
+  const ids = requests.map(request => `${request.requestId}: ${request.questions.map(question => question.id).join(', ')}`).join('; ')
+  if (!answers) {
+    const only = requests.length === 1 && requests[0]!.questions.length === 1 ? requests[0]! : undefined
+    if (!only) throw new Error(`${ticket.title} waits on several questions in T3 Code; pass \`answers\` keyed by question id (${ids})`)
+    const question = only.questions[0]!
+    return { request: only, given: { [question.id]: optionValue(question, text) } }
+  }
+  const keys = Object.keys(answers)
+  const request = requests.find(item => keys.length > 0 && keys.every(key => item.questions.some(question => question.id === key)))
+  if (!request) throw new Error(`\`answers\` must name the questions of one pending request (${ids}); got ${keys.join(', ') || 'none'}`)
+  const given: Answers = {}
+  for (const question of request.questions) {
+    const answer = answers[question.id]
+    if (answer === undefined) continue
+    given[question.id] = Array.isArray(answer) ? answer.map(item => optionValue(question, item)) : optionValue(question, answer)
+  }
+  return { request, given }
+}
+function optionValue(question: PendingQuestion, answer: string): string {
+  const wanted = answer.trim().toLowerCase()
+  const option = question.options.find(item => item.label.trim().toLowerCase() === wanted || item.value?.trim().toLowerCase() === wanted)
+  return option ? option.value ?? option.label : answer
+}
+/** What the operator is told about approvals: only T3 Code grants them. */
+function approvalOnly(ticket: Ticket, approvals: PendingRequest[], link?: string): string {
+  const texts = approvals.map(request => request.kind === 'approval' ? `"${request.text}"` : '').join(', ')
+  return `${ticket.title} waits on an approval in T3 Code (${texts}). Approvals are answered in T3 Code only: open the thread and approve `
+    + `or decline it there${link ? `: ${link}` : ''}. To tell the worker something, use superagent_note.`
+}
+
 export function consoleServer(runtime: Runtime): McpServer {
   const server = new McpServer({ name: 'superagent', version: '0.1.0' })
   const actions = consoleActions(runtime)
@@ -79,7 +137,8 @@ export function consoleServer(runtime: Runtime): McpServer {
     async () => ({ contents: [{ uri: ATTENTION_URI, mimeType: MCP_APP_MIME, text: attentionPage('app') }] }))
 
   server.registerTool('superagent_attention', {
-    description: 'What waits for a person, first: questions to answer, results to review, blocked or failed tickets, and the Watchdog\'s alerts. Empty means healthy.',
+    description: 'What waits for a person, first: questions to answer, approvals to give in T3 Code, results to review, blocked or failed tickets, and the '
+      + 'Watchdog\'s alerts. Empty means healthy.',
     annotations: readOnly, _meta: { ui: { resourceUri: ATTENTION_URI }, 'ui/resourceUri': ATTENTION_URI },
   }, async () => ok(actions.superagent_attention()))
   server.registerTool('superagent_dismiss_alert', { description: 'Dismiss one of the Watchdog\'s alerts once it is dealt with.',
@@ -92,8 +151,13 @@ export function consoleServer(runtime: Runtime): McpServer {
     description: 'Start work: the operator\'s request becomes a ticket with its own T3 Code thread and worktree.',
     inputSchema: { text: z.string().trim().min(1).max(8000) },
   }, async args => ok(actions.superagent_request(args)))
-  server.registerTool('superagent_answer', { description: 'Answer the question a ticket waits on.', inputSchema: { ...id, text: z.string().trim().min(1).max(8000) } },
-    async args => ok(actions.superagent_answer(args)))
+  server.registerTool('superagent_answer', {
+    description: 'Answer the question a ticket waits on: one its worker asked in its report, or one its T3 Code thread waits on (see `pending.questions` '
+      + 'in superagent_attention). For several T3 Code questions, pass `answers` keyed by question id. Approvals cannot be answered here, only in T3 Code.',
+    inputSchema: { ...id, text: z.string().trim().min(1).max(8000),
+      answers: z.record(z.string(), z.union([z.string(), z.array(z.string())])).optional()
+        .describe('For a T3 Code question: answer per question id; a string, or a list for a multiple choice.') },
+  }, async args => ok(await actions.superagent_answer(args)))
   server.registerTool('superagent_stop', { description: 'Stop a ticket; this withdraws its authorization.', inputSchema: { ...id, reason: z.string().max(300).optional() } },
     async args => ok(actions.superagent_stop(args)))
   server.registerTool('superagent_retry', { description: 'Start a blocked or failed ticket again in the same thread and worktree.', inputSchema: id },

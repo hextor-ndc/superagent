@@ -3,14 +3,14 @@
  * t3code runs the workers. Holds no domain rules of its own.
  */
 import { createHash, randomBytes } from 'node:crypto'
-import { Engine, latestReport, threadKey, ticketStage, type DomainEvent, type SourceScope, type Ticket }
+import { Engine, followupOwners, latestReport, liveTicket, threadKey, ticketStage, type DomainEvent, type SourceScope, type Ticket }
   from '../../vendor/dsh/src/core/index.ts'
 import { SettingsSchema, settingsPolicy, type Settings } from '../../vendor/dsh/src/policy.ts'
 import type { Config } from '../config.ts'
 import { T3Executor, type T3ExecutorOptions, type TicketThread } from '../executor/t3-executor.ts'
 import { MCP_SERVER_NAME, writeMcpConfig } from '../executor/workspace.ts'
 import { shortId } from '../executor/render.ts'
-import type { T3Client } from '../t3/client.ts'
+import type { PendingQuestion, PendingRequest, T3Client } from '../t3/client.ts'
 import { GITHUB, GithubSource, ghCli, type Gh } from '../sources/github.ts'
 import { CONSOLE } from './console-source.ts'
 import { InterimRouter } from './interim-router.ts'
@@ -23,6 +23,17 @@ import { Store } from './store.ts'
 export interface TicketView {
   id: string; short: string; title: string; stage: string; question?: string; summary?: string; link?: string
   outcome?: string; updatedAt: string; source: string
+  /**
+   * What the worker's t3code thread waits on a person for. Approvals are answered in T3 Code only; questions also through
+   * `superagent_answer`. While there are any, an open Ticket's stage is `person/approve` or `person/question`.
+   */
+  pending?: { approvals: { requestId: string; text: string }[]; questions: (PendingQuestion & { requestId: string })[] }
+}
+
+/** Timing for the executor and for the look at the Watchdog thread; tests make them short. */
+export type RuntimeTiming = Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs' | 'pendingCheckMs'> & {
+  /** The pause between looks at what the Watchdog thread waits on; 60 s by default. */
+  watchdogPendingMs?: number
 }
 
 export class Runtime {
@@ -40,24 +51,30 @@ export class Runtime {
   /** The Watchdog thread in t3code, once it exists. */
   watchdog?: { threadId: string; link?: string }
   private watchdogTimer?: NodeJS.Timeout
+  private watchdogPendingTimer?: NodeJS.Timeout
+  /** What the Watchdog thread waits on a person for, as last seen, and since when; shown as an alert. */
+  watchdogPending: { requests: PendingRequest[]; since: string } | undefined
+  private readonly watchdogPendingMs: number
   private pass?: NodeJS.Timeout
   readonly events: DomainEvent[] = []
   readonly health = new Health()
 
   constructor(readonly config: Config, readonly t3: T3Client, project: { id: string; root: string },
-    timing: Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs'> = {}, deps: { gh?: Gh; model?: ModelCall } = {}) {
+    { watchdogPendingMs, ...timing }: RuntimeTiming = {}, deps: { gh?: Gh; model?: ModelCall } = {}) {
     const log = config.log
+    this.watchdogPendingMs = watchdogPendingMs ?? 60_000
     this.repo = new Store(config.database, error => log('after-commit work failed', error))
     const defer = (run: () => void) => this.repo.afterCommit(run)
     this.jobs = new Jobs((key, error, final) => {
       log(`${key} failed${final ? ' for the last time' : ''}`, error)
       this.health.fail(`jobs:${key.split(':')[0]}`, error)
-    }, defer)
+    }, defer, key => this.health.recovered(`jobs:${key.split(':')[0]}`))
     const saved = this.repo.kv.get<{ paused?: boolean }>('settings')
     this.settings = SettingsSchema.parse({
       paused: saved?.paused ?? false,
       policy: { sources: { [CONSOLE]: { allowed: [{ id: config.operator }] },
-        ...config.github ? { [GITHUB]: { allowed: config.github.allowed.map(id => ({ id })) } } : {} } },
+        ...config.github ? { [GITHUB]: { allowed: config.github.allowed.map(id => ({ id })),
+          ...config.github.admission ? { admission: config.github.admission } : {} } } : {} } },
       // The rule-based Router cannot judge proactive work, so it stays off there.
       eval: { mode: config.router.kind === 'claude' ? config.router.acceptMode : 'off' },
       executor: { maxWorkers: config.maxWorkers },
@@ -66,7 +83,9 @@ export class Runtime {
     this.watchdog = this.repo.kv.get('watchdog')
     if (config.github && config.repository) {
       this.github = new GithubSource({ gh: deps.gh ?? ghCli(config.github.gh), repository: config.repository, login: config.github.login,
-        engine: () => this.engine, store: this.repo, pollMs: config.github.pollMs, log, health: this.health })
+        engine: () => this.engine, store: this.repo, pollMs: config.github.pollMs, log, health: this.health,
+        // Unaddressed messages can only become candidates while proactive work is on, so with it off they are not read at all.
+        observe: this.settings.eval.mode === 'off' ? [] : config.github.observe ?? [] })
     }
     const scope: SourceScope = {
       scope: ({ source, meta }) => source === CONSOLE ? { listened: true, observed: false, row: 'console' }
@@ -87,12 +106,39 @@ export class Runtime {
     this.router = config.router.kind === 'claude'
       ? new ClaudeRouter({ engine: () => this.engine, store: this.repo, settings: () => this.settings, view: ticket => this.view(ticket),
         model: config.router.model, effort: config.router.effort, defer, log, health: this.health, ...deps.model ? { call: deps.model } : {} })
-      : new InterimRouter(this.jobs, () => this.engine, log)
+      : new InterimRouter(this.jobs, () => this.engine, this.repo, log, config.github ? [config.github.login] : [])
     this.engine = new Engine({
       repo: this.repo, policy: () => settingsPolicy(this.settings, scope), scope, assessor: this.router, executor: this.executor,
       outbox: this.outbox, prepareTicket: (ticket, outcome) => this.executor.prepare(ticket, outcome),
-      emit: event => { this.events.push(event); if (this.events.length > 500) this.events.shift() },
+      emit: event => {
+        this.events.push(event); if (this.events.length > 500) this.events.shift()
+        // A person's message that reached an open ticket is its worker's; the Router hears of it in the same transaction, and of
+        // those for an ended ticket once it resumes, so it can stop the work when the person asks (the prototype's follow_up notice).
+        // A ticket resumes on the first of them; every one still waiting is announced, such as a stop written after it during a pause.
+        if (event.type === 'ticket.resumed') for (const triggerId of this.waiting(event.data.ticketId)) this.followup(triggerId)
+        else if (event.type === 'trigger.received' || event.type === 'trigger.followup') this.followup(event.data.triggerId)
+      },
     })
+  }
+
+  /** The people's messages a ticket has not been given yet, oldest first. */
+  private waiting(ticketId: string): string[] {
+    const ticket = this.repo.tickets.get(ticketId)
+    return ticket?.undelivered.flatMap(id => {
+      const input = ticket.inputs.find(item => item.id === id)
+      return input?.kind === 'trigger' && input.human ? [input.triggerId] : []
+    }) ?? []
+  }
+  /**
+   * Tells the Router of a person's follow-up that open tickets own, as the prototype's `followupNotice` does. The owners include
+   * ended tickets the message is about to resume, since tickets wake one at a time: a stop that reaches two of them is told with
+   * both from the first wake, not with whichever woke first.
+   */
+  private followup(triggerId: string): void {
+    const trigger = this.repo.triggers.get(triggerId)
+    if (!trigger) return
+    const owners = followupOwners(trigger, this.repo).flatMap(id => this.repo.tickets.get(id) ?? [])
+    if (owners.some(ticket => liveTicket(ticket))) this.router.followup?.(trigger, owners)
   }
 
   /** Resumes the work a previous run left (Tickets in t3code threads, messages not yet sent), then starts the passes. */
@@ -101,6 +147,7 @@ export class Runtime {
     this.outbox.resume()
     this.github?.start()
     this.router.start?.()
+    if (this.watchdog && this.config.watchdogMinutes) this.watchWatchdogPending()
     this.pass = setInterval(() => {
       try { this.engine.evaluateDue() } catch (error) { this.config.log('pass failed', error) }
     }, 1000)
@@ -108,6 +155,7 @@ export class Runtime {
   async stop(): Promise<void> {
     clearInterval(this.pass)
     clearInterval(this.watchdogTimer)
+    clearInterval(this.watchdogPendingTimer)
     this.github?.stop()
     await this.router.stop?.()
     await this.executor.close()
@@ -166,6 +214,25 @@ export class Runtime {
     clearInterval(this.watchdogTimer)
     this.watchdogTimer = setInterval(() => { void this.checkWatchdog(since).catch(error => this.config.log('checking the Watchdog failed', error)) },
       minutes * 60_000)
+    this.watchWatchdogPending()
+  }
+
+  /**
+   * The Watchdog thread can itself wait on an approval, such as for a T3 Code tool its agent calls, and then no check runs.
+   * Nothing else would notice, so its thread is looked at on a slow timer and shown as an alert while it waits.
+   */
+  private watchWatchdogPending(): void {
+    clearInterval(this.watchdogPendingTimer)
+    this.watchdogPendingTimer = setInterval(() => { void this.checkWatchdogPending() }, this.watchdogPendingMs)
+  }
+  /** Looks once at what the Watchdog thread waits on; a failure is logged and keeps the last answer. */
+  async checkWatchdogPending(): Promise<PendingRequest[]> {
+    if (!this.watchdog) return []
+    try {
+      const requests = await this.t3.pendingRequests(this.watchdog.threadId)
+      this.watchdogPending = requests.length ? { requests, since: this.watchdogPending?.since ?? new Date().toISOString() } : undefined
+    } catch (error) { this.config.log('reading what the Watchdog thread waits on failed', error) }
+    return this.watchdogPending?.requests ?? []
   }
 
   /** Re-arms a Watchdog whose check-ins stopped for more than two and a half intervals. */
@@ -186,8 +253,15 @@ export class Runtime {
     const stage = ticketStage(ticket)
     const report = latestReport(ticket)
     const origin = this.repo.triggers.get(ticket.origin.triggerId)
-    return { id: ticket.id, short: shortId(ticket.id), title: ticket.title,
-      stage: 'action' in stage && stage.action ? `${stage.stage}/${stage.action}` : stage.stage,
+    const requests = ticket.ended ? [] : this.executor.pending(ticket.id)
+    const approvals = requests.flatMap(request => request.kind === 'approval' ? [{ requestId: request.requestId, text: request.text }] : [])
+    const questions = requests.flatMap(request => request.kind === 'question'
+      ? request.questions.map(question => ({ ...question, requestId: request.requestId })) : [])
+    let named = 'action' in stage && stage.action ? `${stage.stage}/${stage.action}` : stage.stage
+    // A worker that waits on t3code for a person needs one as much as a worker that asked through its report.
+    if (stage.stage !== 'person' && stage.stage !== 'ended' && requests.length) named = approvals.length ? 'person/approve' : 'person/question'
+    return { id: ticket.id, short: shortId(ticket.id), title: ticket.title, stage: named,
+      ...requests.length ? { pending: { approvals, questions } } : {},
       ...ticket.attention ? { question: ticket.attention.question } : {}, ...report ? { summary: report.summary } : {},
       ...this.executor.thread(ticket.id)?.link ? { link: this.executor.thread(ticket.id)!.link } : {},
       ...ticket.ended ? { outcome: ticket.ended.outcome } : {}, updatedAt: ticket.updatedAt, source: origin?.source ?? 'unknown' }
@@ -241,6 +315,7 @@ const CONSOLE_INTRO = [
   'Use the `superagent` MCP tools: superagent_attention first (what waits for a person), superagent_status, superagent_ticket, '
     + 'superagent_request to start work, superagent_answer to answer a ticket\'s question, superagent_stop, superagent_retry, '
     + 'superagent_note, superagent_pause, superagent_messages and superagent_dismiss_alert (for the Watchdog\'s alerts).',
+  'A ticket at person/approve waits on an approval in its T3 Code thread: only T3 Code can grant it, so link the thread and say so.',
   'Keep answers short. Do not do ticket work in this thread: start a request instead, and link each ticket\'s thread when you mention it.',
   'Reply with one line saying you are ready.',
 ].join('\n')

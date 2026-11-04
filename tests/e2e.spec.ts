@@ -4,10 +4,9 @@
  * thread link.
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
@@ -17,6 +16,7 @@ import type { Config } from '../src/config.ts'
 import { startHttp } from '../src/http/server.ts'
 import { ATTENTION_URI, MCP_APP_MIME } from '../src/mcp/attention-app.ts'
 import { FakeT3 } from './fake-t3.ts'
+import { checkout } from './harness.ts'
 
 const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
@@ -41,12 +41,9 @@ describe('superagent on t3code', () => {
   const errors: string[] = []
 
   beforeEach(async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'superagent-'))
-    root = join(dir, 'widgets')
-    execFileSync('git', ['init', '-q', '-b', 'main', root])
-    writeFileSync(join(root, 'README.md'), '# widgets\n')
-    git(root, '-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.')
-    git(root, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'init')
+    // The harness's checkout is removed after the file.
+    const place = checkout(), dir = place.dir
+    root = place.root
     t3 = new FakeT3([{ id: 'project-1', workspaceRoot: root }])
     const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', projectRoot: root, worktreeRoot: join(dir, 'worktrees'), baseRef: 'HEAD',
       repository: 'acme/widgets', port: 0, publicUrl: '', consoleToken: 'console-secret', watchdogMinutes: 0, database: ':memory:', router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' }, operator: 'hector', maxWorkers: 2,

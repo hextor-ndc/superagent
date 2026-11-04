@@ -1,22 +1,45 @@
 /** An in-memory t3code for tests: threads, runs and the calls the super agent made. */
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { LaunchInput, LaunchResult, ProjectSummary, ScratchLaunchInput, SendResult, T3Client, T3Status, ThreadRead, WaitResult }
-  from '../src/t3/client.ts'
+import { afterAll } from 'vitest'
+import { T3Error, type LaunchInput, type LaunchResult, type PendingRequest, type ProjectSummary, type ScratchLaunchInput, type SendResult, type T3Client,
+  type T3Status, type ThreadRead, type WaitResult } from '../src/t3/client.ts'
 
 interface FakeThread {
   id: string; title: string; link: string; worktreePath: string | null; branch: string | null; pinned: boolean
   runs: { id: string; status: T3Status }[]
   messages: { id: string; text: string; clientRequestId: string }[]
   pullRequests: string[]
+  pending: PendingRequest[]
+}
+
+/**
+ * The scratch folders of every FakeT3 in this module, removed after the spec file (and, failing that, when the process
+ * exits), so a test that never closes its FakeT3 leaves nothing behind. The Runtime writes the console's and the
+ * Watchdog's MCP configuration into a scratch thread's folder, so the folder has to exist while the test runs.
+ */
+const scratchRoots = new Set<string>()
+/** Removes the scratch folders of every FakeT3 made by this module, closed or not. */
+export function removeAllScratch(): void { for (const dir of scratchRoots) removeScratch(dir) }
+afterAll(removeAllScratch)
+process.once('exit', removeAllScratch)
+function removeScratch(dir: string): void {
+  scratchRoots.delete(dir)
+  try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }) } catch { /* left for the OS to clear */ }
 }
 
 export class FakeT3 implements T3Client {
   readonly threads = new Map<string, FakeThread>()
   readonly calls: { tool: string; args: unknown }[] = []
+  /** Threads whose pending requests were read, in order: the executor and the Runtime look at them on timers. */
+  readonly pendingReads: string[] = []
+  /** The next this many pending-request reads fail, as when t3code is unreachable. */
+  failPendingReads = 0
   private readonly requests = new Map<string, unknown>()
   private seq = 0
+  /** One temporary folder per FakeT3, made on the first scratch launch, that holds a folder for each scratch thread. */
+  private scratchRoot?: string
   constructor(readonly projects: ProjectSummary[]) {}
 
   private id(prefix: string) { return `${prefix}-${++this.seq}` }
@@ -37,10 +60,14 @@ export class FakeT3 implements T3Client {
   }
   async launchScratch(input: ScratchLaunchInput): Promise<LaunchResult> {
     this.calls.push({ tool: 't3_thread_launch', args: { scratch: true, ...input } })
-    return this.once(input.clientRequestId, () => this.create(input.title, mkdtempSync(join(tmpdir(), 'scratch-')), null, input.message, input.clientRequestId))
+    return this.once(input.clientRequestId, () => this.create(input.title, mkdtempSync(join(this.scratch(), 'thread-')), null, input.message, input.clientRequestId))
+  }
+  private scratch(): string {
+    if (!this.scratchRoot) scratchRoots.add(this.scratchRoot = mkdtempSync(join(tmpdir(), 'fake-t3-scratch-')))
+    return this.scratchRoot
   }
   private create(title: string, worktreePath: string | null, branch: string | null, message: string | undefined, requestId: string): LaunchResult {
-    const thread: FakeThread = { id: this.id('thread'), title, link: '', worktreePath, branch, pinned: false, runs: [], messages: [], pullRequests: [] }
+    const thread: FakeThread = { id: this.id('thread'), title, link: '', worktreePath, branch, pinned: false, runs: [], messages: [], pullRequests: [], pending: [] }
     thread.link = `https://app.t3.codes/thread/${thread.id}`
     this.threads.set(thread.id, thread)
     let runId: string | null = null
@@ -75,7 +102,8 @@ export class FakeT3 implements T3Client {
     const latest = thread.runs.at(-1)
     return {
       thread: { threadId, title: thread.title, link: thread.link, status: latest?.status ?? 'idle', activeRunId: latest?.status === 'running' ? latest.id : null,
-        latestRunId: latest?.id ?? null, worktreePath: thread.worktreePath, branch: thread.branch, settled: false, archived: false },
+        latestRunId: latest?.id ?? null, worktreePath: thread.worktreePath, branch: thread.branch, settled: false, archived: false,
+        pendingRequestCount: thread.pending.length },
       items: thread.messages.map((message, position) => ({ position, itemId: message.id, runId: null, messageId: message.id, type: 'user_message',
         text: message.text, createdBy: null })),
       nextPosition: null,
@@ -94,7 +122,23 @@ export class FakeT3 implements T3Client {
     this.calls.push({ tool: 'link_pull_requests', args: { threadId, urls } })
     this.thread(threadId).pullRequests.push(...urls)
   }
-  async close() {}
+  async pendingRequests(threadId: string): Promise<PendingRequest[]> {
+    this.pendingReads.push(threadId)
+    if (this.failPendingReads > 0) { this.failPendingReads--; throw new T3Error('t3_thread_read', 'network', 'fetch failed') }
+    return [...this.thread(threadId).pending]
+  }
+  async answerQuestion(threadId: string, requestId: string, answers: Record<string, string | string[]>) {
+    this.calls.push({ tool: 't3_pending_request', args: { action: 'respond', threadId, requestId, answers } })
+    const thread = this.thread(threadId)
+    const index = thread.pending.findIndex(request => request.kind === 'question' && request.requestId === requestId)
+    if (index < 0) throw new Error(`invalid_request The pending user-input request was not found.`)
+    thread.pending.splice(index, 1)
+  }
+  /** Removes the scratch threads' folders. A scratch launch after this makes a new folder; the earlier threads keep their removed paths. */
+  async close() {
+    if (this.scratchRoot) removeScratch(this.scratchRoot)
+    this.scratchRoot = undefined
+  }
 
   /** The agent of a thread finishes its turn. */
   finishRun(threadId: string, status: T3Status = 'completed'): void {

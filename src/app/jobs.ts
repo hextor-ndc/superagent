@@ -16,9 +16,10 @@ export class Jobs {
   /**
    * @param defer - runs `enqueue` once the caller's transaction commits (`Store.afterCommit`), so work a rolled-back command
    * queued never runs.
+   * @param onDone - called after a job ran without an error, such as to clear the failures `onError` counted.
    */
   constructor(private readonly onError: (key: string, error: unknown, final: boolean) => void = () => {},
-    private readonly defer: (run: () => void) => void = run => run()) {}
+    private readonly defer: (run: () => void) => void = run => run(), private readonly onDone: (key: string) => void = () => {}) {}
 
   /** Queue `run` under `key`; it starts on the next tick. */
   enqueue(key: string, run: () => Promise<void>, options: JobOptions = {}): void {
@@ -63,6 +64,7 @@ export class Jobs {
     try {
       await job.run()
       job.running = false
+      this.onDone(key)
       if (job.again) return this.schedule(key, job, 0)
       this.jobs.delete(key)
     } catch (error) {
