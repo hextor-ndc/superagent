@@ -9,7 +9,7 @@ import { T3Error, type LaunchInput, type LaunchResult, type PendingRequest, type
 
 interface FakeThread {
   id: string; title: string; link: string
-  /** The project the thread was launched in; null for a scratch thread. */
+  /** The project the thread was launched in; for a scratch thread, the scratch project (`SCRATCH_PROJECT`). */
   projectId: string | null
   worktreePath: string | null; branch: string | null; pinned: boolean
   runs: { id: string; status: T3Status }[]
@@ -32,6 +32,12 @@ function removeScratch(dir: string): void {
   scratchRoots.delete(dir)
   try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }) } catch { /* left for the OS to clear */ }
 }
+
+/**
+ * The id of t3code's scratch project. t3code 0.1.6 makes it, titled "No project", at its first scratch launch, with the
+ * folder that holds the scratch threads' folders as its root, and lists it in `t3_project_list` from then on.
+ */
+export const SCRATCH_PROJECT = 'p-scratch'
 
 export interface FakeT3Options {
   /**
@@ -119,7 +125,13 @@ export class FakeT3 implements T3Client {
   }
   async launchScratch(input: ScratchLaunchInput): Promise<LaunchResult> {
     this.calls.push({ tool: 't3_thread_launch', args: { scratch: true, ...input } })
-    return this.once(input.clientRequestId, () => this.create(null, input.title, mkdtempSync(join(this.scratch(), 'thread-')), null, input.message, input.clientRequestId))
+    return this.once(input.clientRequestId, () => {
+      const root = this.scratch()
+      const known = this.projects.find(project => project.id === SCRATCH_PROJECT)
+      if (!known) this.projects.push({ id: SCRATCH_PROJECT, title: 'No project', workspaceRoot: root })
+      else known.workspaceRoot = root
+      return this.create(SCRATCH_PROJECT, input.title, mkdtempSync(join(root, 'thread-')), null, input.message, input.clientRequestId)
+    })
   }
   private scratch(): string {
     if (!this.scratchRoot) scratchRoots.add(this.scratchRoot = mkdtempSync(join(tmpdir(), 'fake-t3-scratch-')))
@@ -137,7 +149,7 @@ export class FakeT3 implements T3Client {
       thread.runs.push({ id: runId, status: 'running' })
       thread.messages.push({ id: this.id('message'), text: message, clientRequestId: requestId })
     }
-    return { threadId: thread.id, link: thread.link, runId, status: runId ? 'running' : null }
+    return { threadId: thread.id, link: thread.link, ...projectId ? { projectId } : {}, runId, status: runId ? 'running' : null }
   }
   async send(threadId: string, message: string, clientRequestId: string, mode = 'auto'): Promise<SendResult> {
     this.calls.push({ tool: 't3_thread_send', args: { threadId, message, clientRequestId, mode } })
@@ -162,7 +174,7 @@ export class FakeT3 implements T3Client {
     const thread = this.thread(threadId)
     const latest = thread.runs.at(-1)
     return {
-      thread: { threadId, title: thread.title, link: thread.link, status: latest?.status ?? 'idle', activeRunId: latest?.status === 'running' ? latest.id : null,
+      thread: { threadId, projectId: thread.projectId, title: thread.title, link: thread.link, status: latest?.status ?? 'idle', activeRunId: latest?.status === 'running' ? latest.id : null,
         latestRunId: latest?.id ?? null, worktreePath: thread.worktreePath, branch: thread.branch, settled: false, archived: false,
         pendingRequestCount: thread.pending.length },
       items: thread.messages.map((message, position) => ({ position, itemId: message.id, runId: null, messageId: message.id, type: 'user_message',

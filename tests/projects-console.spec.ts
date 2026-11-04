@@ -14,7 +14,7 @@ import { Runtime } from '../src/app/runtime.ts'
 import type { Config } from '../src/config.ts'
 import { unregistered } from '../src/executor/t3-executor.ts'
 import { watchdogCheck } from '../src/mcp/watchdog-tools.ts'
-import { FakeT3 } from './fake-t3.ts'
+import { FakeT3, SCRATCH_PROJECT } from './fake-t3.ts'
 import { checkout, data, harness, mcp, until, type Harness } from './harness.ts'
 
 /** A Runtime with no project configured, on a registry loaded from `t3` and the catalogue in `dir`. */
@@ -52,6 +52,25 @@ describe('projects in the console', () => {
     expect(JSON.stringify(unknown.content)).toContain('No project widgets in T3 Code.')
     expect(made.runtime.repo.threads.list()).toEqual([])
     expect(made.runtime.repo.tickets.list()).toEqual([])
+    await console.close()
+  })
+
+  it('leaves t3code\'s scratch project, which holds the console and the Watchdog, out of the projects', async () => {
+    const place = checkout()
+    catalogue(place.dir, [])
+    const t3 = new FakeT3([{ id: 'project-1', workspaceRoot: place.root, title: 'Widgets' }])
+    made = await consoleOnly(t3, place.dir, { watchdogMinutes: 15 })
+    // A start after the console thread exists: T3 Code lists the scratch project from the first load on.
+    await t3.launchScratch({ title: 'Earlier thread', clientRequestId: 'earlier' })
+    expect((await t3.listProjects()).map(project => project.title)).toEqual(['Widgets', 'No project'])
+    await made.runtime.projects.refresh()
+    await made.runtime.ensureWatchdog()
+    await made.runtime.ensureConsole()
+    const console = await mcp(`${made.base}/mcp/console/console-secret`)
+    const listed = data(await console.callTool({ name: 'superagent_projects', arguments: { refresh: true } }))
+    expect(listed).toMatchObject({ summary: '1 ready', total: 1 })
+    expect(made.runtime.projects.list().map(entry => entry.id)).toEqual(['project-1'])
+    expect(made.runtime.projects.byId(SCRATCH_PROJECT)).toBeUndefined()
     await console.close()
   })
 

@@ -24,7 +24,8 @@ export interface TicketThread {
   link?: string
   /**
    * The T3 Code project the thread was launched under, as a cross-check of the Ticket's binding (which stays in its own kv
-   * row, since this record is first saved only after the launch). Absent on records saved before projects were kept per ticket.
+   * row, since this record is first saved when the worktree is made, or after the launch). Absent on records saved before projects
+   * were kept per ticket.
    */
   projectId?: string
   worktreePath: string
@@ -378,12 +379,14 @@ export class T3Executor implements Executor {
         return
       }
       Object.assign(entry, { worktreePath: prepared.worktreePath, branch: prepared.branch, projectId: binding.projectId })
+      this.threads.set(ticketId, entry)
       if (prepared.base) {
         entry.baseSha = prepared.base.sha
         if (prepared.base.note) entry.baseNote = prepared.base.note
         else delete entry.baseNote
+        // Only the preparation that made the worktree knows its base: saved now, a restart before the thread exists keeps it.
+        this.save(entry)
       }
-      this.threads.set(ticketId, entry)
       if (!this.waitsToStart(ticketId, assignmentId)) { stopped = true; return }
       const described = this.options.projects.byId(binding.projectId)
       const catalogue = described?.describe && described.catalogue && 'path' in described.catalogue ? described.catalogue : undefined

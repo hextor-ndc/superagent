@@ -48,6 +48,8 @@ export interface ClaudeRouterOptions {
   projectOf?: (ticketId: string) => ProjectBinding | undefined
   /** Where an accept of a candidate's Triggers would be bound, or why it would be refused; shown on its card as `project_hint`. */
   projectPreview?: (triggers: Trigger[]) => ProjectPreview
+  /** Why a ticket takes no more messages after `superagent_reroute`; the attach guard refuses such a ticket. */
+  rerouted?: (ticketId: string) => string | undefined
   /** Calls the Messages API; tests pass a scripted model. */
   call?: ModelCall
   model?: string
@@ -77,7 +79,8 @@ export class ClaudeRouter implements Router {
 
   constructor(private readonly options: ClaudeRouterOptions) {
     this.tools = routerTools({ engine: options.engine, store: options.store, settings: options.settings, view: options.view,
-      ...options.projectOf ? { projectOf: options.projectOf } : {}, ...options.projectPreview ? { projectPreview: options.projectPreview } : {} })
+      ...options.projectOf ? { projectOf: options.projectOf } : {}, ...options.projectPreview ? { projectPreview: options.projectPreview } : {},
+      ...options.rerouted ? { rerouted: options.rerouted } : {} })
     this.call = options.call ?? defaultCall()
   }
 

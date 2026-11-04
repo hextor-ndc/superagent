@@ -21,7 +21,8 @@ export interface LaunchInput {
   runtimeMode?: string
   clientRequestId: string
 }
-export interface LaunchResult { threadId: string; link?: string; runId: string | null; status: T3Status | null }
+/** `projectId` is the thread's project; for a scratch thread, t3code's scratch project ("No project"), which it lists from then on. */
+export interface LaunchResult { threadId: string; link?: string; projectId?: string; runId: string | null; status: T3Status | null }
 export interface ScratchLaunchInput { title: string; message?: string; clientRequestId: string }
 export interface SendResult { messageId: string; runId: string; delivery: 'started' | 'queued' | 'steered' | 'restarted'; status: T3Status }
 export interface WaitResult { runId: string | null; status: T3Status; timedOut: boolean }
@@ -32,7 +33,7 @@ export interface TimelineItem {
   status?: string
 }
 export interface ThreadRead {
-  thread: { threadId: string; title: string; link?: string; status: T3Status; activeRunId: string | null; latestRunId: string | null
+  thread: { threadId: string; projectId?: string | null; title: string; link?: string; status: T3Status; activeRunId: string | null; latestRunId: string | null
     worktreePath: string | null; branch: string | null; settled: boolean; archived: boolean
     /** Approvals and questions that wait for a person, of every kind. */
     pendingRequestCount?: number

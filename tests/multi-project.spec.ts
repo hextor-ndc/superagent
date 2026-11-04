@@ -286,6 +286,34 @@ describe('tickets bound to their project', () => {
     expect(readFileSync(join(thread.worktreePath!, 'README.md'), 'utf8')).toBe('# gadgets\n')
   })
 
+  it('keeps the base line and the dirty note for a launch after a restart that came once the worktree was made', async () => {
+    const place = checkout('widgets')
+    const gadgets = checkout('gadgets', place.dir).root
+    const database = join(place.dir, 'state.sqlite')
+    const projects = { 'p-gadgets': { baseRef: 'HEAD' } }
+    const first = new FakeT3([{ id: 'p-widgets', workspaceRoot: place.root, title: 'Widgets' }, { id: 'p-gadgets', workspaceRoot: gadgets, title: 'Gadgets' }],
+      { checkWorktrees: true })
+    // The launch never answers, so the service stops after the worktree was made and before the thread exists.
+    let launched = false
+    first.launch = () => { launched = true; return new Promise(() => {}) }
+    writeFileSync(join(gadgets, 'scratch.txt'), 'mine\n')
+    let env = await setup({ dir: place.dir, t3: first, database, projects })
+    made = env.made
+    const trigger = named('Fix the gadget count', 'p-gadgets')
+    made.runtime.engine.receive(trigger)
+    await env.ticketOf(trigger)
+    await until(() => launched, 'the first launch')
+    await made.close()
+
+    env = await setup({ dir: place.dir, database, projects })
+    made = env.made
+    const thread = await until(() => env.t3.workerThreads()[0], 'the relaunched thread')
+    const head = git(gadgets, 'rev-parse', 'HEAD')
+    const variables = thread.messages[0]!.text.split('## Execution variables')[1]!.split('\n## ')[0]!
+    expect(variables).toContain(`- Base HEAD at ${head}`)
+    expect(variables).toContain(`- Base ${head.slice(0, 12)} on main; the checkout had 1 uncommitted change that is not in this worktree.`)
+  })
+
   it('launches two tickets of one repository at once', async () => {
     const env = await setup()
     made = env.made
@@ -580,14 +608,41 @@ describe('migration v1', () => {
     expect(backups(old.place.dir)).toHaveLength(1)
   })
 
-  it('logs, and leaves alone, old tickets whose worktrees are not of the legacy project it binds them to', async () => {
+  /** Nothing of the migration is in the database: no binding and no marker. */
+  const unmigrated = (database: string) => {
+    const store = new Store(database)
+    try { return store.kv.list('ticket-project:').length === 0 && store.kv.get(SCHEMA_KEY) === undefined } finally { store.close() }
+  }
+  const wrongRoot = (dir: string) => ({ t3: new FakeT3([{ id: 'p-gadgets', workspaceRoot: join(dir, 'gadgets'), title: 'Gadgets' }], { checkWorktrees: true }),
+    legacy: { root: join(dir, 'gadgets'), worktreeRoot: join(dir, 'gw') } })
+
+  it('refuses to start, binding nothing, when old open tickets\' worktrees are not of the legacy project, and binds them once it is set right', async () => {
     const old = await oldDatabase()
     // SUPERAGENT_PROJECT_ROOT set to the wrong checkout for the migration.
-    const t3 = new FakeT3([{ id: 'p-gadgets', workspaceRoot: join(old.place.dir, 'gadgets'), title: 'Gadgets' }], { checkWorktrees: true })
-    const env = await setup({ dir: old.place.dir, database: old.database, t3, legacy: { root: join(old.place.dir, 'gadgets'), worktreeRoot: join(old.place.dir, 'gw') } })
-    made = env.made
-    expect(made.errors.some(error => error.includes(`${old.directory} is a worktree of`) && error.includes('check SUPERAGENT_PROJECT_ROOT'))).toBe(true)
+    const start = setup({ dir: old.place.dir, database: old.database, ...wrongRoot(old.place.dir) })
+    await expect(start).rejects.toThrow(new RegExp(`An open ticket of an earlier version does not belong to the project SUPERAGENT_PROJECT_ROOT names, `
+      + `Gadgets .*${old.directory} is a worktree of .*Set SUPERAGENT_PROJECT_ROOT to the project those tickets were made in.*Nothing was bound; `
+      + 'a copy of the database from before is at .*state\\.sqlite\\.bak-'))
+    expect(unmigrated(old.database)).toBe(true)
     expect(existsSync(old.directory!)).toBe(true)
+    // With the variable fixed, the next start binds the ticket to the project its worktree is of.
+    const env = await setup({ dir: old.place.dir, database: old.database, t3: old.t3, legacy: { repository: 'acme/widgets' } })
+    made = env.made
+    expect(made.runtime.binding(old.ticketId)).toMatchObject({ projectId: 'p-widgets', by: 'legacy' })
+  })
+
+  it('refuses to start when an old open ticket\'s worktree is not made yet and its folder is not the legacy project\'s', async () => {
+    const old = await oldDatabase()
+    // As a ticket the earlier version accepted and had not launched: no worktree, and no thread.
+    git(join(old.place.dir, 'widgets'), 'worktree', 'remove', '--force', old.directory!)
+    const store = new Store(old.database)
+    store.kv.delete(`ticket-thread:${old.ticketId}`)
+    store.close()
+    const start = setup({ dir: old.place.dir, database: old.database, ...wrongRoot(old.place.dir) })
+    await expect(start).rejects.toThrow(new RegExp(`its worktree ${old.directory} is not made yet, and its folder ${join(old.place.dir, 'worktrees')} `
+      + `is not Gadgets's worktree folder ${join(old.place.dir, 'gw')}`))
+    expect(unmigrated(old.database)).toBe(true)
+    expect(git(join(old.place.dir, 'gadgets'), 'branch', '--list')).not.toContain('agent/')
   })
 
   it('refuses to start with old tickets and no legacy project, and names the copy of the database', async () => {

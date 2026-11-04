@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { consoleTrigger } from '../src/app/console-source.ts'
 import { T3Error, type LaunchInput } from '../src/t3/client.ts'
-import { FakeT3, removeAllScratch } from './fake-t3.ts'
+import { FakeT3, removeAllScratch, SCRATCH_PROJECT } from './fake-t3.ts'
 import { checkout, git, harness, until, type Harness } from './harness.ts'
 
 async function scratchFolder(t3: FakeT3, clientRequestId: string): Promise<string> {
@@ -66,12 +66,16 @@ describe('FakeT3 projects and worktree checks', () => {
   const notOneOfItsWorktrees = { tool: 't3_thread_launch', code: 'invalid_request', transient: false,
     message: expect.stringContaining('worktreePath must be one of the project\'s git worktrees') }
 
-  it('records the project of each thread, and none for a scratch thread', async () => {
+  it('records the project of each thread, and t3code\'s scratch project for a scratch thread, which it lists from then on', async () => {
     const { t3, widgetsTree, gadgetsTree } = twoProjects()
     const first = await launch(t3, 'widgets-id', widgetsTree)
     const second = await launch(t3, 'gadgets-id', gadgetsTree)
+    expect((await t3.listProjects()).map(project => project.id)).toEqual(['widgets-id', 'gadgets-id'])
     const scratch = await t3.launchScratch({ title: 'Superagent', clientRequestId: 'console' })
-    expect([first, second, scratch].map(launched => t3.threads.get(launched.threadId)!.projectId)).toEqual(['widgets-id', 'gadgets-id', null])
+    expect([first, second, scratch].map(launched => t3.threads.get(launched.threadId)!.projectId)).toEqual(['widgets-id', 'gadgets-id', SCRATCH_PROJECT])
+    expect(scratch.projectId).toBe(SCRATCH_PROJECT)
+    const folder = (await t3.read(scratch.threadId)).thread.worktreePath!
+    expect((await t3.listProjects()).at(-1)).toEqual({ id: SCRATCH_PROJECT, title: 'No project', workspaceRoot: dirname(folder) })
     await t3.close()
   })
 

@@ -8,7 +8,7 @@ import { liveTicket, reasonText, threadKey, type Decision, type Ticket, type Tri
 import { CONSOLE, consoleThread, consoleTrigger, type ConsoleHint } from '../app/console-source.ts'
 import type { Runtime } from '../app/runtime.ts'
 import { shortId } from '../executor/render.ts'
-import { BINDING_PREFIX, denied, STATUSES, type ProjectBinding, type ProjectEntry, type ProjectStatus } from '../app/projects.ts'
+import { BINDING_PREFIX, denied, rerouteKey, STATUSES, type ProjectBinding, type ProjectEntry, type ProjectStatus, type Rerouted } from '../app/projects.ts'
 import type { PendingQuestion, PendingRequest } from '../t3/client.ts'
 import { ATTENTION_URI, MCP_APP_MIME, attentionPage } from './attention-app.ts'
 import { ok } from './result.ts'
@@ -103,6 +103,10 @@ export function consoleActions(runtime: Runtime) {
     },
     superagent_answer: async ({ ticket_id, text, answers }: { ticket_id: string; text: string; answers?: Answers }) => {
       const found = ticket(ticket_id)
+      // A rerouted ticket's work goes on in the new ticket. An answer here would be filed again in the old project, or resume
+      // the old ticket there when it had ended before the reroute.
+      const moved = runtime.rerouted(found.id)
+      if (moved) throw new Error(`${moved} Answer that ticket instead.`)
       let pending = liveTicket(found) ? runtime.executor.pending(found.id) : []
       const isQuestion = (request: PendingRequest): request is QuestionRequest => request.kind === 'question'
       // `answers` names t3code questions: when the last look saw none, ask t3code now rather than send the text as a chat message.
@@ -211,9 +215,6 @@ async function awaitOutcome(runtime: Runtime, trigger: Trigger, waitMs: number):
   }
   return outcome
 }
-/** kv `reroute:<ticketId>`: the request `superagent_reroute` filed for a ticket, so a repeated call returns it. */
-interface Rerouted { triggerId: string; projectId: string; key: string }
-const rerouteKey = (ticketId: string) => `reroute:${ticketId}`
 
 /** A path or name as one shell word, for the cleanup commands. */
 const quote = (word: string): string => /^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`

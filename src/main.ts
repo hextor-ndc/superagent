@@ -39,10 +39,10 @@ async function run(): Promise<void> {
   const t3 = new McpT3Client({ url: config.t3Url, token, ...(config.model ? { modelSelection: config.model } : {}) })
   const projects = await ProjectRegistry.load({ t3, stateDir: config.stateDir, legacy: config.legacy, catalogue: config.catalogue,
     projectsFile: config.projectsFile, log: config.log })
-  logProjects(projects)
   // A configured project that does not resolve fails the start, as before; GitHub needs it for its repository.
-  if (config.legacy && !projects.legacy()) throw new Error(projects.legacyProblem() ?? 'The project SUPERAGENT_PROJECT_ROOT names is not ready.')
-  if (config.github && !projects.legacy()) throw new Error('GitHub needs the project its repository belongs to: set SUPERAGENT_PROJECT_ROOT and SUPERAGENT_REPOSITORY.')
+  const refused = config.legacy && !projects.legacy() ? projects.legacyProblem() ?? 'The project SUPERAGENT_PROJECT_ROOT names is not ready.'
+    : config.github && !projects.legacy() ? 'GitHub needs the project its repository belongs to: set SUPERAGENT_PROJECT_ROOT and SUPERAGENT_REPOSITORY.' : undefined
+  if (refused) { logProjects(projects); throw new Error(refused) }
 
   const runtime = new Runtime(config, t3, projects)
   // The migration of earlier state runs before HTTP opens and before any work resumes.
@@ -50,6 +50,8 @@ async function run(): Promise<void> {
   runtime.start()
   await runtime.ensureConsole()
   await runtime.ensureWatchdog().catch(error => log(`starting the Watchdog failed: ${error instanceof Error ? error.message : String(error)}`))
+  // After the console's thread exists: it puts t3code's scratch project in T3 Code's list, which the registry leaves out.
+  logProjects(projects)
   const unnamed = config.unnamedRequests === 'refuse' ? undefined : runtime.projectPreview([{ source: 'console', meta: {} }])
   log(`ready: router ${config.router.kind}${config.github ? `, GitHub ${runtime.workProject?.repository} as ${config.github.login}` : ''}; `
     + `unnamed requests go to ${unnamed && !('refused' in unnamed) ? unnamed.key : 'no project (they are refused)'}; `

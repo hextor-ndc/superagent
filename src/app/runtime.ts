@@ -19,8 +19,8 @@ import { Jobs } from './jobs.ts'
 import { StoredOutbox } from './outbox.ts'
 import { Health } from './health.ts'
 import { migrateProjects, SCHEMA_KEY, type ProjectsSchema } from './migrate-projects.ts'
-import { BINDING_PREFIX, bindingKey, bindingOf, deniedProject, ProjectRegistry, resolveProject, type BoundBy, type ProjectBinding, type ProjectEntry,
-  type ProjectRules } from './projects.ts'
+import { BINDING_PREFIX, bindingKey, bindingOf, deniedProject, ProjectRegistry, rerouteKey, resolveProject, type BoundBy, type ProjectBinding,
+  type ProjectEntry, type ProjectRules, type Rerouted } from './projects.ts'
 import { Store } from './store.ts'
 
 export interface TicketView {
@@ -157,7 +157,7 @@ export class Runtime {
     this.router = config.router.kind === 'claude'
       ? new ClaudeRouter({ engine: () => this.engine, store: this.repo, settings: () => this.settings, view: ticket => this.view(ticket),
         delivery: ticketId => this.binding(ticketId)?.delivery, projectOf: ticketId => this.binding(ticketId),
-        projectPreview: triggers => this.projectPreview(triggers),
+        projectPreview: triggers => this.projectPreview(triggers), rerouted: ticketId => this.rerouted(ticketId),
         model: config.router.model, effort: config.router.effort, defer, log, health: this.health, ...deps.model ? { call: deps.model } : {} })
       : new InterimRouter(this.jobs, () => this.engine, this.repo, log, config.github ? [config.github.login] : [],
         triggers => this.projectRefusal(triggers))
@@ -207,6 +207,17 @@ export class Runtime {
 
   /** A ticket's project, as bound at its accept. */
   binding(ticketId: string): ProjectBinding | undefined { return this.repo.kv.get<ProjectBinding>(bindingKey(ticketId)) }
+  /**
+   * Why a ticket takes no more messages because `superagent_reroute` filed its request again in another project, naming the
+   * ticket (or request) where the work goes on; undefined for a ticket that was not rerouted.
+   */
+  rerouted(ticketId: string): string | undefined {
+    const moved = this.repo.kv.get<Rerouted>(rerouteKey(ticketId))
+    if (!moved) return undefined
+    const made = this.repo.tickets.list().find(ticket => ticket.origin.triggerIds.includes(moved.triggerId))
+    return `Ticket ${shortId(ticketId)} was rerouted to ${moved.key}, and its work goes on there in `
+      + `${made ? `ticket ${shortId(made.id)}` : `request ${moved.triggerId}`}; the rerouted ticket takes no more messages.`
+  }
   /**
    * Binds a newly accepted ticket to its project, inside the Engine's accept transaction (the `prepareTicket` hook), by the
    * rules of `resolveProject`, and records it in kv `ticket-project:<id>`. A throw rolls the whole accept back: no ticket,
@@ -311,6 +322,7 @@ export class Runtime {
     this.console = { threadId: launched.threadId, link: launched.link }
     this.repo.kv.set('console', this.console)
     const detail = await this.t3.read(launched.threadId, { limit: 1 })
+    this.hideScratch(launched.projectId ?? detail.thread.projectId)
     if (detail.thread.worktreePath) await writeMcpConfig(detail.thread.worktreePath, this.consoleUrl())
     else this.config.log(`The console thread has no folder; add the console MCP server by hand: ${MCP_SERVER_NAME} ${this.consoleUrl()}`)
     await this.t3.organize(launched.threadId, 'pin').catch(error => this.config.log('pinning the console failed', error))
@@ -323,6 +335,10 @@ export class Runtime {
       await this.t3.send(launched.threadId, CONSOLE_INTRO_V2, `${requestId}:intro-v2`, 'queue')
         .then(() => this.repo.kv.set(CONSOLE_INTRO_KEY, CONSOLE_INTRO_VERSION), error => this.config.log('updating the console\'s introduction failed', error))
     }
+  }
+  /** The scratch project a console or Watchdog thread is in is t3code's own, not a project for work (plan, 3.3). */
+  private hideScratch(projectId: string | null | undefined): void {
+    if (projectId && !this.projects.byId(projectId)?.legacy) this.projects.hide(projectId)
   }
   consoleUrl(): string { return `${this.config.publicUrl}/mcp/console/${this.config.consoleToken}` }
   /** The Watchdog's own token, derived from the console's so it never opens the console's tools. */
@@ -342,6 +358,7 @@ export class Runtime {
     this.watchdog = { threadId: launched.threadId, link: launched.link }
     this.repo.kv.set('watchdog', this.watchdog)
     const detail = await this.t3.read(launched.threadId, { limit: 1 })
+    this.hideScratch(launched.projectId ?? detail.thread.projectId)
     if (detail.thread.worktreePath) await writeMcpConfig(detail.thread.worktreePath, this.watchdogUrl())
     else this.config.log(`The Watchdog thread has no folder; add its MCP server by hand: ${MCP_SERVER_NAME} ${this.watchdogUrl()}`)
     // The setup goes only to an empty thread. A thread set up by an earlier version gets the change once, as its own message.

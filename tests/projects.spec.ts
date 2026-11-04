@@ -291,6 +291,55 @@ describe('the project registry', () => {
     expect(byKey(registry, 'Odd').baseRef).toBe('HEAD')
   })
 
+  it('denies a registered linked worktree of a denied repository, wherever the worktree folder is', async () => {
+    const ws = workspace()
+    checkout('PERSONAL/diary', ws.dir)
+    git(ws.at('PERSONAL/diary'), 'worktree', 'add', '-q', '-b', 'side', ws.at('apps/diary-side'))
+    ws.write([{ path: 'PERSONAL/diary' }, { path: 'apps/diary-side' }])
+    // Its main checkout registered too, and denied by the PERSONAL/ default: the worktree is denied, not ready.
+    const both = await ws.load(new FakeT3([project('p-diary', ws.at('PERSONAL/diary'), 'Diary'), project('p-side', ws.at('apps/diary-side'), 'Side')]))
+    expect(byKey(both, 'PERSONAL/diary')).toMatchObject({ status: 'denied' })
+    expect(byKey(both, 'apps/diary-side')).toMatchObject({ status: 'denied',
+      reason: `A linked worktree of ${ws.real('PERSONAL/diary')}, which is denied: Denied by default (PERSONAL/).` })
+    // Registered alone, it is denied by the rule on its repository's folder.
+    const alone = await ws.load(new FakeT3([project('p-side', ws.at('apps/diary-side'), 'Side')]))
+    expect(byKey(alone, 'apps/diary-side')).toMatchObject({ status: 'denied',
+      reason: `A linked worktree of ${ws.real('PERSONAL/diary')}, which is denied by default (PERSONAL/).` })
+    // An override by id that lets the registered main checkout take work lifts it for the worktree too, which folds into it.
+    ws.overrides({ 'p-diary': { access: 'named' } })
+    expect(byKey(await ws.load(new FakeT3([project('p-diary', ws.at('PERSONAL/diary'), 'Diary'), project('p-side', ws.at('apps/diary-side'), 'Side')])),
+      'apps/diary-side')).toMatchObject({ status: 'folded' })
+    // Once projects.json lets the repository's folder take work, the worktree folds into its main checkout, or works alone.
+    ws.overrides({ 'PERSONAL/diary': { access: 'named' } })
+    expect(byKey(await ws.load(new FakeT3([project('p-diary', ws.at('PERSONAL/diary'), 'Diary'), project('p-side', ws.at('apps/diary-side'), 'Side')])),
+      'apps/diary-side')).toMatchObject({ status: 'folded' })
+    expect(byKey(await ws.load(new FakeT3([project('p-side', ws.at('apps/diary-side'), 'Side')])), 'apps/diary-side')).toMatchObject({ status: 'ready' })
+  })
+
+  it('gives pr delivery from projects.json only to the legacy project with a repository', async () => {
+    const ws = workspace()
+    ws.write([])
+    const widgets = ws.at('apps/widgets')
+    ws.overrides({ [widgets]: { delivery: 'pr' } })
+    const t3 = new FakeT3([project('p-widgets', widgets, 'Widgets')])
+    expect((await ws.load(t3, { root: widgets, baseRef: 'HEAD' })).legacy()).toMatchObject({ delivery: 'branch' })
+    expect((await ws.load(t3, { root: widgets, baseRef: 'HEAD', repository: 'acme/widgets' })).legacy()).toMatchObject({ delivery: 'pr', repository: 'acme/widgets' })
+    ws.overrides({ [widgets]: { delivery: 'branch' } })
+    expect((await ws.load(t3, { root: widgets, baseRef: 'HEAD', repository: 'acme/widgets' })).legacy()).toMatchObject({ delivery: 'branch' })
+  })
+
+  it('keeps a prefix\'s describe: false for a legacy project under PERSONAL/, while it works there', async () => {
+    const ws = workspace()
+    const { root: diary } = checkout('PERSONAL/diary', ws.dir)
+    ws.write([{ path: 'PERSONAL/diary', purpose: 'Private diary.', notes: 'Private.' }])
+    const t3 = new FakeT3([project('p-diary', diary, 'Diary')])
+    const registry = await ws.load(t3, { root: diary, baseRef: 'HEAD' })
+    expect(registry.legacy()).toMatchObject({ status: 'ready', access: 'work', legacy: true, describe: false })
+    // projects.json can still allow it, by its path.
+    ws.overrides({ 'PERSONAL/diary': { describe: true } })
+    expect((await ws.load(t3, { root: diary, baseRef: 'HEAD' })).legacy()).toMatchObject({ access: 'work', describe: true })
+  })
+
   it('keeps the legacy project\'s own settings, finds it by root or id, and says why it does not resolve', async () => {
     const ws = workspace()
     const { root: archived } = checkout('ARCHIVE/legacy', ws.dir)

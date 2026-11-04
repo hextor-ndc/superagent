@@ -324,6 +324,28 @@ describe('the Router across projects (phase 3a)', () => {
       && input.triggerId === gizmos.id)).toBe(false)
   }, 15_000)
 
+  it('refuses to attach a message to a rerouted ticket, which would resume it in the project it left', async () => {
+    let target: { kind: string; ticket?: string } = { kind: 'accept' }
+    const model = routing(card => target.kind === 'accept' ? accept(card, card.triggers[0]!.text)
+      : target.kind === 'attach' ? [{ kind: 'attach', trigger_id: card.trigger_id, ticket_id: target.ticket }] : undefined)
+    const { env, call } = await open({ model: model.call })
+    const widgets = data(await call('superagent_request', { text: 'Count the gadgets', wait_seconds: 10 }))
+    expect(widgets).toMatchObject({ status: 'accepted', project: 'Widgets' })
+    await until(() => env.t3.workerThreads()[0], 'the worker thread')
+    env.made.runtime.engine.report(widgets.ticket_id as string, { state: 'ready', summary: 'Counted.' })
+    const moved = data(await call('superagent_reroute', { ticket_id: widgets.ticket_id as string, project: 'Gadgets', wait_seconds: 10 }))
+    expect(moved).toMatchObject({ stopped: { outcome: 'completed' }, filed: { status: 'accepted', project: 'Gadgets' } })
+
+    target = { kind: 'attach', ticket: widgets.ticket_id as string }
+    const more = consoleTrigger('hector', 'Also count the blue ones')
+    env.made.runtime.engine.receive(more)
+    const refused = await until(() => model.results.find(item => item.kind === 'attach'), 'the attach result')
+    expect(refused.refused).toMatch(/was rerouted to Gadgets, and its work goes on there in ticket T-/)
+    const old = env.made.runtime.repo.tickets.get(widgets.ticket_id as string)!
+    expect(old.ended).toMatchObject({ outcome: 'completed' })
+    expect(old.inputs.some(input => input.kind === 'trigger' && input.triggerId === more.id)).toBe(false)
+  }, 15_000)
+
   it('returns ignored with the reason, or pending while the Router is slow; superagent_ticket and the attention list tell the rest', async () => {
     let release!: () => void
     const gate = new Promise<void>(resolve => { release = resolve })

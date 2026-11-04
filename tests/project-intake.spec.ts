@@ -196,6 +196,41 @@ describe('the console\'s intake across projects (phase 3a)', () => {
     expect(runtime.repo.tickets.list()).toHaveLength(2)
   })
 
+  it('refuses an answer on a rerouted ticket, live or ended, so nothing is filed or resumed in the old project', async () => {
+    const { env, call } = await open()
+    const { runtime } = env.made
+    // A running ticket rerouted: an answer on it would go to Eval and be filed in Widgets again, by its inherited hint.
+    const first = data(await call('superagent_request', { text: 'Count the gadgets', wait_seconds: 10 }))
+    await until(() => env.t3.workerThreads()[0], 'the first worker thread')
+    const moved = data(await call('superagent_reroute', { ticket_id: first.short as string, project: 'Gadgets', wait_seconds: 10 }))
+    const filed = moved.filed as { ticket_id: string; short: string }
+    const origin = runtime.repo.triggers.get(runtime.repo.tickets.get(first.ticket_id as string)!.origin.triggerId)!
+    const thread = () => JSON.stringify(runtime.repo.threads.get(threadKey(origin.threads[0]!)))
+    const before = thread()
+    const refused = await call('superagent_answer', { ticket_id: first.short as string, text: 'Also count the blue ones' })
+    expect(refused.isError).toBe(true)
+    expect(JSON.stringify(refused.content)).toContain(`was rerouted to Gadgets, and its work goes on there in ticket ${filed.short}`)
+    expect(thread()).toBe(before)
+
+    // A ticket that had ended before its reroute: an answer would resume it in Widgets while the Gadgets ticket works.
+    const second = data(await call('superagent_request', { text: 'Count the widgets', wait_seconds: 10 }))
+    await until(() => env.t3.workerThreads().filter(item => item.projectId === 'p-widgets').length === 2, 'the second widgets worker thread')
+    runtime.engine.report(second.ticket_id as string, { state: 'ready', summary: 'Counted.' })
+    expect(runtime.repo.tickets.get(second.ticket_id as string)!.ended).toMatchObject({ outcome: 'completed' })
+    const rerouted = data(await call('superagent_reroute', { ticket_id: second.short as string, project: 'Gadgets', wait_seconds: 10 }))
+    expect(rerouted).toMatchObject({ stopped: { outcome: 'completed' }, filed: { status: 'accepted', project: 'Gadgets' } })
+    const assignments = runtime.repo.tickets.get(second.ticket_id as string)!.assignments.length
+    const again = await call('superagent_answer', { ticket_id: second.ticket_id as string, text: 'Count the red ones too' })
+    expect(again.isError).toBe(true)
+    expect(JSON.stringify(again.content)).toContain('was rerouted to Gadgets')
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const old = runtime.repo.tickets.get(second.ticket_id as string)!
+    expect(old.ended).toMatchObject({ outcome: 'completed' })
+    expect(old.assignments).toHaveLength(assignments)
+    // Two requests, each rerouted once: two tickets in Widgets that ended, two in Gadgets, and nothing more.
+    expect(runtime.repo.tickets.list().map(ticket => runtime.binding(ticket.id)?.key).sort()).toEqual(['Gadgets', 'Gadgets', 'Widgets', 'Widgets'])
+  })
+
   it('answers superagent_ticket for a trigger id: the ticket once there is one, else what became of the request', async () => {
     const { env, call } = await open({ config: { unnamedRequests: 'refuse' } })
     const accepted = data(await call('superagent_request', { text: 'Fix the gadget count', project: 'Gadgets', wait_seconds: 10 }))

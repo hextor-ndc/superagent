@@ -125,6 +125,9 @@ export interface ProjectBinding {
 }
 export const BINDING_PREFIX = 'ticket-project:'
 export const bindingKey = (ticketId: string): string => `${BINDING_PREFIX}${ticketId}`
+/** kv `reroute:<ticketId>`: the request `superagent_reroute` filed for a ticket in another project. */
+export interface Rerouted { triggerId: string; projectId: string; key: string }
+export const rerouteKey = (ticketId: string): string => `reroute:${ticketId}`
 
 /** The binding of a ticket to a registered project; `worktreeRoot` replaces the project's own, as the migration needs. */
 export function bindingOf(entry: ProjectEntry, ticketId: string, by: BoundBy, at: string, worktreeRoot = entry.worktreeRoot): ProjectBinding {
@@ -315,6 +318,8 @@ export class ProjectRegistry {
   private health?: Health
   private catalogueRead?: { stamp: string; value: Catalogue }
   private overridesRead?: { stamp: string; value: Record<string, ProjectOverride> }
+  /** T3 Code projects that are not the operator's, such as t3code's scratch project (`hide`). */
+  private readonly hidden = new Set<string>()
 
   private constructor(private readonly options?: ProjectRegistryOptions) {}
 
@@ -393,6 +398,15 @@ export class ProjectRegistry {
       .slice(0, 5).map(item => item.entry.key)
   }
 
+  /**
+   * Leaves a T3 Code project out of the list from now on: t3code's scratch project ("No project"), which holds the console's
+   * and the Watchdog's threads. t3code lists it once a scratch thread exists, and it is no folder for work.
+   */
+  hide(projectId: string): void {
+    this.hidden.add(projectId)
+    this.entries = this.entries.filter(entry => entry.id !== projectId)
+  }
+
   /** Reports refreshes to the Watchdog's health entries under `projects`. */
   reportTo(health: Health): void { this.health = health }
   /** Refreshes on a timer until `stop`. A registry from `single` has nothing to refresh. */
@@ -437,7 +451,7 @@ export class ProjectRegistry {
   private async build(options: ProjectRegistryOptions): Promise<{ entries: ProjectEntry[]; problem?: string }> {
     const catalogue = options.catalogue ? this.readCatalogue(options.catalogue) : undefined
     const overrides = options.projectsFile ? this.readOverrides(options.projectsFile) : {}
-    const listed = await options.t3.listProjects()
+    const listed = (await options.t3.listProjects()).filter(project => !this.hidden.has(project.id))
     return assemble({ listed, catalogue, overrides, stateDir: options.stateDir, legacy: options.legacy, log: options.log })
   }
 
@@ -531,10 +545,13 @@ async function assemble(input: AssembleInput): Promise<{ entries: ProjectEntry[]
 
   for (const draft of drafts) {
     const matched = rules.filter(rule => matches(rule, draft.project.id, draft.root)).sort(bySpecificity)
-    // The legacy project works whatever a prefix says; only an override for it by id or path can deny it.
-    for (const rule of draft.legacy ? matched.filter(item => item.kind !== 'prefix') : matched) {
-      draft.override = { ...draft.override, ...rule.override }
-      if (rule.override.access) draft.deniedBy = rule.override.access === 'deny' ? rule.key : undefined
+    // The legacy project works whatever a prefix says; only an override for it by id or path can deny it. A prefix's other
+    // fields, such as describe: false under PERSONAL/, still apply to it.
+    for (const rule of matched) {
+      const { access: _access, ...rest } = rule.override
+      const override: ProjectOverride = draft.legacy && rule.kind === 'prefix' ? rest : rule.override
+      draft.override = { ...draft.override, ...override }
+      if (override.access) draft.deniedBy = override.access === 'deny' ? rule.key : undefined
     }
     if (!draft.exists) {
       draft.status = 'missing-checkout'; draft.reason = `${draft.given} no longer exists; remove the project in T3 Code or restore the folder.`
@@ -563,7 +580,8 @@ async function assemble(input: AssembleInput): Promise<{ entries: ProjectEntry[]
     }
   }
 
-  await pool(drafts.filter(draft => !draft.status), 8, async draft => { draft.git = await gitFacts(draft.root) })
+  // Denied ones too (git only reads), so a linked worktree registered outside a denied folder is known as that repository's.
+  await pool(drafts.filter(draft => !draft.status || draft.status === 'denied'), 8, async draft => { draft.git = await gitFacts(draft.root) })
   for (const draft of drafts) {
     if (draft.status) continue
     if (!draft.git) { draft.status = 'no-git'; draft.reason = `${draft.root} is not a git checkout; workers need one.` }
@@ -574,8 +592,28 @@ async function assemble(input: AssembleInput): Promise<{ entries: ProjectEntry[]
       draft.status = 'no-git'; draft.reason = `${draft.root} is inside the git checkout ${draft.git.toplevel}, not its top level; register the top level in T3 Code.`
     }
   }
-  // A registered linked worktree whose main checkout is registered too is folded into it (phase 0, probe 3).
+  // A deny holds for the repository, not only the folder: a registered linked worktree of a repository whose main checkout
+  // is denied is denied too, since its branches and worktrees would be made there. A registered main checkout counts as its
+  // status says (an override by id can lift a prefix's deny); one not registered, by the rules on its path.
   const mainOf = (git: GitFacts) => basename(git.commonDir) === '.git' ? dirname(git.commonDir) : undefined
+  for (const draft of drafts) {
+    if (draft.status || draft.legacy || !draft.git) continue
+    const main = mainOf(draft.git)
+    if (!main || main === draft.root) continue
+    const registered = drafts.filter(other => other.root === main)
+    const owner = registered.find(other => other.status === 'denied')
+    let deniedBy: string | undefined
+    for (const rule of registered.length ? [] : rules.filter(item => item.kind !== 'id' && matches(item, undefined, main)).sort(bySpecificity)) {
+      if (rule.override.access) deniedBy = rule.override.access === 'deny' ? rule.key : undefined
+    }
+    if (owner && registered.every(other => other.status === 'denied')) {
+      draft.status = 'denied'; draft.reason = `A linked worktree of ${main}, which is denied: ${owner.reason}`
+    } else if (deniedBy) {
+      draft.status = 'denied'
+      draft.reason = `A linked worktree of ${main}, which is denied by ${input.overrides[deniedBy] ? 'projects.json' : 'default'} (${deniedBy}).`
+    }
+  }
+  // A registered linked worktree whose main checkout is registered too is folded into it (phase 0, probe 3).
   for (const draft of drafts) {
     if (draft.status || draft.legacy || !draft.git) continue
     const main = mainOf(draft.git)
@@ -594,7 +632,8 @@ async function assemble(input: AssembleInput): Promise<{ entries: ProjectEntry[]
       .sort((a, b) => b.abs.length - a.abs.length)[0]
     const title = draft.project.title?.trim() || basename(draft.root)
     const isLegacy = draft.legacy && !!legacy
-    const delivery: Delivery = isLegacy ? draft.override.delivery ?? (legacy!.repository ? 'pr' : 'branch') : 'branch'
+    // Pull requests need the repository SUPERAGENT_REPOSITORY names, so only the legacy project with one can deliver them.
+    const delivery: Delivery = isLegacy && legacy!.repository ? draft.override.delivery ?? 'pr' : 'branch'
     return {
       id: draft.project.id, key: exact?.path ?? title, title, aliases: draft.override.aliases ?? [], root: draft.root,
       ...draft.git ? { commonDir: draft.git.commonDir } : {}, ...draft.git?.defaultBranch ? { defaultBranch: draft.git.defaultBranch } : {},

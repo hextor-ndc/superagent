@@ -20,6 +20,8 @@ export interface RouterToolHost {
   projectOf?: (ticketId: string) => ProjectBinding | undefined
   /** Where an accept of these Triggers would be bound now, or why it would be refused (`Runtime.projectPreview`). */
   projectPreview?: (triggers: Trigger[]) => ProjectPreview
+  /** Why a ticket takes no more messages after `superagent_reroute`; undefined for a ticket that was not rerouted. */
+  rerouted?: (ticketId: string) => string | undefined
 }
 
 export interface RouterTool<S extends z.ZodType = z.ZodType> { name: string; description: string; schema: S; run: (args: z.infer<S>) => unknown }
@@ -205,6 +207,9 @@ function route(host: RouterToolHost, item: RouteItem) {
       return fromDecision(decision)
     }
     case 'attach': {
+      // An attach would resume a rerouted ticket that had ended, in the project it was moved out of.
+      const moved = host.rerouted?.(host.store.tickets.get(item.ticket_id!)?.id ?? item.ticket_id!)
+      if (moved) return { refused: `${moved} Attach the message to that ticket, or accept it as its own.` }
       const refused = crossProject(host, item.ticket_id!, host.store.triggers.get(item.trigger_id))
       if (refused) return { refused }
       const ticket = engine.attach(item.ticket_id!, item.trigger_id, item.note ?? undefined)
