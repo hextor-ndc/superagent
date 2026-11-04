@@ -1,5 +1,5 @@
 /**
- * Phases 1 and 2 of docs/multi-project-plan.md in the Runtime: the console's `superagent_projects`, a console-only start with
+ * Phases 1 to 3a of docs/multi-project-plan.md in the Runtime: the console's `superagent_projects`, a console-only start with
  * no project configured, the refusal of unnamed requests when no project is the default (D21), tickets that keep their
  * project across a start without one, and the Watchdog's `projects` part.
  */
@@ -43,10 +43,13 @@ describe('projects in the console', () => {
 
     const console = await mcp(`${made.base}/mcp/console/console-secret`)
     const listed = data(await console.callTool({ name: 'superagent_projects', arguments: {} }))
-    expect(listed).toMatchObject({ summary: 'no projects', total: 0, projects: [], work: expect.stringMatching(/^multi-project routing is not enabled yet, and no project is ready/) })
+    expect(listed).toMatchObject({ summary: 'no projects', total: 0, projects: [],
+      work: expect.stringMatching(/^Name the project on every superagent_request with project=<key>\. There is no default .* 0 projects are ready\./) })
     const refused = await console.callTool({ name: 'superagent_request', arguments: { text: 'Fix the README' } })
     expect(refused.isError).toBe(true)
-    expect(JSON.stringify(refused.content)).toContain('multi-project routing is not enabled yet')
+    expect(JSON.stringify(refused.content)).toContain('Name the project: superagent_request with project=<key>')
+    const unknown = await console.callTool({ name: 'superagent_request', arguments: { text: 'Fix the README', project: 'widgets' } })
+    expect(JSON.stringify(unknown.content)).toContain('No project widgets in T3 Code.')
     expect(made.runtime.repo.threads.list()).toEqual([])
     expect(made.runtime.repo.tickets.list()).toEqual([])
     await console.close()
@@ -80,8 +83,8 @@ describe('projects in the console', () => {
 
     const many = await console.callTool({ name: 'superagent_request', arguments: { text: 'Fix the README' } })
     expect(many.isError).toBe(true)
-    expect(JSON.stringify(many.content)).toContain('multi-project routing is not enabled yet: 2 projects are ready (Gadgets, widgets). '
-      + 'Set SUPERAGENT_PROJECT_ROOT to the project unnamed requests go to')
+    expect(JSON.stringify(many.content)).toContain('Name the project: superagent_request with project=<key> (superagent_projects lists them). '
+      + 'No project is the default: no legacy project is set and 2 projects are ready (Gadgets, widgets).')
     expect(made.runtime.repo.tickets.list()).toEqual([])
 
     expect(await call('superagent_projects', { query: 'widgets' })).toMatchObject({ total: 1, projects: [{ key: 'widgets' }] })
@@ -106,7 +109,7 @@ describe('projects in the console', () => {
     made.runtime.engine.receive(other)
     const decision = await until(() => made!.runtime.repo.decisions.byThread(threadKey(other.threads[0]!))[0], 'the decision')
     expect(decision).toMatchObject({ kind: 'ignore' })
-    expect(JSON.stringify(decision)).toContain('An accept needs a project, and none is the default')
+    expect(JSON.stringify(decision)).toContain('Name the project: superagent_request with project=<key>')
     expect(made.runtime.repo.tickets.list()).toEqual([])
     expect(made.runtime.repo.kv.list('ticket-project:')).toEqual([])
     await console.close()
@@ -125,7 +128,8 @@ describe('projects in the console', () => {
     await console.callTool({ name: 'superagent_request', arguments: { text: 'Fix the typo in the README heading' } })
     await until(() => t3.workerThreads()[0], 'the worker thread')
     const listed = data(await console.callTool({ name: 'superagent_projects', arguments: {} }))
-    expect(listed).toMatchObject({ summary: '1 ready', work: 'Requests go to widgets, the project SUPERAGENT_PROJECT_ROOT names; multi-project routing is not enabled yet.',
+    expect(listed).toMatchObject({ summary: '1 ready', work: 'Name the project on every superagent_request with project=<key>. Requests that name none go '
+      + 'to widgets, the default (the project SUPERAGENT_PROJECT_ROOT names).',
       projects: [{ key: 'widgets', legacy: true, access: 'work', delivery: 'pr', open_tickets: 1, last_ticket: expect.any(String), worktree_root: join(place.dir, 'worktrees') }] })
     // Also after a refresh, which makes new entries.
     expect(data(await console.callTool({ name: 'superagent_projects', arguments: { refresh: true } }))).toMatchObject({ projects: [{ key: 'widgets', open_tickets: 1 }] })
@@ -142,9 +146,10 @@ describe('projects in the console', () => {
     made = await consoleOnly(t3, dir)
     const console = await mcp(`${made.base}/mcp/console/console-secret`)
     expect(data(await console.callTool({ name: 'superagent_projects', arguments: {} }))).toMatchObject({
-      work: 'Requests go to widgets, the only ready project; multi-project routing is not enabled yet.' })
+      work: 'Name the project on every superagent_request with project=<key>. Requests that name none go to widgets, the default (the only ready project).' })
     const accepted = await console.callTool({ name: 'superagent_request', arguments: { text: 'Fix the README' } })
     expect(accepted.isError).toBeFalsy()
+    expect(data(accepted)).toMatchObject({ status: 'accepted', filed_in: 'widgets, the default for requests that name no project', project: 'widgets' })
     const thread = await until(() => t3.workerThreads()[0], 'the worker thread')
     const ticket = made.runtime.repo.tickets.list()[0]!
     expect(made.runtime.binding(ticket.id)).toMatchObject({ projectId: 'p-widgets', key: 'widgets', by: 'single', delivery: 'branch',

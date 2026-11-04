@@ -14,13 +14,15 @@
  *   answer (it is the answer) stays with the worker. The stop is kept in the store until the Engine took it, so a restart
  *   or a failed attempt does not lose it;
  * - proactive (inferred) candidates are ignored, so nothing proactive happens without the real Router;
- * - a request no project can take now (the legacy project's checkout is gone, say) is ignored with the reason, as binding it
- *   would fail;
+ * - a request no project can take now is ignored with the reason, as binding it would fail: one that names no project when
+ *   there is no default (or unnamed requests are refused), one whose project is not ready, or one whose legacy project's
+ *   checkout is gone. It goes to the project it names, else to the default one, by the same rules as its binding;
  * - a worker's `ready` report goes back to the requester as the result, and its question as the attention message.
  */
 import { liveTicket, UserError, type Candidate, type EngineForMainSession, type Ticket, type Trigger, type WorkerReport }
   from '../../vendor/dsh/src/core/index.ts'
 import type { Router } from '../router/claude-router.ts'
+import { NAME_THE_PROJECT } from './projects.ts'
 import type { Jobs } from './jobs.ts'
 import type { Store } from './store.ts'
 
@@ -63,7 +65,7 @@ export class InterimRouter implements Router {
       // The rules cannot judge a project. An accept no project can take would throw in the Engine's prepareTicket and fail this
       // job on every try, with nobody told, so it is ignored with the reason (plan, 3.2).
       const refused = this.projectRefusal(candidate.triggers)
-      if (refused) return ignore(`No project can take this request: ${refused}`)
+      if (refused) return ignore(refused.startsWith(NAME_THE_PROJECT) ? refused : `No project can take this request: ${refused}`)
       engine.decide(trigger.id, { kind: 'accept', evalId: candidate.evalId, title: titleOf(trigger), scope: scopeOf(fresh),
         reason: 'Explicit request from an allowed person.', name: titleOf(trigger) })
     })

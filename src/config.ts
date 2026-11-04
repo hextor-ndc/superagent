@@ -36,6 +36,11 @@ export interface Config {
   catalogue?: string
   /** The operator's per-project overrides; `<stateDir>/projects.json` unless `SUPERAGENT_PROJECTS_FILE` moves it. Optional. */
   projectsFile: string
+  /**
+   * `SUPERAGENT_UNNAMED_REQUESTS`: what a console request that names no project gets. `default` (the default) files it in the
+   * legacy project, or in the one ready project when none is set, and says so; `refuse` refuses it (plan, open question 1).
+   */
+  unnamedRequests?: 'default' | 'refuse'
   port: number
   /** How t3code's agents reach this service; workers' MCP URLs start with it. */
   publicUrl: string
@@ -81,6 +86,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...legacy ? { legacy } : {},
     ...env.SUPERAGENT_CATALOGUE?.trim() ? { catalogue: resolve(env.SUPERAGENT_CATALOGUE.trim()) } : {},
     projectsFile: resolve(env.SUPERAGENT_PROJECTS_FILE?.trim() || join(state, 'projects.json')),
+    unnamedRequests: oneOf(env.SUPERAGENT_UNNAMED_REQUESTS, ['default', 'refuse'] as const, 'default'),
     port,
     publicUrl: (env.SUPERAGENT_PUBLIC_URL ?? `http://127.0.0.1:${port}`).replace(/\/+$/, ''),
     consoleToken: env.SUPERAGENT_CONSOLE_TOKEN?.trim() ?? '',

@@ -20,6 +20,7 @@ import type { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { vi } from 'vitest'
 import { latestAssignment, waitsForPerson, type Ticket, type TicketInput } from '../../vendor/dsh/src/core/index.ts'
 import { SettingsSchema } from '../../vendor/dsh/src/policy.ts'
+import { ProjectRegistry } from '../../src/app/projects.ts'
 import { shortId } from '../../src/executor/render.ts'
 import { ClaudeRouter } from '../../src/router/claude-router.ts'
 import type { LaunchInput, LaunchResult, PendingRequest, ProjectSummary, ScratchLaunchInput, SendResult, T3Client, T3Status, ThreadRead,
@@ -29,7 +30,7 @@ import { FakeT3 } from '../fake-t3.ts'
 import { checkout, harness, mcp, removeCheckout, type Harness, type Timing } from '../harness.ts'
 import { workloadRouter, type RouterCall } from './router-script.ts'
 import { labelsOf, newWorkerState, runWorkerTurn, type TurnResult, type WorkerState } from './worker-plan.mjs'
-import { MINUTE, PEOPLE, POLL_MS, type Anchor, type Workload, type WorkloadEvent } from './workload.ts'
+import { MINUTE, PEOPLE, POLL_MS, projectTag, type Anchor, type Workload, type WorkloadEvent } from './workload.ts'
 
 /** A worker thread as the checks see it: its link and the messages the super agent put in it. */
 export interface SimThread { id: string; link: string; messages: { text: string; clientRequestId: string }[] }
@@ -54,8 +55,11 @@ export interface Workers {
    * less often, and the executor reports a turn end a millisecond after the reads recorded with it, which needs a clock that moves.
    */
   readonly realClock: boolean
-  /** The t3code project and the checkout the Runtime works in. */
-  open(): Promise<{ project: string; dir: string; root: string }>
+  /**
+   * The t3code project and the checkout the Runtime works in; with `projects`, the registry of every project the Runtime may
+   * work in, that one being the legacy project.
+   */
+  open(): Promise<{ project: string; dir: string; root: string; projects?: ProjectRegistry }>
   /** Plays or follows worker turns; what is still going on there, or undefined once the workers are quiet. */
   step(sim: Simulation): Promise<string | undefined>
   /** Whether a thread's latest run is active (it holds a worker slot), as last seen. */
@@ -115,7 +119,9 @@ export class Simulation {
   private real = 0
   private ticker?: ReturnType<typeof setInterval>
 
-  constructor(readonly options: SimulationOptions) { this.workers = options.workers ?? new MemoryWorkers() }
+  constructor(readonly options: SimulationOptions) {
+    this.workers = options.workers ?? new MemoryWorkers([...new Set(options.workload.requests.flatMap(request => request.project ?? []))])
+  }
   /** The t3code side's calls and threads, for the checks. */
   get t3(): SimT3 { return this.workers.t3 }
 
@@ -124,7 +130,7 @@ export class Simulation {
     this.origin = Date.now()
     this.real = performance.now()
     if (this.workers.realClock) this.ticker = setInterval(() => this.tick(), 1)
-    const { project, ...place } = await this.workers.open()
+    const { project, projects, ...place } = await this.workers.open()
     const claude = this.options.router === 'claude'
     const rules = SettingsSchema.parse({}).policy.rules.filter(rule => rule.enabled).map(rule => rule.id)
     const model = claude ? workloadRouter(() => this.clock, rules) : undefined
@@ -136,7 +142,8 @@ export class Simulation {
       // proactive candidate, so observe mode has proactive work to judge from GitHub. The rules Router keeps the defaults.
       github: { login: PEOPLE.agent, allowed: [...PEOPLE.allowed], gh: 'gh', pollMs: 3_600_000,
         ...claude ? { admission: { comments: { unlistedAddressed: 'inferred' }, issues: { unlistedAddressed: 'inferred' } } } : {} },
-    }, { gh: this.github.gh, project, ...this.workers.timing ? { timing: this.workers.timing } : {}, ...model ? { model: model.call } : {} })
+    }, { gh: this.github.gh, project, ...projects ? { projects } : {}, ...this.workers.timing ? { timing: this.workers.timing } : {},
+      ...model ? { model: model.call } : {} })
     this.console = await mcp(`${this.made.base}/mcp/console/${this.made.runtime.config.consoleToken}`)
     await this.made.runtime.github!.poll()
   }
@@ -267,7 +274,12 @@ export class Simulation {
     }
   }
   private async applyOther(event: WorkloadEvent): Promise<void> {
-    if (event.kind === 'request') await this.consoleCall('superagent_request', { text: event.text })
+    if (event.kind === 'request') {
+      // wait_seconds 0 returns at once, as the tool did before it waited for the decision: waiting would hold the simulated clock
+      // and the other events of the batch for the Router's turn. The properties check where each request went.
+      const project = projectTag(event.text)
+      await this.consoleCall('superagent_request', { text: event.text, ...project ? { project } : {}, wait_seconds: 0 })
+    }
     else if (event.kind === 'stop' || event.kind === 'answer') {
       const ticket = this.ticketOf(event.request)
       if (!ticket) { this.consoleErrors.push(`${event.id}: no ticket for ${event.request}`); return }
@@ -375,20 +387,30 @@ export class SlotT3 extends FakeT3 implements SimT3 {
 interface Worker { threadId: string; client: Client; state: WorkerState; seen: number; finish: boolean; holding: boolean
   call: (name: string, args: Record<string, unknown>) => Promise<unknown> }
 
-/** Tiers A and B: FakeT3, with each worker played here; a turn that does not hold ends its run. */
+/**
+ * Tiers A and B: FakeT3, with each worker played here; a turn that does not hold ends its run. Besides the legacy project,
+ * `widgets`, each project the workload's requests name is a checkout of its own beside it, registered as `project-<key>`.
+ * FakeT3 checks every launch's project id and worktree as t3code does (`checkWorktrees`).
+ */
 export class MemoryWorkers implements Workers {
-  // Off, as before: the project's root is set only in open() (docs/multi-project-plan.md, phase 0).
-  readonly t3 = new SlotT3([{ id: 'project-1', workspaceRoot: '' }], { checkWorktrees: false })
+  readonly t3 = new SlotT3([{ id: 'project-1', workspaceRoot: '', title: 'widgets' }], { checkWorktrees: true })
   readonly pauseMs = 3
   readonly settleMs = 20_000
   readonly realClock = false
   private readonly workers = new Map<string, Worker>()
   private place?: { dir: string; root: string }
 
+  constructor(private readonly extra: readonly string[] = []) {}
+
   async open() {
     const place = this.place = checkout()
     this.t3.projects[0]!.workspaceRoot = place.root
-    return { project: 'project-1', ...place }
+    if (!this.extra.length) return { project: 'project-1', ...place }
+    for (const key of this.extra) this.t3.addProject({ id: `project-${key}`, workspaceRoot: checkout(key, place.dir).root, title: key })
+    // The legacy project as the harness configures it, and the others as main.ts reads them from T3 Code.
+    const projects = await ProjectRegistry.load({ t3: this.t3, stateDir: join(place.dir, 'state'), projectsFile: join(place.dir, 'state', 'projects.json'),
+      legacy: { root: place.root, worktreeRoot: join(place.dir, 'worktrees'), baseRef: 'HEAD', repository: PEOPLE.repository } })
+    return { project: 'project-1', ...place, projects }
   }
   active(threadId: string): boolean { return this.t3.threads.get(threadId)?.runs.at(-1)?.status === 'running' }
   running(): number { return this.t3.runningWorkers() }

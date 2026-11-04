@@ -101,11 +101,11 @@ export interface T3ExecutorOptions {
 }
 
 /** Why a launch of a Ticket that has no binding fails: there is no default at launch time (D3). */
-export const NO_BINDING = 'No project is recorded for this ticket, and a launch never picks one: stop it and request the work again.'
+export const NO_BINDING = 'No project is recorded for this ticket, and a launch never picks one: use superagent_reroute to file its request in a project.'
 /** Why a new thread cannot launch in a project T3 Code no longer has where the Ticket was bound. */
 export const unregistered = (binding: Pick<ProjectBinding, 'key' | 'root'>): string => `Project ${binding.key} is no longer registered in T3 Code at `
-  + `${binding.root}. A ticket keeps the project it was accepted into, so a retry fails the same way: stop it and request the work again, `
-  + 'so it is filed in the project\'s current registration.'
+  + `${binding.root}. A ticket keeps the project it was accepted into, so a retry fails the same way: use superagent_reroute to file this `
+  + 'request in the project\'s current registration.'
 
 /** How many times a worker whose turn failed is told to go on before its Ticket is reported failed, as in the prototype. */
 const CONTINUATIONS = 3

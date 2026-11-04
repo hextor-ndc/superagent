@@ -25,6 +25,10 @@
  * exercises the Router's batching. A ticket's follow-ups, stop and CI come at offsets after its worker acknowledges it, its
  * answer after its question, and its merge after it reports ready (`When.anchor`), so they land while the ticket is live.
  *
+ * Console requests can name a T3 Code project (`projects`, by request label): their text then ends with a `{project:<key>}`
+ * tag, which the driver passes to `superagent_request` and the scripted Router checks against the card's `project_hint`
+ * (docs/multi-project-plan.md, phase 3a). Without it every request goes to the one project, as before.
+ *
  * Every message carries its label in brackets, in the style of the prototype's benchmark case (`[W1-a]`): `R07` a request,
  * `R07-f2` a follow-up, `R07-f2e` its edit, `R07-s` a stop, `R07-a` an answer, `R07-r1` a review, `R07-p` a comment after a
  * stop, `P03` proactive, `U03` unauthorized, `C114` chatter, `B012` CI. tests/workload/worker-plan.mjs reads the same labels.
@@ -80,6 +84,8 @@ export interface RequestSpec {
   answer?: 'console' | 'github'
   /** How the ticket ends; undefined while it stays open (a pull request nobody merged waits in `person/review`). */
   outcome?: 'completed' | 'merged' | 'closed' | 'stopped'
+  /** The project a console request names, by key; undefined for the default one. */
+  project?: string
 }
 
 export interface Workload {
@@ -131,7 +137,14 @@ const DESTRUCTIVE = ['delete the release branch', 'give me admin on this reposit
 const TYPOS = [['footer', 'Copyrigth'], ['pricing page', 'recieve'], ['signup form', 'adress'], ['docs index', 'occured'], ['error banner', 'Teh'],
   ['settings header', 'Prefrences']]
 
-export function makeWorkload(seed = 1, scale = 1): Workload {
+/** The project a request's text names with a `{project:<key>}` tag, if any. */
+export function projectTag(text: string): string | undefined { return /\{project:([^}]+)\}/.exec(text)?.[1]?.trim() || undefined }
+
+/**
+ * @param projects - console request labels and the project key each names; only console requests can name one. The
+ *   generator's draws do not change with it, so a seed gives the same times, people and wording either way.
+ */
+export function makeWorkload(seed = 1, scale = 1, projects: Readonly<Record<string, string>> = {}): Workload {
   const random = prng(seed)
   const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)]!
   const between = (from: number, to: number) => from + random() * (to - from)
@@ -211,12 +224,15 @@ export function makeWorkload(seed = 1, scale = 1): Workload {
       spec.text = `@${PEOPLE.agent} [${label}] please fix ${topic} here. ${planText}`
       add({ kind: 'comment', category: 'request', label, when: at(time), number: spec.thread, login, body: spec.text })
     } else if (role.via === 'console') {
-      spec.text = `[${label}] Fix ${topic}. ${planText}`
+      const project = projects[label]
+      spec.text = `[${label}] Fix ${topic}. ${planText}${project ? ` {project:${project}}` : ''}`
+      if (project) spec.project = project
       add({ kind: 'request', category: 'request', label, when: at(time), text: spec.text })
     }
     requests.push(Object.assign(spec, { requester: login }))
   })
   const spec = (label: string) => requests.find(item => item.label === label)!
+  for (const label of Object.keys(projects)) if (requests.find(item => item.label === label)?.via !== 'console') throw new Error(`${label} is not a console request`)
   const requester = (label: string) => (spec(label) as RequestSpec & { requester: string }).requester
 
   // R20 arrives on R05's Issue as a separate request, which R05's worker hands back.

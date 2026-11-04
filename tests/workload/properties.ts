@@ -4,7 +4,8 @@
  * (Tier B, the rules router), both in tests/workload/acceptance.spec.ts, and 7.4 (Tier C, against a real t3code, in
  * tests/live/workload.spec.ts). The checks: exactly one ticket per request, follow-ups delivered once to the right ticket,
  * nothing proactive launched, nothing sent twice, stops honoured, results relayed with links, questions answered once, worker
- * slots respected. The paper's metrics are logged, not gated.
+ * slots respected, and every worker launched in the project its request names, else in the default one. The paper's metrics
+ * are logged, not gated.
  */
 import { afterAll, beforeAll, expect, it } from 'vitest'
 import { key, readUntil, type Decision, type Ticket } from '../../vendor/dsh/src/core/index.ts'
@@ -116,6 +117,33 @@ export function acceptance({ name, workload, router, maxWorkers: MAX_WORKERS, pl
     expect(sim.handbacks).toEqual([{ from: 'R05', label: 'R20' }])
     expect(hits('R20').R05).toBe(1)
     expect(sim.threadOf(ticket('R20'))!.messages[0]!.text).toContain('[R20]')
+  })
+
+  // docs/multi-project-plan.md, phase 3a: a request that names a project (its `{project:<key>}` tag) runs there, every other one
+  // in the legacy project, and its binding says the same, so a restart cannot move it.
+  it('launches each worker in the project its request names, else in the default one', () => {
+    const legacy = runtime().projects.legacy()?.id
+    expect(legacy).toBeDefined()
+    const launches = sim.t3.calls.filter(call => call.tool === 't3_thread_launch' && !(call.args as { scratch?: boolean }).scratch)
+    expect(launches.length).toBeGreaterThan(0)
+    const seen = new Map<string, string>()
+    for (const call of launches) {
+      const { projectId, clientRequestId } = call.args as { projectId: string; clientRequestId: string }
+      const assignment = clientRequestId.replace(/^launch:/, '')
+      const owner = tickets().find(item => item.assignments.some(each => each.id === assignment))
+      expect(owner, clientRequestId).toBeDefined()
+      const label = sim.labelOf(owner!) ?? owner!.id
+      const named = workload.requests.find(request => request.label === label)?.project
+      const expected = named ? runtime().projects.resolve(named).found?.id : legacy
+      expect({ label, projectId }).toEqual({ label, projectId: expected })
+      expect({ label, bound: runtime().binding(owner!.id)?.projectId }).toEqual({ label, bound: expected })
+      seen.set(label, projectId)
+    }
+    for (const request of workload.requests.filter(item => item.project)) {
+      const id = runtime().projects.resolve(request.project!).found?.id
+      expect(id, request.label).not.toBe(legacy)
+      expect(seen.get(request.label), request.label).toBe(id)
+    }
   })
 
   it('never launches proactive work in observe mode', () => {

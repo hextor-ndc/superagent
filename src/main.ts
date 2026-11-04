@@ -50,8 +50,9 @@ async function run(): Promise<void> {
   runtime.start()
   await runtime.ensureConsole()
   await runtime.ensureWatchdog().catch(error => log(`starting the Watchdog failed: ${error instanceof Error ? error.message : String(error)}`))
+  const unnamed = config.unnamedRequests === 'refuse' ? undefined : runtime.projectPreview([{ source: 'console', meta: {} }])
   log(`ready: router ${config.router.kind}${config.github ? `, GitHub ${runtime.workProject?.repository} as ${config.github.login}` : ''}; `
-    + `unnamed requests go to ${runtime.workProject?.key ?? (runtime.requestRefusal() ? 'no project (they are refused)' : runtime.projects.ready()[0]!.key)}; `
+    + `unnamed requests go to ${unnamed && !('refused' in unnamed) ? unnamed.key : 'no project (they are refused)'}; `
     + `console ${runtime.console?.link ?? runtime.console?.threadId}, panel ${runtime.panelUrl()}`)
 
   const shutdown = async () => {

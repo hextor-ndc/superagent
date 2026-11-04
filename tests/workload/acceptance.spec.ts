@@ -12,7 +12,8 @@ import { makeWorkload, type Workload } from './workload.ts'
 /** `WORKLOAD_SEED` plays another seed's workload; `npm test` plays seed 1. */
 const SEED = Number(process.env.WORKLOAD_SEED ?? 1)
 const MAX_WORKERS = 3
-const workload: Workload = makeWorkload(SEED, 1)
+/** R16, a console request, names a second project, so the workload runs in two (docs/multi-project-plan.md, phase 3a). */
+const workload: Workload = makeWorkload(SEED, 1, { R16: 'gadgets' })
 const tier = (router: 'claude' | 'rules') =>
   acceptance({ name: router, workload, router, maxWorkers: MAX_WORKERS, play: () => simulate({ workload, router, maxWorkers: MAX_WORKERS }) })
 
@@ -24,6 +25,11 @@ describe('the workload generator', () => {
   it('is pure: a seed gives the same workload, another seed a different one', () => {
     expect(JSON.stringify(makeWorkload(SEED).events)).toBe(JSON.stringify(makeWorkload(SEED).events))
     expect(JSON.stringify(makeWorkload(SEED + 1).events)).not.toBe(JSON.stringify(makeWorkload(SEED).events))
+    // A named project only adds its tag to that request's text.
+    const tagged = (events: Workload['events']) => JSON.stringify(events).replace(' {project:gadgets}', '')
+    expect(tagged(workload.events)).toBe(JSON.stringify(makeWorkload(SEED).events))
+    expect(workload.requests.find(request => request.label === 'R16')).toMatchObject({ project: 'gadgets', text: expect.stringMatching(/ \{project:gadgets\}$/) })
+    expect(() => makeWorkload(SEED, 1, { R01: 'gadgets' })).toThrow('R01 is not a console request')
     expect(workload.requests).toHaveLength(20)
     expect(workload.counts).toMatchObject({ request: 20, followup: 30, stop: 4, answer: 4, review: 16, ci: 40, unauthorized: 10, proactive: 6 })
   })

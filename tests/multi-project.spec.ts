@@ -14,7 +14,7 @@ import { createServer } from 'node:net'
 import { join } from 'node:path'
 import type Anthropic from '@anthropic-ai/sdk'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { threadKey, type Trigger } from '../vendor/dsh/src/core/index.ts'
+import { threadKey } from '../vendor/dsh/src/core/index.ts'
 import { consoleTrigger } from '../src/app/console-source.ts'
 import { SCHEMA_KEY } from '../src/app/migrate-projects.ts'
 import { ProjectRegistry, resolveProject, type ProjectBinding } from '../src/app/projects.ts'
@@ -30,55 +30,9 @@ import type { ModelCall } from '../src/router/claude-router.ts'
 import { routerInstructions } from '../src/router/prompt.ts'
 import { T3Error } from '../src/t3/client.ts'
 import { FakeT3 } from './fake-t3.ts'
-import { checkout, data, git, harness, mcp, until, type Harness, type Timing } from './harness.ts'
+import { checkout, data, git, harness, mcp, until, type Harness } from './harness.ts'
+import { commit, failure, fast, named, setup, workerLaunches, worktreesOf } from './two-projects.ts'
 
-const commit = (cwd: string, file: string, text: string, message = file) => {
-  writeFileSync(join(cwd, file), text)
-  git(cwd, 'add', file)
-  git(cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', message)
-  return git(cwd, 'rev-parse', 'HEAD')
-}
-const worktreesOf = (root: string) => git(root, 'worktree', 'list', '--porcelain').split('\n')
-  .filter(line => line.startsWith('worktree ')).map(line => line.slice('worktree '.length))
-/** A console request that names its project, as `superagent_request` will from phase 3a; set on the trigger by the test. */
-const named = (text: string, project: string): Trigger => {
-  const trigger = consoleTrigger('hector', text)
-  return { ...trigger, meta: { ...trigger.meta, project, projectBy: 'operator' } }
-}
-const workerLaunches = (t3: FakeT3) => t3.calls.filter(call => call.tool === 't3_thread_launch' && !(call.args as { scratch?: boolean }).scratch)
-const failure = (made: Harness, ticketId: string) => {
-  const ticket = made.runtime.repo.tickets.get(ticketId)
-  return ticket?.assignments.flatMap(item => item.report?.state === 'failed' ? [item.report.summary] : []).at(-1)
-}
-const fast: Timing = { waitMs: 10, idlePollMs: 10, continueAfterMs: 0, launchRetryMs: 20 }
-
-interface Setup {
-  dir: string; widgets: string; gadgets: string; t3: FakeT3; made: Harness
-  /** The ticket a trigger made, once it exists. */
-  ticketOf(trigger: Trigger): Promise<string>
-}
-/**
- * widgets and gadgets registered in a FakeT3, a registry loaded as main.ts loads it, and a harness on them. `legacy` makes
- * widgets the legacy project (the default); `projects` is written as projects.json first.
- */
-async function setup(options: { legacy?: Partial<LegacyProject> | false; projects?: Record<string, unknown>; database?: string; dir?: string
-  t3?: FakeT3; timing?: Timing; config?: Partial<Config>; model?: ModelCall } = {}): Promise<Setup> {
-  const place = options.dir ? { dir: options.dir, root: join(options.dir, 'widgets') } : checkout('widgets')
-  const dir = place.dir, widgets = place.root, gadgets = join(dir, 'gadgets')
-  if (!options.dir) checkout('gadgets', dir)
-  const t3 = options.t3 ?? new FakeT3([{ id: 'p-widgets', workspaceRoot: widgets, title: 'Widgets' }, { id: 'p-gadgets', workspaceRoot: gadgets, title: 'Gadgets' }],
-    { checkWorktrees: true })
-  const stateDir = join(dir, 'state')
-  if (options.projects) { mkdirSync(stateDir, { recursive: true }); writeFileSync(join(stateDir, 'projects.json'), JSON.stringify(options.projects)) }
-  const legacy: LegacyProject | undefined = options.legacy === false ? undefined
-    : { root: widgets, worktreeRoot: join(dir, 'worktrees'), baseRef: 'HEAD', ...options.legacy }
-  const projects = await ProjectRegistry.load({ t3, stateDir, legacy, projectsFile: join(stateDir, 'projects.json') })
-  const made = await harness(t3, place, options.database ?? ':memory:', { legacy, ...options.config },
-    { projects, project: 'p-widgets', timing: options.timing ?? fast, ...options.model ? { model: options.model } : {} })
-  const ticketOf = (trigger: Trigger) => until(() => made.runtime.repo.tickets.list().find(ticket => ticket.origin.triggerId === trigger.id)?.id,
-    `the ticket of ${trigger.text}`)
-  return { dir, widgets, gadgets, t3, made, ticketOf }
-}
 
 describe('tickets bound to their project', () => {
   let made: Harness | undefined
@@ -144,19 +98,19 @@ describe('tickets bound to their project', () => {
     // The console refuses it before anything is stored.
     const console = await mcp(`${made.base}/mcp/console/console-secret`)
     const refused = await console.callTool({ name: 'superagent_request', arguments: { text: 'Tidy up' } })
-    expect(JSON.stringify(refused.content)).toContain('multi-project routing is not enabled yet: 2 projects are ready')
+    expect(JSON.stringify(refused.content)).toContain('No project is the default: no legacy project is set and 2 projects are ready')
     await console.close()
     // One that reaches the rules router another way is ignored with the reason.
     const ignored = consoleTrigger('hector', 'Tidy up')
     made.runtime.engine.receive(ignored)
     const decision = await until(() => made!.runtime.repo.decisions.byThread(threadKey(ignored.threads[0]!))[0], 'the decision')
     expect(decision).toMatchObject({ kind: 'ignore' })
-    expect(JSON.stringify(decision)).toContain('An accept needs a project, and none is the default')
+    expect(JSON.stringify(decision)).toContain('Name the project: superagent_request with project=<key>')
     // An accept that reaches the Engine anyway, as from a Router that does not ask first, is rolled back at its binding.
     vi.spyOn(made.runtime, 'projectRefusal').mockReturnValue(undefined)
     const trigger = consoleTrigger('hector', 'Tidy up')
     made.runtime.engine.receive(trigger)
-    await until(() => made!.errors.some(error => error.includes('An accept needs a project, and none is the default')), 'the refused accept')
+    await until(() => made!.errors.some(error => error.includes('No project is the default')), 'the refused accept')
     expect(made.runtime.repo.tickets.list()).toEqual([])
     expect(made.runtime.repo.decisions.byThread(threadKey(trigger.threads[0]!))).toEqual([])
     expect(made.runtime.repo.kv.list('ticket-project:')).toEqual([])
@@ -810,7 +764,7 @@ describe('project rules without a Runtime', () => {
     expect(() => pick(withLegacy, [meta()], 'p-gadgets')).toThrow('A Router choice of project is not enabled')
     expect(() => pick(withLegacy, [meta('p-widgets', 'operator')], 'p-gadgets')).toThrow('The request named p-widgets, and the route chose p-gadgets.')
     expect(() => pick(withLegacy, [meta('gizmos', 'operator')])).toThrow('No project gizmos in T3 Code')
-    expect(() => pick(without, [meta()])).toThrow('An accept needs a project, and none is the default: no legacy project is set and 2 projects are ready (Gadgets, Widgets)')
+    expect(() => pick(without, [meta()])).toThrow('No project is the default: no legacy project is set and 2 projects are ready (Gadgets, Widgets)')
     t3.removeProject('p-gadgets')
     await without.refresh()
     expect(pick(without, [meta()])).toEqual({ key: 'Widgets', by: 'single' })

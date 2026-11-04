@@ -3,8 +3,8 @@
  * t3code runs the workers. Holds no domain rules of its own.
  */
 import { createHash, randomBytes } from 'node:crypto'
-import { Engine, followupOwners, latestReport, liveTicket, threadKey, ticketStage, type DomainEvent, type SourceScope, type Ticket, type Trigger }
-  from '../../vendor/dsh/src/core/index.ts'
+import { Engine, followupOwners, latestReport, liveTicket, reasonText, threadKey, ticketStage, type DomainEvent, type SourceScope, type Ticket,
+  type Trigger } from '../../vendor/dsh/src/core/index.ts'
 import { SettingsSchema, settingsPolicy, type Settings } from '../../vendor/dsh/src/policy.ts'
 import type { Config } from '../config.ts'
 import { T3Executor, type T3ExecutorOptions, type TicketThread } from '../executor/t3-executor.ts'
@@ -19,12 +19,15 @@ import { Jobs } from './jobs.ts'
 import { StoredOutbox } from './outbox.ts'
 import { Health } from './health.ts'
 import { migrateProjects, SCHEMA_KEY, type ProjectsSchema } from './migrate-projects.ts'
-import { BINDING_PREFIX, bindingKey, bindingOf, ProjectRegistry, resolveProject, type ProjectBinding, type ProjectEntry } from './projects.ts'
+import { BINDING_PREFIX, bindingKey, bindingOf, deniedProject, ProjectRegistry, resolveProject, type BoundBy, type ProjectBinding, type ProjectEntry,
+  type ProjectRules } from './projects.ts'
 import { Store } from './store.ts'
 
 export interface TicketView {
   id: string; short: string; title: string; stage: string; question?: string; summary?: string; link?: string
   outcome?: string; updatedAt: string; source: string
+  /** The project the ticket was accepted into, from its binding; absent only for a ticket with no binding, which never launches. */
+  project?: { id: string; key: string; title: string }
   /**
    * What the worker's t3code thread waits on a person for. Approvals are answered in T3 Code only; questions also through
    * `superagent_answer`. While there are any, an open Ticket's stage is `person/approve` or `person/question`.
@@ -44,6 +47,17 @@ export interface ReviewItem {
   /** To run once the branch is merged, or to discard it; `git branch -d` refuses a branch that is not merged. */
   cleanup: string[]
 }
+
+/**
+ * A console request the Router or the rules ignored, for the attention list (D18): the core sends nothing for an ignore, so
+ * without this list a request that went nowhere would wait unseen.
+ */
+export interface IgnoredRequest { trigger_id: string; text: string; reason: string; at: string; project?: string }
+/** How long an ignored console request stays in the attention list. */
+export const IGNORED_FOR_MS = 24 * 60 * 60_000
+
+/** Where a card or a tool says a request would go: the project its accept would bind to, or why it would be refused. */
+export type ProjectPreview = { id: string; key: string; title: string; by: BoundBy } | { refused: string }
 
 /** Timing for the executor and for the look at the Watchdog thread; tests make them short. */
 export type RuntimeTiming = Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs' | 'pendingCheckMs' | 'projectsMaxAgeMs' | 'launchRetryMs'> & {
@@ -116,14 +130,17 @@ export class Runtime {
     this.console = this.repo.kv.get('console')
     this.watchdog = this.repo.kv.get('watchdog')
     if (config.github && work?.repository) {
-      this.github = new GithubSource({ gh: deps.gh ?? ghCli(config.github.gh), repository: work.repository, login: config.github.login,
+      this.github = new GithubSource({ gh: deps.gh ?? ghCli(config.github.gh), repository: work.repository,
+        project: () => this.projects.configuredLegacy()?.id, login: config.github.login,
         engine: () => this.engine, store: this.repo, pollMs: config.github.pollMs, log, health: this.health,
         // Unaddressed messages can only become candidates while proactive work is on, so with it off they are not read at all.
         observe: this.settings.eval.mode === 'off' ? [] : config.github.observe ?? [] })
     }
+    // Only a hint that names a denied project filters (D19), at intake and when an ended ticket's Mandate is checked again.
     const scope: SourceScope = {
-      scope: ({ source, meta }) => source === CONSOLE ? { listened: true, observed: false, row: 'console' }
-        : source === GITHUB && this.github ? this.github.scope(meta) : { listened: false, reason: 'source_off' },
+      scope: ({ source, meta }) => deniedProject(this.projects, meta) ? { listened: false, reason: 'project_denied' }
+        : source === CONSOLE ? { listened: true, observed: false, row: 'console' }
+          : source === GITHUB && this.github ? this.github.scope(meta) : { listened: false, reason: 'source_off' },
     }
     this.executor = new T3Executor({
       t3, repo: this.repo, engine: () => this.engine, settings: () => this.settings,
@@ -139,7 +156,8 @@ export class Runtime {
     if (this.github) { const github = this.github; this.outbox.register(GITHUB, message => github.send(message)) }
     this.router = config.router.kind === 'claude'
       ? new ClaudeRouter({ engine: () => this.engine, store: this.repo, settings: () => this.settings, view: ticket => this.view(ticket),
-        delivery: ticketId => this.binding(ticketId)?.delivery,
+        delivery: ticketId => this.binding(ticketId)?.delivery, projectOf: ticketId => this.binding(ticketId),
+        projectPreview: triggers => this.projectPreview(triggers),
         model: config.router.model, effort: config.router.effort, defer, log, health: this.health, ...deps.model ? { call: deps.model } : {} })
       : new InterimRouter(this.jobs, () => this.engine, this.repo, log, config.github ? [config.github.login] : [],
         triggers => this.projectRefusal(triggers))
@@ -199,7 +217,7 @@ export class Runtime {
     const triggers = ids.flatMap(id => this.repo.triggers.get(id) ?? [])
     const audit = outcome.audit
     const choice = audit && typeof audit === 'object' && 'project' in audit ? audit.project : undefined
-    const { entry, by } = resolveProject(this.projects, { triggers, choice, migratedAt: this.migratedAt() })
+    const { entry, by } = resolveProject(this.projects, { triggers, choice, ...this.rules() })
     const binding = bindingOf(entry, ticket.id, by, new Date().toISOString())
     this.repo.kv.set(bindingKey(ticket.id), binding)
     return binding
@@ -210,26 +228,48 @@ export class Runtime {
    * instead of failing its job on every try (plan, 3.2).
    */
   projectRefusal(triggers: Trigger[]): string | undefined {
-    try { resolveProject(this.projects, { triggers, migratedAt: this.migratedAt() }); return undefined } catch (error) {
-      return error instanceof Error ? error.message : String(error)
-    }
+    const preview = this.projectPreview(triggers)
+    return 'refused' in preview ? preview.refused : undefined
   }
-  private migratedAt(): string | undefined { return this.repo.kv.get<ProjectsSchema>(SCHEMA_KEY)?.migratedAt }
+  /** Where an accept of `triggers` would be bound now, or why it would be refused; the Router's card shows it (plan, 3.2). */
+  projectPreview(triggers: (Pick<Trigger, 'meta'> & Partial<Pick<Trigger, 'source' | 'at'>>)[]): ProjectPreview {
+    try {
+      const { entry, by } = resolveProject(this.projects, { triggers, ...this.rules() })
+      return { id: entry.id!, key: entry.key, title: entry.title, by }
+    } catch (error) { return { refused: error instanceof Error ? error.message : String(error) } }
+  }
+  private rules(): ProjectRules {
+    const migratedAt = this.repo.kv.get<ProjectsSchema>(SCHEMA_KEY)?.migratedAt
+    return { ...migratedAt ? { migratedAt } : {}, unnamed: this.config.unnamedRequests ?? 'default' }
+  }
 
   /**
-   * Why a new console request cannot be taken now; undefined when it can. Requests cannot name a project yet (phase 3a), so
-   * an unnamed one goes to the legacy project, or to the one ready project when there is no legacy project (D21); otherwise
-   * it is refused rather than sent to a project nobody named. The legacy project is taken as the registry has it now, so one
-   * whose checkout went missing since the start refuses with its status rather than storing a request no ticket can come of.
+   * The project a new console request goes to, by the rules its binding will apply: the one `project` names (a key, alias,
+   * title, path or T3 Code id), else the default for unnamed requests. A name that does not resolve reads T3 Code, the
+   * catalogue and projects.json again once before it is refused, so a project added a moment ago is found. Throws with the
+   * reason, and suggestions for an unknown name, when the request cannot be taken; nothing is stored then.
    */
-  requestRefusal(): string | undefined {
-    if (this.projects.hasLegacy()) return this.projectRefusal([])
-    const ready = this.projects.ready()
-    if (ready.length === 1) return undefined
-    const set = 'Set SUPERAGENT_PROJECT_ROOT to the project unnamed requests go to and restart the super agent.'
-    if (ready.length > 1) return `multi-project routing is not enabled yet: ${ready.length} projects are ready (${ready.map(entry => entry.key).join(', ')}). ${set}`
-    return `multi-project routing is not enabled yet, and no project is ready: add a git checkout as a project in T3 Code. ${set} `
-      + 'superagent_projects lists what T3 Code has.'
+  async requestProject(project?: string): Promise<{ entry: ProjectEntry; by: BoundBy; hint?: { project: string; projectBy: 'operator' } }> {
+    const now = new Date().toISOString()
+    if (project === undefined) {
+      const { entry, by } = resolveProject(this.projects, { triggers: [{ source: CONSOLE, at: now, meta: { scope: 'console' } }], ...this.rules() })
+      return { entry, by }
+    }
+    let resolved = this.projects.resolve(project)
+    if (!resolved.found) {
+      await this.projects.refresh().catch(error => this.config.log('reading the projects again for a request failed', error))
+      resolved = this.projects.resolve(project)
+    }
+    if (!resolved.found) {
+      throw new Error(`No project ${project} in T3 Code${resolved.suggestions.length ? `; did you mean ${resolved.suggestions.join(', ')}?` : '.'} `
+        + 'superagent_projects lists the projects and why each can or cannot take work.')
+    }
+    if (!resolved.found.id) {
+      throw new Error(`Project ${resolved.found.key} is ${resolved.found.status}: ${resolved.found.reason ?? 'it is not a T3 Code project.'}`)
+    }
+    const hint = { project: resolved.found.id, projectBy: 'operator' as const }
+    const { entry, by } = resolveProject(this.projects, { triggers: [{ source: CONSOLE, at: now, meta: { scope: 'console', ...hint } }], ...this.rules() })
+    return { entry, by, hint }
   }
 
   /** Resumes the work a previous run left (Tickets in t3code threads, messages not yet sent), then starts the passes. */
@@ -274,9 +314,14 @@ export class Runtime {
     if (detail.thread.worktreePath) await writeMcpConfig(detail.thread.worktreePath, this.consoleUrl())
     else this.config.log(`The console thread has no folder; add the console MCP server by hand: ${MCP_SERVER_NAME} ${this.consoleUrl()}`)
     await this.t3.organize(launched.threadId, 'pin').catch(error => this.config.log('pinning the console failed', error))
+    // The introduction goes only to an empty thread. A thread introduced by an earlier version gets the change once, as its own message.
+    const version = this.repo.kv.get<number>(CONSOLE_INTRO_KEY) ?? 1
     if (!detail.items.length) {
       await this.t3.send(launched.threadId, CONSOLE_INTRO, `${requestId}:intro`, 'queue')
-        .catch(error => this.config.log('introducing the console failed', error))
+        .then(() => this.repo.kv.set(CONSOLE_INTRO_KEY, CONSOLE_INTRO_VERSION), error => this.config.log('introducing the console failed', error))
+    } else if (version < CONSOLE_INTRO_VERSION) {
+      await this.t3.send(launched.threadId, CONSOLE_INTRO_V2, `${requestId}:intro-v2`, 'queue')
+        .then(() => this.repo.kv.set(CONSOLE_INTRO_KEY, CONSOLE_INTRO_VERSION), error => this.config.log('updating the console\'s introduction failed', error))
     }
   }
   consoleUrl(): string { return `${this.config.publicUrl}/mcp/console/${this.config.consoleToken}` }
@@ -351,6 +396,7 @@ export class Runtime {
     const stage = ticketStage(ticket)
     const report = latestReport(ticket)
     const origin = this.repo.triggers.get(ticket.origin.triggerId)
+    const binding = this.binding(ticket.id)
     const requests = ticket.ended ? [] : this.executor.pending(ticket.id)
     const approvals = requests.flatMap(request => request.kind === 'approval' ? [{ requestId: request.requestId, text: request.text }] : [])
     const questions = requests.flatMap(request => request.kind === 'question'
@@ -362,11 +408,30 @@ export class Runtime {
       ...requests.length ? { pending: { approvals, questions } } : {},
       ...ticket.attention ? { question: ticket.attention.question } : {}, ...report ? { summary: report.summary } : {},
       ...this.executor.thread(ticket.id)?.link ? { link: this.executor.thread(ticket.id)!.link } : {},
-      ...ticket.ended ? { outcome: ticket.ended.outcome } : {}, updatedAt: ticket.updatedAt, source: origin?.source ?? 'unknown' }
+      ...ticket.ended ? { outcome: ticket.ended.outcome } : {}, updatedAt: ticket.updatedAt, source: origin?.source ?? 'unknown',
+      ...binding ? { project: { id: binding.projectId, key: binding.key, title: binding.title } } : {} }
   }
   tickets(): TicketView[] { return this.repo.tickets.list().map(ticket => this.view(ticket)) }
   /** What waits for a person, first; the panel's and the attention app's list. A healthy state is an empty list. */
   attention(): TicketView[] { return this.tickets().filter(view => view.stage.startsWith('person/')) }
+  /**
+   * Console requests ignored in the last day, newest first (D18): those whose thread's latest Decision is an ignore. Each
+   * request has its own thread, and an answer on a ticket's thread that came back for a fresh Eval counts too.
+   */
+  ignoredRequests(now = Date.now()): IgnoredRequest[] {
+    const items: IgnoredRequest[] = []
+    for (const thread of this.repo.threads.list()) {
+      if (thread.ref.source !== CONSOLE) continue
+      const decision = this.repo.decisions.byThread(thread.key).at(-1)
+      if (decision?.kind !== 'ignore' || now - Date.parse(decision.at) > IGNORED_FOR_MS) continue
+      const trigger = decision.triggerIds.map(id => this.repo.triggers.get(id)).findLast(item => item?.human)
+      if (!trigger) continue
+      const named = typeof trigger.meta.project === 'string' ? this.projects.byId(trigger.meta.project)?.key ?? trigger.meta.project : undefined
+      items.push({ trigger_id: trigger.id, text: trigger.text.length > 300 ? `${trigger.text.slice(0, 299)}…` : trigger.text,
+        reason: reasonText(decision.reason), at: decision.at, ...named ? { project: named } : {} })
+    }
+    return items.sort((a, b) => b.at.localeCompare(a.at)).slice(0, 20)
+  }
   /**
    * The review list (D12): completed tickets of `branch` projects whose branch still exists and is not in the project's default
    * branch. A ready report ends such a ticket at once, so nothing else shows it. Made again when older than `maxAgeMs`.
@@ -440,13 +505,34 @@ const WATCHDOG_SETUP_V2 = 'An update to your instructions: the superagent now re
 const WATCHDOG_REARM = 'The superagent has not seen a Watchdog check for a while. Run the check now, then confirm with list_scheduled_tasks that '
   + 'your interval task exists and is enabled; create it again as your first message says if not.'
 
+/** kv: the version of the introduction the console thread has; 1 for a thread introduced before it was kept. */
+const CONSOLE_INTRO_KEY = 'console:intro'
+const CONSOLE_INTRO_VERSION = 2
+
+/** How the console agent files work across projects (plan, 3.2), in the introduction and in the update for an older thread. */
+const PROJECT_RULES = [
+  'Work goes to T3 Code projects. Call superagent_projects to see them, then pass `project` (its key) on every superagent_request.',
+  'If two projects fit the request, or none does, ask the operator which one before you file anything. When work spans projects, '
+    + 'file one request per project, and say in each what the other one does.',
+  'Read what superagent_request returns: `accepted` names the ticket, its project and its thread; `ignored` gives the reason; '
+    + '`pending` is normal while the Router decides, so check superagent_attention or superagent_ticket with the trigger id later.',
+  'If a ticket went to the wrong project, use superagent_reroute: it stops the ticket and files the same request in the right one.',
+]
 const CONSOLE_INTRO = [
   'This is the Superagent console. You help the operator run the superagent, which works on tickets in their own T3 Code threads.',
   'Use the `superagent` MCP tools: superagent_attention first (what waits for a person), superagent_status, superagent_ticket, '
     + 'superagent_request to start work, superagent_projects (the T3 Code projects and why each can or cannot take work), '
-    + 'superagent_answer to answer a ticket\'s question, superagent_stop, superagent_retry, '
+    + 'superagent_answer to answer a ticket\'s question, superagent_reroute, superagent_stop, superagent_retry, '
     + 'superagent_note, superagent_pause, superagent_messages and superagent_dismiss_alert (for the Watchdog\'s alerts).',
+  ...PROJECT_RULES,
   'A ticket at person/approve waits on an approval in its T3 Code thread: only T3 Code can grant it, so link the thread and say so.',
   'Keep answers short. Do not do ticket work in this thread: start a request instead, and link each ticket\'s thread when you mention it.',
   'Reply with one line saying you are ready.',
+].join('\n')
+/** What changed in the introduction since version 1, for a console thread that already has it. */
+const CONSOLE_INTRO_V2 = [
+  'An update to your instructions: the superagent now works in several T3 Code projects, and each ticket keeps the project it was filed in.',
+  ...PROJECT_RULES,
+  'superagent_ticket also takes the trigger id superagent_request returns, and superagent_attention lists requests ignored in the last day.',
+  'Reply with one line saying you have it.',
 ].join('\n')

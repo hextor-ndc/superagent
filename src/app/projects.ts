@@ -155,18 +155,34 @@ export function preUpgrade(trigger: Pick<Trigger, 'meta'> & Partial<Pick<Trigger
 }
 
 /**
+ * What an unnamed console request gets (plan, open question 1): `default`, the bind-time default of D21 (the legacy project,
+ * else the one ready project); `refuse`, nothing, so every console request must name its project
+ * (`SUPERAGENT_UNNAMED_REQUESTS=refuse`). Requests from other Sources keep the default: GitHub maps to the legacy project (D20).
+ */
+export type UnnamedRequests = 'default' | 'refuse'
+/** How every refusal of an accept that names no project starts, so the console agent and the rules router can say what to do. */
+export const NAME_THE_PROJECT = 'Name the project: superagent_request with project=<key> (superagent_projects lists them).'
+
+/** The rules `resolveProject` reads besides the registry. */
+export interface ProjectRules {
+  /** `schema:projects.migratedAt`, when the migration ran. */
+  migratedAt?: string
+  /** What an unnamed console request gets; `default` when left out. */
+  unnamed?: UnnamedRequests
+}
+
+/**
  * Which project an accept goes to, by the rules of plan 3.2, in order: an explicit hint on the request's Triggers; a Router
  * choice (not allowed before phase 3b, so any is refused); an inherited hint, which a console request from before the
- * migration is for the legacy project (D19); the bind-time default (D21). The project must be ready and not denied. Throws
- * with the reason otherwise, which rolls the accept back when called in `prepareTicket`. Pure: it reads the registry's last
- * good list and writes nothing.
+ * migration is for the legacy project (D19); the bind-time default (D21), unless `unnamed` is `refuse` and the request came
+ * from the console. The project must be ready and not denied. Throws with the reason otherwise, which rolls the accept back
+ * when called in `prepareTicket`. Pure: it reads the registry's last good list and writes nothing.
  *
  * @param triggers - the accept's Triggers, its origin first.
  * @param choice - the Router's `audit.project`, if the accept carries one.
- * @param migratedAt - `schema:projects.migratedAt`, when the migration ran.
  */
-export function resolveProject(registry: ProjectRegistry, { triggers, choice, migratedAt }:
-  { triggers: (Pick<Trigger, 'meta'> & Partial<Pick<Trigger, 'source' | 'at'>>)[]; choice?: unknown; migratedAt?: string }):
+export function resolveProject(registry: ProjectRegistry, { triggers, choice, migratedAt, unnamed = 'default' }:
+  { triggers: (Pick<Trigger, 'meta'> & Partial<Pick<Trigger, 'source' | 'at'>>)[]; choice?: unknown } & ProjectRules):
   { entry: ProjectEntry; by: BoundBy } {
   const hints = triggers.flatMap(trigger => projectHint(trigger) ?? [])
   const explicit = [...new Map(hints.filter(hint => hint.by !== 'inherited').map(hint => [hint.project, hint])).values()]
@@ -195,6 +211,8 @@ export function resolveProject(registry: ProjectRegistry, { triggers, choice, mi
     }
     entry = resolved.found
     by = hint.by === 'operator' ? 'operator' : hint.by === 'source' ? 'github' : 'inherited'
+  } else if (unnamed === 'refuse' && triggers.length && triggers.every(trigger => trigger.source === CONSOLE)) {
+    throw new Error(`${NAME_THE_PROJECT} Requests that name none are refused here (SUPERAGENT_UNNAMED_REQUESTS=refuse).`)
   } else if (registry.hasLegacy()) {
     const legacy = registry.configuredLegacy()
     if (!legacy) throw new Error(registry.legacyProblem() ?? 'The project SUPERAGENT_PROJECT_ROOT names is not in T3 Code.')
@@ -202,15 +220,33 @@ export function resolveProject(registry: ProjectRegistry, { triggers, choice, mi
   } else {
     const ready = registry.ready()
     if (ready.length !== 1) {
-      throw new Error(`An accept needs a project, and none is the default: no legacy project is set and ${ready.length} project`
-        + `${ready.length === 1 ? ' is' : 's are'} ready${ready.length ? ` (${ready.map(item => item.key).join(', ')})` : ''}. `
-        + 'Multi-project routing is not enabled yet: set SUPERAGENT_PROJECT_ROOT to the project unnamed requests go to.')
+      throw new Error(`${NAME_THE_PROJECT} No project is the default: no legacy project is set and ${ready.length} project`
+        + `${ready.length === 1 ? ' is' : 's are'} ready${ready.length ? ` (${ready.map(item => item.key).join(', ')})` : ''}.`)
     }
     entry = ready[0]!; by = 'single'
   }
   if (entry.status !== 'ready') throw new Error(`Project ${entry.key} is ${entry.status}: ${entry.reason ?? 'it cannot take work.'}`)
   if (entry.access === 'deny' || !entry.id) throw new Error(`Project ${entry.key} is denied: it never takes work.`)
   return { entry, by }
+}
+
+/**
+ * The project a Trigger's `meta.project` names explicitly (`operator` or `source`) when that project is denied, by
+ * projects.json, a default prefix or as a folder of worktrees (D19): `SourceScope` filters only these. An inherited hint does
+ * not count: it is the project of the ticket a follow-up is for, and a deny stops new work there, not the answer a running
+ * ticket waits on. A hint that names no known project, a Trigger without one, and an empty or stale registry all count as
+ * listened, so a registry that cannot be read never stops intake or revalidation.
+ */
+export function deniedProject(registry: ProjectRegistry, meta: Record<string, unknown>): ProjectEntry | undefined {
+  const hint = projectHint({ meta })
+  return hint && hint.by !== 'inherited' ? denied(registry, hint.project) : undefined
+}
+/** The project `name` resolves to when it is denied (access `deny`, or status `denied`); undefined otherwise or when unknown. */
+export function denied(registry: ProjectRegistry, name: string): ProjectEntry | undefined {
+  try {
+    const found = registry.resolve(name).found
+    return found && (found.access === 'deny' || found.status === 'denied') ? found : undefined
+  } catch { return undefined }
 }
 
 const OverrideSchema = z.object({
