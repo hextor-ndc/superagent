@@ -7,6 +7,7 @@ import { z } from 'zod'
 import { liveTicket, type Ticket } from '../../vendor/dsh/src/core/index.ts'
 import { CONSOLE, consoleThread, consoleTrigger } from '../app/console-source.ts'
 import type { Runtime } from '../app/runtime.ts'
+import { STATUSES, type ProjectEntry, type ProjectStatus } from '../app/projects.ts'
 import type { PendingQuestion, PendingRequest } from '../t3/client.ts'
 import { ATTENTION_URI, MCP_APP_MIME, attentionPage } from './attention-app.ts'
 import { ok } from './result.ts'
@@ -40,7 +41,15 @@ export function consoleActions(runtime: Runtime) {
         messages: runtime.outbox.list(record => record.message.ticketId === found.id).map(record => ({ kind: record.message.kind, status: record.status,
           text: record.message.text })) }
     },
+    superagent_projects: async ({ query, status, limit = 25, refresh }: { query?: string; status?: ProjectStatus; limit?: number; refresh?: boolean }) => {
+      let refreshError: string | undefined
+      if (refresh) await runtime.projects.refresh().catch(error => { refreshError = error instanceof Error ? error.message : String(error) })
+      return projectRows(runtime, { query, status, limit, refreshError })
+    },
     superagent_request: ({ text }: { text: string }) => {
+      // Work goes only to the legacy project until tickets carry their own project; nothing is stored for a refused request.
+      const refusal = runtime.requestRefusal()
+      if (refusal) throw new Error(refusal)
       const trigger = consoleTrigger(runtime.config.operator, text)
       const result = engine.receive(trigger)
       return { trigger_id: trigger.id, result, next: 'The ticket appears in superagent_status within seconds; its thread opens in the sidebar.' }
@@ -87,6 +96,65 @@ export function consoleActions(runtime: Runtime) {
   }
 }
 export type ConsoleAction = keyof ReturnType<typeof consoleActions>
+
+/** What a request to a project leaves in its repository, and the setup T3 Code needs first (plan, section 1). */
+const PROJECT_NOTES = {
+  side_effects: 'Each ticket in a project adds a branch agent/<name>, a worktree under the project\'s worktree_root, and the lines .mcp.json '
+    + 'and .codex/ in the repository\'s .git/info/exclude. Nothing touches the checkout\'s own files.',
+  setup: 'To make a folder a project: add it as a project in T3 Code (the super agent cannot), then in that project\'s settings turn off PR '
+    + 'watching and "continue threads after server update". Then call superagent_projects with refresh. Access, aliases, delivery and '
+    + 'base ref can be set in projects.json in the super agent\'s state directory.',
+}
+const clip = (text: string | undefined, chars: number) => text && text.length > chars ? `${text.slice(0, chars - 1)}…` : text
+
+/**
+ * The projects for the console: the one a query names exactly, else those whose names, purpose or root contain it, ready
+ * ones first. Catalogue text is left out where the operator has not allowed it to reach a model (plan, open question 2).
+ */
+function projectRows(runtime: Runtime, { query, status, limit, refreshError }: { query?: string; status?: ProjectStatus; limit: number; refreshError?: string }) {
+  const registry = runtime.projects
+  const all = registry.list()
+  const wanted = query?.trim().toLowerCase()
+  const exact = query?.trim() ? registry.resolve(query) : undefined
+  const text = (entry: ProjectEntry) => [entry.key, entry.title, entry.root, ...entry.aliases,
+    ...entry.describe && entry.catalogue && 'path' in entry.catalogue ? [entry.catalogue.purpose ?? '', entry.catalogue.notes ?? ''] : []].join('\n').toLowerCase()
+  const matched = (exact?.found ? [exact.found] : wanted ? all.filter(entry => text(entry).includes(wanted)) : all)
+    .filter(entry => !status || entry.status === status)
+  // Every ticket so far was made in the project workers use, the legacy project.
+  const tickets = runtime.repo.tickets.list()
+  const open = tickets.filter(ticket => !ticket.ended).length
+  const last = tickets.map(ticket => ticket.createdAt).sort().at(-1)
+  // The registry's entries are new objects after each refresh, so the work project is matched by id.
+  const works = (entry: ProjectEntry) => !!runtime.workProject && entry.id === runtime.workProject.id
+  const row = (entry: ProjectEntry) => {
+    const catalogue = entry.catalogue
+    const described = catalogue && 'path' in catalogue
+    return {
+      key: entry.key, title: entry.title, status: entry.status, ...entry.reason ? { why: entry.reason } : {}, ...entry.id ? { id: entry.id } : {},
+      root: entry.root, ...entry.legacy ? { legacy: true } : {}, ...entry.aliases.length ? { aliases: entry.aliases } : {},
+      ...described && entry.describe ? { ...catalogue.purpose ? { purpose: clip(catalogue.purpose, 200) } : {},
+        ...catalogue.notes ? { notes: clip(catalogue.notes, 300) } : {}, ...catalogue.related.length ? { related: catalogue.related } : {} } : {},
+      ...described && !entry.describe ? { description: 'withheld: catalogue text from this folder is not sent to models unless projects.json sets describe: true' } : {},
+      ...catalogue && 'insideCatalogued' in catalogue ? { inside_catalogued: catalogue.insideCatalogued } : {},
+      ...entry.worktrees.length ? { worktrees: entry.worktrees } : {},
+      access: entry.access, delivery: entry.delivery, base_ref: entry.baseRef, worktree_root: entry.worktreeRoot,
+      open_tickets: works(entry) ? open : 0, last_ticket: works(entry) ? last ?? null : null,
+    }
+  }
+  const refreshed = registry.state()
+  return {
+    summary: registry.summary(),
+    work: runtime.workProject
+      ? `Requests go to ${runtime.workProject.key}, the project SUPERAGENT_PROJECT_ROOT names; multi-project routing is not enabled yet.`
+      : runtime.requestRefusal(),
+    ...refreshed.refreshedAt ? { refreshed_at: refreshed.refreshedAt } : {},
+    ...refreshError ?? refreshed.error ? { refresh_failed: refreshError ?? refreshed.error, note: 'The list is the last one read.' } : {},
+    total: matched.length,
+    projects: matched.slice(0, limit).map(row),
+    ...query?.trim() && !matched.length && exact && !exact.found ? { suggestions: exact.suggestions } : {},
+    ...PROJECT_NOTES,
+  }
+}
 
 /** Answers to a t3code question, by question id: one string, or several for a multiple choice. */
 type Answers = Record<string, string | string[]>
@@ -147,6 +215,13 @@ export function consoleServer(runtime: Runtime): McpServer {
     async () => ok(actions.superagent_status()))
   server.registerTool('superagent_ticket', { description: 'One ticket in detail: stage, reports, inputs and messages.', inputSchema: id, annotations: readOnly },
     async args => ok(actions.superagent_ticket(args)))
+  server.registerTool('superagent_projects', {
+    description: 'The T3 Code projects and catalogued folders: for each, whether work can go there (status, and why not), what it is for, '
+      + 'access, delivery and base ref. `query` matches a name, alias, path or purpose; `refresh` reads T3 Code, the catalogue and projects.json again.',
+    inputSchema: { query: z.string().trim().max(200).optional(), status: z.enum(STATUSES as [ProjectStatus, ...ProjectStatus[]]).optional(),
+      limit: z.number().int().min(1).max(200).optional(), refresh: z.boolean().optional() },
+    annotations: readOnly,
+  }, async args => ok(await actions.superagent_projects(args)))
   server.registerTool('superagent_request', {
     description: 'Start work: the operator\'s request becomes a ticket with its own T3 Code thread and worktree.',
     inputSchema: { text: z.string().trim().min(1).max(8000) },

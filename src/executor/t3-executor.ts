@@ -53,9 +53,12 @@ export interface T3ExecutorOptions {
     | 'assignmentInterrupted'>
   repo: Pick<Repositories, 'tickets' | 'triggers'>
   settings: () => Settings
-  /** The t3code project the workers run in, and its checkout on this machine. */
-  project: { id: string; root: string; repository?: string }
-  worktreeRoot: string
+  /**
+   * The t3code project the workers run in, and its checkout on this machine. Without one (no legacy project configured), no
+   * Ticket can be accepted: `prepare` throws, which rolls the accept back, and a launch fails its Ticket.
+   */
+  project?: { id: string; root: string; repository?: string }
+  worktreeRoot?: string
   baseRef?: string
   branchPrefix?: string
   /** Builds a Ticket's worker MCP URL from its capability token. */
@@ -83,6 +86,9 @@ export interface T3ExecutorOptions {
   /** Queues work once the Engine's transaction commits (`Store.afterCommit`); at once without one. */
   defer?: (run: () => void) => void
 }
+
+/** Why no Ticket can be accepted or started without a project. */
+export const NO_PROJECT = 'No project to work in: set SUPERAGENT_PROJECT_ROOT to the T3 Code project workers use (multi-project routing is not enabled yet).'
 
 /** How many times a worker whose turn failed is told to go on before its Ticket is reported failed, as in the prototype. */
 const CONTINUATIONS = 3
@@ -169,6 +175,7 @@ export class T3Executor implements Executor {
 
   // The Engine's `prepareTicket` hook: what the executor chose for a newly accepted Ticket.
   prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
+    if (!this.options.project || !this.options.worktreeRoot) throw new Error(NO_PROJECT)
     const name = ticketName(outcome.name, ticket.id)
     const ruleIds = ticket.mandate.basis.rules
     const rules = this.options.settings().policy.rules.filter(rule => ruleIds?.includes(rule.id))
@@ -302,13 +309,15 @@ export class T3Executor implements Executor {
     // A stop queued meanwhile stays, for the next launch to wait on: it is a stop of this Assignment, which the looks below see.
     if (this.stopping.get(ticketId) === stopping) this.stopping.delete(ticketId)
     if (!this.waitsToStart(ticketId, assignmentId)) return
+    const project = this.options.project, worktreeRoot = this.options.worktreeRoot
+    if (!project || !worktreeRoot) { this.fail(ticketId, NO_PROJECT); return }
     this.slots.reserve(ticketId, 'launch')
     let stopped = false
     try {
       const entry = this.threads.get(ticketId) ?? this.newEntry(ticket)
       let prepared: Prepared
       try {
-        prepared = await prepareWorktree({ projectRoot: this.options.project.root, worktreeRoot: this.options.worktreeRoot,
+        prepared = await prepareWorktree({ projectRoot: project.root, worktreeRoot,
           name: ticket.execution!.name, branchPrefix: this.options.branchPrefix ?? 'agent/', baseRef: this.options.baseRef ?? 'HEAD',
           mcpUrl: this.options.workerUrl(entry.token) })
       } catch (error) {
@@ -320,7 +329,7 @@ export class T3Executor implements Executor {
       this.threads.set(ticketId, entry)
       if (!this.waitsToStart(ticketId, assignmentId)) { stopped = true; return }
       const variables: ExecutionVariables = { ticketId, name: ticket.execution!.name, directory: prepared.worktreePath, branch: prepared.branch,
-        repository: this.options.project.repository, account: this.options.account?.login, commitEmail: this.options.account?.commitEmail }
+        repository: project.repository, account: this.options.account?.login, commitEmail: this.options.account?.commitEmail }
       const origin = this.options.repo.triggers.get(ticket.origin.triggerId)
       const batch = ticket.origin.triggerIds.filter(id => id !== ticket.origin.triggerId).flatMap(id => this.options.repo.triggers.get(id) ?? [])
       const text = assignmentMessage(ticket, origin, variables, batch)
@@ -330,7 +339,7 @@ export class T3Executor implements Executor {
         await this.options.t3.send(threadId, `${text}\n\nThis is a new assignment of the same ticket: continue from the worktree's current state.`,
           `assign:${assignmentId}`)
       } else {
-        const launched = await this.options.t3.launch({ projectId: this.options.project.id, title: threadTitle(ticket), message: text,
+        const launched = await this.options.t3.launch({ projectId: project.id, title: threadTitle(ticket), message: text,
           worktreePath: prepared.worktreePath, branch: prepared.branch, clientRequestId: `launch:${assignmentId}`,
           ...(this.options.runtimeMode ? { runtimeMode: this.options.runtimeMode } : {}) })
         threadId = launched.threadId

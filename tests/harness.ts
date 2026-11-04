@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { afterAll } from 'vitest'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import type { ProjectRegistry } from '../src/app/projects.ts'
 import { Runtime } from '../src/app/runtime.ts'
 import type { Config } from '../src/config.ts'
 import { startHttp } from '../src/http/server.ts'
@@ -53,19 +54,22 @@ export interface Harness { runtime: Runtime; http: Server; base: string; errors:
 
 /**
  * Starts a Runtime on `t3` with its HTTP server on a free port. `deps.timing` replaces the fast default timing, and
- * `deps.project` the t3code project, for a live t3code. A FakeT3 that leaves `checkWorktrees` unset gets it turned on, so
+ * `deps.project` the t3code project, for a live t3code; `deps.projects` gives a loaded registry instead of the one legacy
+ * project on `place`. The state directory is `<place.dir>/state`, so nothing is written under the real one. A FakeT3 that leaves `checkWorktrees` unset gets it turned on, so
  * a launch with the wrong project id or a path that is not one of the project's worktrees fails as it would in t3code.
  */
 export async function harness(t3: T3Client, place: { dir: string; root: string }, database = ':memory:', overrides: Partial<Config> = {},
-  deps: { gh?: Gh; model?: ModelCall; timing?: Timing; project?: string } = {}): Promise<Harness> {
+  deps: { gh?: Gh; model?: ModelCall; timing?: Timing; project?: string; projects?: ProjectRegistry } = {}): Promise<Harness> {
   const errors: string[] = []
   if (t3 instanceof FakeT3) t3.checkWorktrees ??= true
-  const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', projectRoot: place.root, worktreeRoot: join(place.dir, 'worktrees'), baseRef: 'HEAD',
+  const stateDir = join(place.dir, 'state')
+  const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', stateDir, projectsFile: join(stateDir, 'projects.json'),
+    legacy: { root: place.root, worktreeRoot: join(place.dir, 'worktrees'), baseRef: 'HEAD', repository: 'acme/widgets' },
     router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' },
-    repository: 'acme/widgets', port: 0, publicUrl: '', consoleToken: 'console-secret', watchdogMinutes: 0, database, operator: 'hector', maxWorkers: 2,
+    port: 0, publicUrl: '', consoleToken: 'console-secret', watchdogMinutes: 0, database, operator: 'hector', maxWorkers: 2,
     log: (message, error) => { errors.push(`${message} ${error instanceof Error ? error.message : error ?? ''}`) }, ...overrides }
-  const { timing = { waitMs: 10, idlePollMs: 10, continueAfterMs: 0 }, project = 'project-1', ...rest } = deps
-  const runtime = new Runtime(config, t3, { id: project, root: place.root }, timing, rest)
+  const { timing = { waitMs: 10, idlePollMs: 10, continueAfterMs: 0 }, project = 'project-1', projects, ...rest } = deps
+  const runtime = new Runtime(config, t3, projects ?? { id: project, root: place.root }, timing, rest)
   const http = await startHttp(runtime, 0)
   const base = `http://127.0.0.1:${(http.address() as AddressInfo).port}`
   // The public URL is known once the server listens; the runtime reads it whenever it builds a URL.

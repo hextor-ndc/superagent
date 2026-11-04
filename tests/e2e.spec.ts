@@ -45,8 +45,8 @@ describe('superagent on t3code', () => {
     const place = checkout(), dir = place.dir
     root = place.root
     t3 = new FakeT3([{ id: 'project-1', workspaceRoot: root }])
-    const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', projectRoot: root, worktreeRoot: join(dir, 'worktrees'), baseRef: 'HEAD',
-      repository: 'acme/widgets', port: 0, publicUrl: '', consoleToken: 'console-secret', watchdogMinutes: 0, database: ':memory:', router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' }, operator: 'hector', maxWorkers: 2,
+    const config: Config = { t3Url: 'unused', t3Token: 'unused', tokenFile: 'unused', stateDir: join(dir, 'state'), projectsFile: join(dir, 'state', 'projects.json'),
+      legacy: { root, worktreeRoot: join(dir, 'worktrees'), baseRef: 'HEAD', repository: 'acme/widgets' }, port: 0, publicUrl: '', consoleToken: 'console-secret', watchdogMinutes: 0, database: ':memory:', router: { kind: 'rules', model: 'claude-opus-5-5', effort: 'medium', acceptMode: 'observe' }, operator: 'hector', maxWorkers: 2,
       log: (message, error) => { errors.push(`${message} ${error instanceof Error ? error.message : error ?? ''}`) } }
     // The public URL is known only once the server listens; the runtime reads it when it builds URLs.
     runtime = new Runtime(config, t3, { id: 'project-1', root }, { waitMs: 10, idlePollMs: 10 })

@@ -18,6 +18,7 @@ import { ClaudeRouter, type ModelCall, type Router } from '../router/claude-rout
 import { Jobs } from './jobs.ts'
 import { StoredOutbox } from './outbox.ts'
 import { Health } from './health.ts'
+import { ProjectRegistry, type ProjectEntry } from './projects.ts'
 import { Store } from './store.ts'
 
 export interface TicketView {
@@ -58,10 +59,27 @@ export class Runtime {
   private pass?: NodeJS.Timeout
   readonly events: DomainEvent[] = []
   readonly health = new Health()
+  /** Every T3 Code project with what the catalogue and projects.json say of it (docs/multi-project-plan.md, 3.1). */
+  readonly projects: ProjectRegistry
+  /**
+   * The project workers launch in: the legacy project (`SUPERAGENT_PROJECT_ROOT` or `SUPERAGENT_PROJECT_ID`) as the registry
+   * resolved it at the start. Without one, requests are refused until per-ticket projects arrive (plan, phase 2).
+   */
+  readonly workProject?: ProjectEntry
 
-  constructor(readonly config: Config, readonly t3: T3Client, project: { id: string; root: string },
+  /**
+   * @param projects - the registry main.ts loaded, or one project `{ id, root }`, which becomes `ProjectRegistry.single()` with the
+   *   legacy settings in `config.legacy`.
+   */
+  constructor(readonly config: Config, readonly t3: T3Client, projects: ProjectRegistry | { id: string; root: string },
     { watchdogPendingMs, ...timing }: RuntimeTiming = {}, deps: { gh?: Gh; model?: ModelCall } = {}) {
     const log = config.log
+    if (!config.consoleToken) throw new Error('No console token: main.ts sets one with ensureConsoleToken before the Runtime starts.')
+    this.projects = projects instanceof ProjectRegistry ? projects : ProjectRegistry.single({ ...projects,
+      ...config.legacy?.worktreeRoot ? { worktreeRoot: config.legacy.worktreeRoot } : {}, baseRef: config.legacy?.baseRef ?? 'HEAD',
+      ...config.legacy?.repository ? { repository: config.legacy.repository } : {} })
+    this.projects.reportTo(this.health)
+    const work = this.workProject = this.projects.legacy()
     this.watchdogPendingMs = watchdogPendingMs ?? 60_000
     this.repo = new Store(config.database, error => log('after-commit work failed', error))
     const defer = (run: () => void) => this.repo.afterCommit(run)
@@ -81,8 +99,8 @@ export class Runtime {
     })
     this.console = this.repo.kv.get('console')
     this.watchdog = this.repo.kv.get('watchdog')
-    if (config.github && config.repository) {
-      this.github = new GithubSource({ gh: deps.gh ?? ghCli(config.github.gh), repository: config.repository, login: config.github.login,
+    if (config.github && work?.repository) {
+      this.github = new GithubSource({ gh: deps.gh ?? ghCli(config.github.gh), repository: work.repository, login: config.github.login,
         engine: () => this.engine, store: this.repo, pollMs: config.github.pollMs, log, health: this.health,
         // Unaddressed messages can only become candidates while proactive work is on, so with it off they are not read at all.
         observe: this.settings.eval.mode === 'off' ? [] : config.github.observe ?? [] })
@@ -93,7 +111,8 @@ export class Runtime {
     }
     this.executor = new T3Executor({
       t3, repo: this.repo, engine: () => this.engine, settings: () => this.settings,
-      project: { ...project, repository: config.repository }, worktreeRoot: config.worktreeRoot, baseRef: config.baseRef,
+      ...work?.id ? { project: { id: work.id, root: work.root, ...work.repository ? { repository: work.repository } : {} },
+        worktreeRoot: work.worktreeRoot, baseRef: work.baseRef } : {},
       workerUrl: token => `${config.publicUrl}/mcp/worker/${token}`, maxWorkers: () => this.settings.executor.maxWorkers,
       runtimeMode: config.runtimeMode, log, defer, health: this.health, ...timing,
       ...config.github ? { account: { login: config.github.login, commitEmail: config.github.commitEmail } } : {},
@@ -141,8 +160,36 @@ export class Runtime {
     if (owners.some(ticket => liveTicket(ticket))) this.router.followup?.(trigger, owners)
   }
 
+  /**
+   * What must hold before HTTP opens and the work of a previous run resumes; main.ts awaits it. Tickets made before were all
+   * made in one project, so without a project to work in they stay where they are and the start is refused. Phase 2's
+   * migration of existing state goes here as well.
+   */
+  async prepare(): Promise<void> {
+    const open = this.repo.tickets.open().length
+    if (!this.workProject && open) {
+      throw new Error(`${open} open ticket${open === 1 ? ' was' : 's were'} made in the project workers used, and now no project is set for work: `
+        + 'set SUPERAGENT_PROJECT_ROOT (or SUPERAGENT_PROJECT_ID) to that project again.')
+    }
+  }
+
+  /**
+   * Why a new console request cannot be taken now; undefined when it can. Until per-ticket projects arrive, work goes only to
+   * the legacy project, so without one every request is refused rather than sent to a project nobody named.
+   */
+  requestRefusal(): string | undefined {
+    if (this.workProject) return undefined
+    const ready = this.projects.ready()
+    const set = 'Set SUPERAGENT_PROJECT_ROOT to the project workers use and restart the super agent.'
+    if (ready.length > 1) return `multi-project routing is not enabled yet: ${ready.length} projects are ready (${ready.map(entry => entry.key).join(', ')}). ${set}`
+    if (ready.length === 1) return `multi-project routing is not enabled yet: to work in ${ready[0]!.key}, set SUPERAGENT_PROJECT_ROOT to ${ready[0]!.root} and restart the super agent.`
+    return `multi-project routing is not enabled yet, and no project is ready: add a git checkout as a project in T3 Code. ${set} `
+      + 'superagent_projects lists what T3 Code has.'
+  }
+
   /** Resumes the work a previous run left (Tickets in t3code threads, messages not yet sent), then starts the passes. */
   start(): void {
+    this.projects.start()
     this.executor.resume()
     this.outbox.resume()
     this.github?.start()
@@ -153,6 +200,7 @@ export class Runtime {
     }, 1000)
   }
   async stop(): Promise<void> {
+    this.projects.stop()
     clearInterval(this.pass)
     clearInterval(this.watchdogTimer)
     clearInterval(this.watchdogPendingTimer)
@@ -206,9 +254,14 @@ export class Runtime {
     const detail = await this.t3.read(launched.threadId, { limit: 1 })
     if (detail.thread.worktreePath) await writeMcpConfig(detail.thread.worktreePath, this.watchdogUrl())
     else this.config.log(`The Watchdog thread has no folder; add its MCP server by hand: ${MCP_SERVER_NAME} ${this.watchdogUrl()}`)
+    // The setup goes only to an empty thread. A thread set up by an earlier version gets the change once, as its own message.
+    const version = this.repo.kv.get<number>(WATCHDOG_SETUP_KEY) ?? 1
     if (!detail.items.length) {
       await this.t3.send(launched.threadId, watchdogSetup(minutes), `${requestId}:setup`, 'queue')
-        .catch(error => this.config.log('setting up the Watchdog failed', error))
+        .then(() => this.repo.kv.set(WATCHDOG_SETUP_KEY, WATCHDOG_SETUP_VERSION), error => this.config.log('setting up the Watchdog failed', error))
+    } else if (version < WATCHDOG_SETUP_VERSION) {
+      await this.t3.send(launched.threadId, WATCHDOG_SETUP_V2, `${requestId}:setup-v2`, 'queue')
+        .then(() => this.repo.kv.set(WATCHDOG_SETUP_KEY, WATCHDOG_SETUP_VERSION), error => this.config.log('updating the Watchdog\'s setup failed', error))
     }
     const since = Date.now()
     clearInterval(this.watchdogTimer)
@@ -290,7 +343,7 @@ function watchdogSetup(minutes: number): string {
     'In every check:',
     '1. Call watchdog_check (superagent MCP server). If the server cannot be reached at all, the superagent is down: say so in one line',
     '   in this thread, which is the operator’s alarm, and stop.',
-    '2. Infrastructure: for each part in `failing` (t3code, github, router, watchdog, jobs:*), tell a passing fault from a lasting one.',
+    '2. Infrastructure: for each part in `failing` (t3code, github, router, watchdog, projects, jobs:*), tell a passing fault from a lasting one.',
     '   Raise watchdog_alert once for a part failing across two checks.',
     '3. Progress: for each open ticket with running_turn and minutes_running above 30, or minutes_since_activity above 60 while working,',
     '   read watchdog_thread and judge whether the worker makes real progress toward its assignment, or loops (the same failing',
@@ -307,13 +360,23 @@ function watchdogSetup(minutes: number): string {
   ].join('\n')
 }
 
+/** kv: the version of the setup the Watchdog thread has; 1 for a thread set up before it was kept. */
+const WATCHDOG_SETUP_KEY = 'watchdog:setup'
+const WATCHDOG_SETUP_VERSION = 2
+/** What changed in the setup since version 1, for a Watchdog thread that already has it. */
+const WATCHDOG_SETUP_V2 = 'An update to your instructions: the superagent now reports one more part, `projects`, which reads the T3 Code '
+  + 'project list, the catalogue and projects.json. In step 2 of every check, treat `projects` in `failing` like the other parts: '
+  + 'raise watchdog_alert once when it fails across two checks. watchdog_check also shows a one-line summary of the projects. '
+  + 'Reply with one line saying you have it.'
+
 const WATCHDOG_REARM = 'The superagent has not seen a Watchdog check for a while. Run the check now, then confirm with list_scheduled_tasks that '
   + 'your interval task exists and is enabled; create it again as your first message says if not.'
 
 const CONSOLE_INTRO = [
   'This is the Superagent console. You help the operator run the superagent, which works on tickets in their own T3 Code threads.',
   'Use the `superagent` MCP tools: superagent_attention first (what waits for a person), superagent_status, superagent_ticket, '
-    + 'superagent_request to start work, superagent_answer to answer a ticket\'s question, superagent_stop, superagent_retry, '
+    + 'superagent_request to start work, superagent_projects (the T3 Code projects and why each can or cannot take work), '
+    + 'superagent_answer to answer a ticket\'s question, superagent_stop, superagent_retry, '
     + 'superagent_note, superagent_pause, superagent_messages and superagent_dismiss_alert (for the Watchdog\'s alerts).',
   'A ticket at person/approve waits on an approval in its T3 Code thread: only T3 Code can grant it, so link the thread and say so.',
   'Keep answers short. Do not do ticket work in this thread: start a request instead, and link each ticket\'s thread when you mention it.',

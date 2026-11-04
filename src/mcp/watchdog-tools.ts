@@ -71,6 +71,7 @@ export function watchdogCheck(runtime: Runtime) {
     failing: runtime.health.failing(),
     health,
     router: { kind: runtime.config.router.kind, ...'state' in runtime.router ? { ...(runtime.router as { state(): object }).state() } : {} },
+    projects: { summary: runtime.projects.summary(), ...runtime.projects.state() },
     tickets: working,
     open_alerts: alerts(runtime).length,
   }

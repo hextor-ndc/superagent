@@ -1,7 +1,6 @@
 /** Configuration from the environment. Point 5: the only credential is t3code's `mcp-client` token. */
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
-import { randomBytes } from 'node:crypto'
 import { AdmissionTableSchema } from '../vendor/dsh/src/policy.ts'
 import type { AdmissionRow } from '../vendor/dsh/src/admission.ts'
 
@@ -9,20 +8,41 @@ import type { AdmissionRow } from '../vendor/dsh/src/admission.ts'
 export const GITHUB_ROWS = ['issues', 'pulls', 'comments'] as const
 export type GithubRow = typeof GITHUB_ROWS[number]
 
+/**
+ * The project `SUPERAGENT_PROJECT_ROOT` or `SUPERAGENT_PROJECT_ID` names: the one project of a single-project install, which
+ * keeps its settings when more projects are registered (docs/multi-project-plan.md, 3.1). Workers launch only here for now.
+ */
+export interface LegacyProject {
+  /** `SUPERAGENT_PROJECT_ROOT`, resolved; absent when only the id is given, and then t3code's root for that id is used. */
+  root?: string
+  /** The t3code project id; found by `root` when not given. */
+  id?: string
+  /** `SUPERAGENT_WORKTREE_ROOT`, or `<root>/../<name>-superagent`; absent when only the id is given, and then derived the same way from t3code's root. */
+  worktreeRoot?: string
+  baseRef: string
+  /** `SUPERAGENT_REPOSITORY`: the GitHub repository of this project, the only one with pull-request delivery. */
+  repository?: string
+}
+
 export interface Config {
   t3Url: string
   /** An `mcp-client` token given directly; empty to use the one `superagent connect` saved in `tokenFile`. */
   t3Token: string
   tokenFile: string
-  /** The t3code project the workers use; found by `projectRoot` when not given. */
-  projectId?: string
-  projectRoot: string
-  worktreeRoot: string
-  baseRef: string
-  repository?: string
+  /** Where every file of the service goes: the database, the t3code token, the lock, the console token, projects.json and new projects' worktrees. */
+  stateDir: string
+  legacy?: LegacyProject
+  /** `SUPERAGENT_CATALOGUE`: a repositories.json that describes the projects on this machine; optional. */
+  catalogue?: string
+  /** The operator's per-project overrides; `<stateDir>/projects.json` unless `SUPERAGENT_PROJECTS_FILE` moves it. Optional. */
+  projectsFile: string
   port: number
   /** How t3code's agents reach this service; workers' MCP URLs start with it. */
   publicUrl: string
+  /**
+   * The secret in the console and panel URLs: `SUPERAGENT_CONSOLE_TOKEN`, or empty until main.ts reads or makes the saved one
+   * with `ensureConsoleToken`, since loading the configuration writes nothing.
+   */
   consoleToken: string
   /** The SQLite file, or `:memory:` in tests. */
   database: string
@@ -48,27 +68,23 @@ export interface Config {
   log: (message: string, error?: unknown) => void
 }
 
+/** Reads the configuration from the environment. It writes nothing: the files it names are made by main.ts. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const need = (name: string): string => {
-    const value = env[name]?.trim()
-    if (!value) throw new Error(`Set ${name}. See README.md, "Run it".`)
-    return value
-  }
-  const projectRoot = resolve(need('SUPERAGENT_PROJECT_ROOT'))
+  const state = stateDir(env)
+  const legacy = legacyProject(env)
   const port = Number(env.SUPERAGENT_PORT ?? 3790)
   return {
     t3Url: env.T3_MCP_URL ?? 'http://127.0.0.1:3773/mcp',
     t3Token: env.T3_MCP_TOKEN?.trim() ?? '',
-    tokenFile: join(stateDir(env), 't3-token.json'),
-    projectId: env.SUPERAGENT_PROJECT_ID || undefined,
-    projectRoot,
-    worktreeRoot: resolve(env.SUPERAGENT_WORKTREE_ROOT ?? join(dirname(projectRoot), `${basename(projectRoot)}-superagent`)),
-    baseRef: env.SUPERAGENT_BASE_REF ?? 'HEAD',
-    repository: env.SUPERAGENT_REPOSITORY || undefined,
+    tokenFile: join(state, 't3-token.json'),
+    stateDir: state,
+    ...legacy ? { legacy } : {},
+    ...env.SUPERAGENT_CATALOGUE?.trim() ? { catalogue: resolve(env.SUPERAGENT_CATALOGUE.trim()) } : {},
+    projectsFile: resolve(env.SUPERAGENT_PROJECTS_FILE?.trim() || join(state, 'projects.json')),
     port,
     publicUrl: (env.SUPERAGENT_PUBLIC_URL ?? `http://127.0.0.1:${port}`).replace(/\/+$/, ''),
-    consoleToken: env.SUPERAGENT_CONSOLE_TOKEN || randomBytes(24).toString('base64url'),
-    database: join(stateDir(env), 'state.sqlite'),
+    consoleToken: env.SUPERAGENT_CONSOLE_TOKEN?.trim() ?? '',
+    database: join(state, 'state.sqlite'),
     operator: env.SUPERAGENT_OPERATOR ?? 'operator',
     maxWorkers: Number(env.SUPERAGENT_MAX_WORKERS ?? 3),
     runtimeMode: env.SUPERAGENT_RUNTIME_MODE || undefined,
@@ -91,6 +107,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     } } : {},
     log: (message, error) => console.error(`[superagent] ${message}${error ? `: ${error instanceof Error ? error.message : String(error)}` : ''}`),
   }
+}
+
+/**
+ * The legacy project from `SUPERAGENT_PROJECT_ROOT` or `SUPERAGENT_PROJECT_ID`, with the settings that belong to it. Those
+ * settings without either variable are refused, since they would silently do nothing.
+ */
+function legacyProject(env: NodeJS.ProcessEnv): LegacyProject | undefined {
+  const root = env.SUPERAGENT_PROJECT_ROOT?.trim() ? resolve(env.SUPERAGENT_PROJECT_ROOT.trim()) : undefined
+  const id = env.SUPERAGENT_PROJECT_ID?.trim() || undefined
+  if (!root && !id) {
+    const orphans = ['SUPERAGENT_WORKTREE_ROOT', 'SUPERAGENT_BASE_REF', 'SUPERAGENT_REPOSITORY'].filter(name => env[name]?.trim())
+    if (orphans.length) {
+      throw new Error(`${orphans.join(', ')} ${orphans.length === 1 ? 'belongs' : 'belong'} to the project SUPERAGENT_PROJECT_ROOT names: set it too, `
+        + 'or leave them out. See README.md, "Run it".')
+    }
+    return undefined
+  }
+  const worktreeRoot = env.SUPERAGENT_WORKTREE_ROOT?.trim() ? resolve(env.SUPERAGENT_WORKTREE_ROOT.trim())
+    : root ? join(dirname(root), `${basename(root)}-superagent`) : undefined
+  return { ...root ? { root } : {}, ...id ? { id } : {}, ...worktreeRoot ? { worktreeRoot } : {}, baseRef: env.SUPERAGENT_BASE_REF?.trim() || 'HEAD',
+    ...env.SUPERAGENT_REPOSITORY?.trim() ? { repository: env.SUPERAGENT_REPOSITORY.trim() } : {} }
 }
 
 /** `<provider instance>/<model>`, such as `codex/gpt-6-astra`; `orchestrator_capabilities` lists both. */
@@ -129,5 +166,5 @@ function oneOf<T extends string>(value: string | undefined, allowed: readonly T[
   return value as T
 }
 
-/** Where the super agent keeps its database and its t3code token. */
+/** Where the super agent keeps its database, its t3code token and its other files. */
 export const stateDir = (env: NodeJS.ProcessEnv = process.env): string => resolve(env.SUPERAGENT_STATE_DIR ?? join(homedir(), '.superagent-t3'))

@@ -21,11 +21,13 @@ See [PLAN.md](PLAN.md) for the design, the phases and what is still approximate.
 2. **A pinned "Superagent" thread.** This is the console: ask it what needs you, start requests, answer questions, stop or retry work.
 3. **An attention queue.** In the console, `superagent_attention` draws an interactive queue (an MCP App, which renders with Codex). The same view is at `/panel/<console token>` for t3code's browser tab.
 4. **Links back.** Every acknowledgement and result the super agent posts ends with **Open in T3 Code**.
-5. **A "Superagent Watchdog" thread.** Its agent schedules its own checks with t3code's scheduler, so it keeps checking even when the super agent is down. It checks the health of t3code, GitHub, the Router and the job queues, and whether each worker is making real progress. It can nudge a looping worker or retry a failed one; anything else becomes an alert in the console's attention queue. Only a person stops a ticket.
+5. **A "Superagent Watchdog" thread.** Its agent schedules its own checks with t3code's scheduler, so it keeps checking even when the super agent is down. It checks the health of t3code, GitHub, the Router, the project list and the job queues, and whether each worker is making real progress. It can nudge a looping worker or retry a failed one; anything else becomes an alert in the console's attention queue. Only a person stops a ticket.
 
 ## Run it
 
 Requirements: Node 22.19 or later, git, and `t3 serve` with the project added in t3code.
+
+Workers still launch in one project only: the one `SUPERAGENT_PROJECT_ROOT` (or `SUPERAGENT_PROJECT_ID`) names. Without it the super agent starts console-only: it lists every T3 Code project (see "Projects" below) and refuses requests with "multi-project routing is not enabled yet". Per-ticket projects come in later phases of [docs/multi-project-plan.md](docs/multi-project-plan.md).
 
 1. Sign the super agent in to t3code once with `npm run connect` (point 5); see "Sign-in" below.
 2. In the t3code project's settings, turn off PR watching and "continue threads after server update". The super agent handles both (PLAN.md, ground rule 3).
@@ -49,19 +51,21 @@ ANTHROPIC_API_KEY=<key> \
 npm start
 ```
 
-It prints the console thread and the panel URL. Open the **Superagent** thread in t3code and ask, for example, "start a request: fix the typo in the README".
+It prints every T3 Code project with its status, the counts (for example "2 ready, 3 no-git, 108 not-registered, 2 denied"), the console thread and the panel URL. Open the **Superagent** thread in t3code and ask, for example, "start a request: fix the typo in the README".
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `T3_MCP_URL` | `http://127.0.0.1:3773/mcp` | The t3code environment's MCP URL (Settings → Environments → Copy MCP URL) |
 | `T3_MCP_TOKEN` | the token `npm run connect` saved | An `mcp-client` token given directly |
-| `SUPERAGENT_STATE_DIR` | `~/.superagent-t3` | The database and the saved t3code token |
-| `SUPERAGENT_PROJECT_ROOT` | required | The project's checkout, as registered in t3code |
-| `SUPERAGENT_PROJECT_ID` | found from the root | The t3code project id |
-| `SUPERAGENT_WORKTREE_ROOT` | `<root>/../<name>-superagent` | Where Ticket worktrees go |
-| `SUPERAGENT_BASE_REF` | `HEAD` | What new worktrees start from |
+| `SUPERAGENT_STATE_DIR` | `~/.superagent-t3` | The database, the saved t3code token and the other state files (below) |
+| `SUPERAGENT_PROJECT_ROOT` | none: console-only | The checkout of the project workers use, as registered in t3code |
+| `SUPERAGENT_PROJECT_ID` | found from the root | That project's t3code id; needed when two t3code projects have the same folder |
+| `SUPERAGENT_WORKTREE_ROOT` | `<root>/../<name>-superagent` | Where that project's Ticket worktrees go |
+| `SUPERAGENT_BASE_REF` | `HEAD` | What that project's new worktrees start from |
+| `SUPERAGENT_CATALOGUE` | none | A `repositories.json` that describes the folders on this machine, such as `/Users/hextor/coding/repositories.json`; read again when it changes |
+| `SUPERAGENT_PROJECTS_FILE` | `<state dir>/projects.json` | Per-project overrides (below); optional |
 | `SUPERAGENT_PORT` / `SUPERAGENT_PUBLIC_URL` | `3790` / `http://127.0.0.1:3790` | Where t3code's agents reach this service |
-| `SUPERAGENT_CONSOLE_TOKEN` | random | The secret in the console and panel URLs; set it so they survive restarts |
+| `SUPERAGENT_CONSOLE_TOKEN` | made once and kept in `<state dir>/console-token` | The secret in the console and panel URLs |
 | `SUPERAGENT_OPERATOR` | `operator` | The operator's name on the console's allowed list |
 | `SUPERAGENT_MAX_WORKERS` | `3` | Worker threads running at once |
 | `SUPERAGENT_RUNTIME_MODE` | the token's ceiling | Runtime mode for worker threads |
@@ -79,6 +83,65 @@ It prints the console thread and the panel URL. Open the **Superagent** thread i
 | `SUPERAGENT_WATCHDOG_MINUTES` | `15` | Minutes between Watchdog checks; `0` turns it off |
 
 The Router reads Anthropic credentials the way the SDK does: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or an `ant auth login` profile. It sends the default server-side refusal fallback (`fallbacks: "default"`), so a declined request is retried on a fallback model.
+
+`SUPERAGENT_WORKTREE_ROOT`, `SUPERAGENT_BASE_REF` and `SUPERAGENT_REPOSITORY` belong to the project `SUPERAGENT_PROJECT_ROOT` names; setting them without it is refused. GitHub needs that project: with `SUPERAGENT_GITHUB_LOGIN` set and no project, the start is refused. A project that is set but does not resolve to a ready T3 Code project also refuses the start, as before. When t3code has that folder twice (a symlinked form of it), the one registered under the path `SUPERAGENT_PROJECT_ROOT` gives is used, as before; if neither matches it, set `SUPERAGENT_PROJECT_ID`. Setting both to different folders is refused. A project registered at a folder inside a git checkout, rather than its top level, still works there, as before, and the start says so. So does starting without a project while tickets from an earlier start are open.
+
+### State files
+
+Everything goes in the state directory (`SUPERAGENT_STATE_DIR`, `~/.superagent-t3` by default); loading the configuration writes nothing, the start does:
+
+- `state.sqlite`: the database.
+- `t3-token.json`: the t3code sign-in (mode 600).
+- `console-token`: the console token, made on the first start when `SUPERAGENT_CONSOLE_TOKEN` is not set (mode 600). The console and Watchdog threads and the panel URL now survive restarts without the variable. If it was not set before, the first start of this version makes one new console thread and one new Watchdog thread; archive the old ones in T3 Code.
+- `superagent.lock`: the pid of the running instance. A second instance on the same state directory refuses to start; a lock whose process is gone is taken over, and so is one whose pid now belongs to a process that started after the lock was written (a pid reused after a crash or a reboot). When the start is refused, the message names the process; if it is not a superagent, delete the lock file. An instance of an earlier version takes no lock, so stop it before starting this one.
+- `projects.json`: your overrides, if any.
+- `worktrees/<project>/`: where ticket worktrees of projects other than the configured one will go (from phase 2). The folder name comes from the project's key; when two keys give the same name, the second gets a short hash of its T3 Code id. t3code accepts worktrees outside the checkout's folder (see "Several projects on one t3code").
+
+### Projects
+
+The super agent reads T3 Code's project list at the start, every 5 minutes, and when the console asks (`superagent_projects` with `refresh`). It joins it with the catalogue, when `SUPERAGENT_CATALOGUE` is set, by real path (symlinks followed): a folder the catalogue lists gets its purpose and notes; a project inside a catalogued folder but not listed itself copies nothing from it. Catalogued linked worktrees (`git-worktree`) are shown under their main checkout. Git is asked again at every refresh, since the catalogue's git facts are historical.
+
+Each project has a status:
+
+| Status | Meaning |
+| --- | --- |
+| `ready` | Registered in T3 Code, a git checkout whose top level is the folder, not denied |
+| `not-registered` | Catalogued only: add the folder as a project in T3 Code, then refresh |
+| `no-git` | Not a git checkout, or a folder inside one rather than its top level. A catalogued folder whose `.git` file points at a git dir that is not on this machine (a checkout copied from elsewhere) is one too |
+| `denied` | By `projects.json`, by default (`ARCHIVE/`, `PERSONAL/`, `FAMILY/` under the catalogue's workspace), or because it is a folder of the super agent's own worktrees (a `*-superagent` folder or one directly in it, `<state dir>/worktrees`, a `worktreeRoot` from `projects.json`) |
+| `missing-checkout` | The folder no longer exists |
+| `ambiguous` | Two T3 Code projects have the same folder (t3code takes a symlinked form of a registered root as a new project); name the one to use in `projects.json` by its id |
+| `folded` | A linked worktree registered as its own project while its main checkout is registered too; work for that repository goes to the main checkout |
+
+The console's `superagent_projects({ query?, status?, limit?, refresh? })` lists them with the reason, purpose, access, delivery and base ref. Catalogue text from `PERSONAL/` and `FAMILY/` is not sent to the console's model unless `projects.json` allows it.
+
+To make a folder a project, once per project:
+
+1. Add the folder as a project in T3 Code. The super agent cannot: its token is refused `t3_project_create`.
+2. In that project's settings in T3 Code, turn off PR watching and "continue threads after server update". The super agent cannot read or change these settings.
+3. Optionally, add an entry to `projects.json`.
+
+`projects.json` maps a key to overrides. A key is a T3 Code project id, an absolute path, a catalogue path, or a prefix ending in `/` (absolute, or relative to the catalogue's workspace). The more specific key wins: an id over a path over a prefix, and a longer prefix over a shorter one. An entry for `ARCHIVE/`, `PERSONAL/` or `FAMILY/` replaces that default, and a longer one such as `ARCHIVE/tool/` overrides it there; a broader prefix, such as the whole workspace, does not lift the defaults. When two projects have the same key (two T3 Code projects with one title), the second gets its T3 Code id added; which one keeps the plain key does not change between refreshes. Unknown fields are refused, and an invalid file stops the start; a later refresh with an invalid file keeps the last good list.
+
+```json
+{
+  "NDC/bardash": { "access": "named", "aliases": ["bardash", "bar"], "baseRef": "main", "dirty": "warn" },
+  "PERSONAL/automix": { "access": "named", "describe": true },
+  "COMMON/": { "access": "deny" }
+}
+```
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `access` | `work`, `named` (default), `deny` | `deny` never takes work. `named` and `work` differ only once the Router may pick a project itself |
+| `aliases` | names | More names the console can use for the project |
+| `delivery` | `pr`, `branch` | `branch`: commit on the ticket branch, no push, no pull request. Only the project `SUPERAGENT_REPOSITORY` maps to can use `pr` |
+| `baseRef` | a ref | What new worktrees start from; default the local branch `origin/HEAD` names, else `main`, else `master` |
+| `worktreeRoot` | an absolute path | Where the project's ticket worktrees go; default `<state dir>/worktrees/<project>` |
+| `dirty` | `warn` (default), `refuse` | When the base is the branch checked out and the checkout has uncommitted changes |
+| `describe` | `true`, `false` | Whether the catalogue's purpose and notes may be sent to models; `false` by default under `PERSONAL/` and `FAMILY/` |
+
+The configured project keeps its own settings (`SUPERAGENT_WORKTREE_ROOT`, `SUPERAGENT_BASE_REF`, `SUPERAGENT_REPOSITORY`) and access `work`; only an entry for its own id or path can deny it.
 
 ## Sign-in (point 5)
 
