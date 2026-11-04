@@ -31,7 +31,8 @@ export type Access = 'work' | 'named' | 'deny'
 export type Delivery = 'pr' | 'branch'
 /**
  * - `ready`: registered in T3 Code, a git checkout whose top level is the root, not denied;
- * - `not-registered`: catalogued only; T3 Code has no project for it;
+ * - `not-registered`: catalogued only; T3 Code has no project for it. `superagent_add_project` adds one that is a git main
+ *   checkout; the reason of a linked worktree names its main checkout instead;
  * - `no-git`: not a git checkout, or the root is not the checkout's top level;
  * - `denied`: by projects.json, by the default prefix `ARCHIVE/`, or because it is a folder of the super agent's own worktrees;
  * - `missing-checkout`: the folder no longer exists;
@@ -435,6 +436,14 @@ export class ProjectRegistry {
     return deniedBy ? `It is denied by ${overrides[deniedBy] ? 'projects.json' : 'default'} (${deniedBy}).` : undefined
   }
 
+  /**
+   * The catalogue's workspace (its real path), which catalogue paths are relative to; undefined without a catalogue. Reads the
+   * catalogue again when it changed, and throws when it cannot be read.
+   */
+  workspace(): string | undefined {
+    return this.options?.catalogue ? this.readCatalogue(this.options.catalogue).workspace : undefined
+  }
+
   /** Reports refreshes to the Watchdog's health entries under `projects`. */
   reportTo(health: Health): void { this.health = health }
   /** Refreshes on a timer until `stop`. A registry from `single` has nothing to refresh. */
@@ -453,6 +462,16 @@ export class ProjectRegistry {
     if (!this.options) return
     if (this.refreshedAt && Date.now() - Date.parse(this.refreshedAt) < maxAgeMs) return
     await this.refresh()
+  }
+
+  /**
+   * Reads everything again, starting after the read that runs now, if one does, so the list has what changed before the call:
+   * a project the t3 CLI has just added, or a folder just catalogued. `refresh` joins a read that runs, which may have read
+   * T3 Code or the catalogue before the change. Throws as `refresh` does.
+   */
+  async reread(): Promise<ProjectEntry[]> {
+    await this.inflight?.catch(() => {})
+    return this.refresh()
   }
 
   /** Reads everything again. A failure keeps the last good list, marks `projects` failing, and is thrown to the caller. */
@@ -686,7 +705,37 @@ async function assemble(input: AssembleInput): Promise<{ entries: ProjectEntry[]
     if (main && main !== entry.abs) mains.set(entry, main)
   })
   const hasOwner = (main: string) => entries.some(item => item.root === main) || unjoined.some(item => item.abs === main && !mains.has(item))
-  const others = unjoined.filter(entry => !hasOwner(mains.get(entry) ?? '')).map(entry => catalogueOnly(entry, rules, input.overrides))
+  const listedOnly = unjoined.filter(entry => !hasOwner(mains.get(entry) ?? ''))
+  // A linked worktree is no project of its own whatever the catalogue calls it, so the reason of one that is listed names the
+  // main checkout to add instead: the catalogued `git-worktree` entries above, and any other entry whose `.git` is a file.
+  const linked = new Map<Catalogued, string>([...mains].filter(([entry]) => listedOnly.includes(entry)))
+  await pool(listedOnly.filter(entry => entry.exists && !linked.has(entry) && dotGitFile(entry.abs)), 8, async entry => {
+    const git = await gitFacts(entry.abs)
+    const main = git && mainOf(git)
+    if (main && main !== entry.abs) linked.set(entry, main)
+  })
+  // The main checkout as the worktree's reason names it, with its status: work goes to a ready project, an addable folder can
+  // be added, and a denied one, registered, catalogued or under a denied path or prefix, takes no work of either.
+  const workspace = catalogue?.workspace ?? ''
+  const mainCheckout = (main: string): MainCheckout => {
+    const registered = entries.filter(item => item.root === main)
+    const project = registered.find(item => item.status === 'ready') ?? registered[0]
+    if (project) return { root: main, key: project.key, id: project.id, status: project.status, ...project.reason ? { reason: project.reason } : {} }
+    const catalogued = unjoined.find(item => item.abs === main)
+    if (catalogued) {
+      const own = catalogueOnly(catalogued, rules, input.overrides, workspace)
+      return { root: main, key: catalogued.path, status: own.status, ...own.reason ? { reason: own.reason } : {}, addable: own.reason === notRegisteredReason(catalogued.path, main) }
+    }
+    let deniedBy: string | undefined
+    for (const rule of rules.filter(item => item.kind !== 'id' && matches(item, undefined, main)).sort(bySpecificity)) {
+      if (rule.override.access) deniedBy = rule.override.access === 'deny' ? rule.key : undefined
+    }
+    return { root: main, ...deniedBy ? { status: 'denied', reason: `Denied by ${input.overrides[deniedBy] ? 'projects.json' : 'default'} (${deniedBy}).` } : {} }
+  }
+  const others = listedOnly.map(entry => {
+    const main = linked.get(entry)
+    return catalogueOnly(entry, rules, input.overrides, workspace, main ? mainCheckout(main) : undefined)
+  })
 
   // Keys and worktree folders are unique: a second project with the same key gets its T3 Code id added, and a second one
   // with the same folder name a short hash of its id. Which one keeps the plain name depends only on facts that stay the
@@ -718,17 +767,58 @@ async function assemble(input: AssembleInput): Promise<{ entries: ProjectEntry[]
   return { entries: all, ...problem ? { problem } : {} }
 }
 
-/** A catalogued folder T3 Code has no project for. */
-function catalogueOnly(entry: Catalogued, rules: Rule[], overrides: Record<string, ProjectOverride>): ProjectEntry {
+/**
+ * Why a catalogued git checkout is not a project yet, and how to make it one: `superagent_add_project` adds it, and the
+ * console agent and the routers show this text when a request names it.
+ */
+export const notRegisteredReason = (path: string, abs: string): string => `Not a T3 Code project yet: call superagent_add_project with `
+  + `project ${path} to add it (or add ${abs} as a project in T3 Code, then run superagent_projects with refresh).`
+
+/**
+ * Why `superagent_add_project` does not add a folder whose real path is outside the catalogue's workspace: a catalogue path
+ * through a symlink, or one with `../`. The deny rules (`ARCHIVE/`, projects.json prefixes) are paths inside the workspace,
+ * so they would never apply to it.
+ */
+export const outsideReason = (path: string, abs: string, workspace: string): string => `${path} is ${abs}, outside the catalogue's workspace `
+  + `${workspace}: superagent_add_project adds only folders inside it. Add it as a project in T3 Code itself if it should be one.`
+
+/** A linked worktree's main checkout, for the reason of the catalogued worktree. */
+interface MainCheckout {
+  root: string
+  /** Its key, when it is registered or catalogued. */
+  key?: string
+  /** Its T3 Code id, when it is registered. */
+  id?: string
+  /** The registered project's or the catalogued folder's status, or `denied` by the rules on its path; undefined for one that is neither. */
+  status?: ProjectStatus
+  reason?: string
+  /** A catalogued folder `superagent_add_project` can add. */
+  addable?: boolean
+}
+
+/**
+ * A catalogued folder T3 Code has no project for.
+ *
+ * @param workspace - the catalogue's workspace; a folder outside it is not added.
+ * @param main - for a linked worktree, its main checkout.
+ */
+function catalogueOnly(entry: Catalogued, rules: Rule[], overrides: Record<string, ProjectOverride>, workspace: string, main?: MainCheckout): ProjectEntry {
   let override: ProjectOverride = {}, deniedBy: string | undefined
   for (const rule of rules.filter(item => item.kind !== 'id' && matches(item, undefined, entry.abs)).sort(bySpecificity)) {
     override = { ...override, ...rule.override }
     if (rule.override.access) deniedBy = rule.override.access === 'deny' ? rule.key : undefined
   }
+  const linked = main && (main.id && main.status === 'ready' ? `which is the T3 Code project ${main.key}: file its work there.`
+    : main.addable ? `so add its main checkout instead: superagent_add_project with project ${main.key}.`
+      : main.status ? `so work cannot go to it or to its main checkout${main.id ? `, the T3 Code project ${main.key},` : main.key ? ` ${main.key},` : ','} `
+        + `which is ${main.status}: ${main.reason ?? 'it cannot take work.'}`
+        : `which is not in the catalogue: add ${main.root} to the catalogue, then add it with superagent_add_project.`)
   const [status, reason]: [ProjectStatus, string] = !entry.exists ? ['missing-checkout', `${entry.abs} no longer exists.`]
     : override.access === 'deny' ? ['denied', `Denied by ${overrides[deniedBy ?? ''] ? 'projects.json' : 'default'} (${deniedBy}).`]
     : notCheckout(entry.abs) ? ['no-git', notCheckout(entry.abs)!]
-    : ['not-registered', `Add ${entry.abs} as a project in T3 Code, then run superagent_projects with refresh.`]
+    : !within(entry.abs, workspace) ? ['not-registered', outsideReason(entry.path, entry.abs, workspace)]
+    : main ? ['not-registered', `${entry.abs} is a linked worktree of ${main.root}, not a project of its own, ${linked}`]
+    : ['not-registered', notRegisteredReason(entry.path, entry.abs)]
   return { key: entry.path, title: basename(entry.path), aliases: override.aliases ?? [], root: entry.abs, worktreeRoot: '',
     baseRef: override.baseRef ?? 'HEAD', delivery: 'branch', access: override.access ?? 'named', dirty: override.dirty ?? 'warn', status, reason,
     legacy: false, describe: override.describe ?? true, catalogue: facts(entry), worktrees: [] }
@@ -748,6 +838,11 @@ function notCheckout(abs: string): string | undefined {
   if (!gitdir) return `${dotGit} is a file with no gitdir line, so ${abs} is not a git checkout; workers need one.`
   return existsSync(resolve(abs, gitdir)) ? undefined
     : `${abs} is not a git checkout here: its .git file points at ${gitdir}, which does not exist on this machine.`
+}
+
+/** Whether a folder's `.git` is a file, as a linked worktree's (or a submodule's) is. */
+function dotGitFile(abs: string): boolean {
+  try { return statSync(join(abs, '.git')).isFile() } catch { return false }
 }
 
 function facts(entry: Catalogued): CatalogueFacts {

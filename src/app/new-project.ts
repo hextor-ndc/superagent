@@ -59,7 +59,8 @@ export interface T3Cli {
 export function t3Cli({ bin, baseDir }: { bin: string; baseDir?: string }): T3Cli {
   return {
     problem: () => executable(bin) ? undefined
-      : `The T3 Code CLI ${bin} cannot be run here: set T3_BIN to the t3 binary, which superagent_new_project needs to add the project.`,
+      : `The T3 Code CLI ${bin} cannot be run here: set T3_BIN to the t3 binary, which superagent_new_project and superagent_add_project `
+        + 'need to add a project.',
     async addProject(root, title) {
       const args = ['project', 'add', `--title=${title}`, ...baseDir ? ['--base-dir', baseDir] : [], root]
       let out: string
@@ -78,6 +79,9 @@ export function t3Cli({ bin, baseDir }: { bin: string; baseDir?: string }): T3Cl
     },
   }
 }
+/** Why a project the CLI added is not in T3 Code's list: the CLI wrote to another server's data directory. */
+export const notListed = (said: string, root: string): string => `The t3 CLI said "${said.split('\n')[0]}", but T3 Code does not list ${root}: `
+  + 'SUPERAGENT_T3_BASE_DIR must be the data directory of the t3code T3_MCP_URL names (T3 Code\'s default, ~/.t3, when it is not set).'
 /** Whether `bin` is an executable path, or a name found on PATH. */
 function executable(bin: string): boolean {
   const candidates = bin.includes('/') ? [bin] : (process.env.PATH ?? '').split(delimiter).filter(Boolean).map(dir => join(dir, bin))
@@ -147,8 +151,9 @@ const ENTRY_FIELDS = ['path', 'purpose', 'flow', 'modules', 'notes', 'related', 
 const OPTIONAL_FIELDS = new Set(['source_evidence', 'subprojects', 'retrieval_optimization_update', 'hosted_production_check'])
 /** One folder name: letters, digits, spaces and `. _ + -`, not starting with a dot or a dash and not ending in a dot or a space. */
 const SEGMENT = /^[A-Za-z0-9][A-Za-z0-9 ._+-]*$/
-const MANUAL_STEP = 'In T3 Code, open the settings of the project %s and turn off PR watching and "continue threads after server update". '
-  + 'The super agent cannot read or change these settings.'
+/** What the operator still has to do in T3 Code for a project the super agent added: it cannot read or change these settings. */
+export const manualStep = (title: string): string => `In T3 Code, open the settings of the project "${title}" and turn off PR watching and `
+  + '"continue threads after server update". The super agent cannot read or change these settings.'
 const DEFAULT_FLOW = 'New project: nothing is built yet.'
 
 /**
@@ -197,10 +202,7 @@ export async function newProject(context: NewProjectContext, given: NewProjectIn
     }
     const end = Date.now() + (context.listWaitMs ?? 10_000)
     while (!(project = await listed()) && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 250))
-    if (!project) {
-      throw new Error(`The t3 CLI said "${said.split('\n')[0]}", but T3 Code does not list ${abs}: SUPERAGENT_T3_BASE_DIR must be the data directory `
-        + 'of the t3code T3_MCP_URL names (T3 Code\'s default, ~/.t3, when it is not set).')
-    }
+    if (!project) throw new Error(notListed(said, abs))
   }
   job.projectId = project.id
   writeAtomic(jobPath, `${JSON.stringify(job, null, 2)}\n`)
@@ -216,14 +218,15 @@ export async function newProject(context: NewProjectContext, given: NewProjectIn
     : { result: `not changed: there is no ${indexFile}` }
 
   step('refresh')
-  await context.projects.refresh()
+  // A read that runs now, such as the timer's, may have read T3 Code before the CLI added the project.
+  await context.projects.reread()
   const made = context.projects.byId(project.id)
   job.done = now().toISOString()
   writeAtomic(jobPath, `${JSON.stringify(job, null, 2)}\n`)
   return {
     key: made?.key ?? folder, status: made?.status ?? 'not listed', ...made?.reason ? { why: made.reason } : {}, project_id: project.id,
     title: input.title, root: abs, head, branch: 'main', catalogue: catalogued.result, index: indexed.result,
-    ...catalogued.scope ? { scope: catalogued.scope } : {}, backups, manual_step: MANUAL_STEP.replace('%s', `"${input.title}"`),
+    ...catalogued.scope ? { scope: catalogued.scope } : {}, backups, manual_step: manualStep(input.title),
     ...plan.job ? { repeated: true as const } : {}, job: job.id ?? plan.hash,
   }
 }

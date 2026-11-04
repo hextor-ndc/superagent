@@ -14,6 +14,9 @@
  * Last, `superagent_new_project` starts `PERSONAL/garden` in the temp catalogue (repositories.json and REPOSITORIES.md in the
  * server's folder, which is the catalogue's workspace): the folder, its git repository, the T3 Code project through the t3
  * CLI on this server's base dir, both catalogue entries, and a first request whose worker runs in the new project's worktree.
+ * Then `superagent_add_project` adds `NDC/oldshop`, a git checkout that exists already and is catalogued but not in T3 Code:
+ * a request there is refused naming the tool, the tool adds it through the CLI on this server's base dir (T3 Code lists it
+ * over /mcp, with the catalogue path as its title), it is ready, and a first request's worker runs in its own worktree.
  *
  * Run with `T3_LIVE=1 npx vitest run tests/live/two-projects.spec.ts`; `TWO_PROJECTS_LOGS=1` prints the service's output.
  */
@@ -324,5 +327,56 @@ describe.skipIf(!live)(`superagent with two projects on a real t3code${live ? ''
     expect(archived.isError).toBe(true)
     expect(JSON.stringify(archived.content)).toContain('It is denied by default (ARCHIVE/).')
     expect(existsSync(join(server.dir, 'ARCHIVE'))).toBe(false)
+  }, TEST_MS)
+
+  it('adds a catalogued checkout that exists already, and runs a request there in its own worktree', async () => {
+    // An existing repository with a commit and an uncommitted file, catalogued but not in T3 Code.
+    const root = join(server.dir, 'NDC', 'oldshop')
+    mkdirSync(join(server.dir, 'NDC'), { recursive: true })
+    execFileSync('git', ['init', '-q', '-b', 'main', root])
+    writeFileSync(join(root, 'README.md'), '# oldshop\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-q', '-m', 'init')
+    writeFileSync(join(root, 'WIP.md'), 'not committed\n')
+    const file = join(server.dir, 'repositories.json')
+    const catalogue = JSON.parse(readFileSync(file, 'utf8')) as { repositories: { path: string }[] }
+    catalogue.repositories.unshift({ path: 'NDC/oldshop', purpose: 'The old shop.', kind: 'git-repository' } as { path: string })
+    writeFileSync(file, `${JSON.stringify(catalogue, null, 2)}\n`)
+    const head = git(root, 'rev-parse', 'HEAD')
+    const status = git(root, 'status', '--porcelain')
+
+    const listed = await call('superagent_projects', { refresh: true, status: 'not-registered' }) as { projects: Record<string, unknown>[]; to_add: string }
+    expect(listed.projects).toEqual([expect.objectContaining({ key: 'NDC/oldshop', status: 'not-registered',
+      why: expect.stringContaining('call superagent_add_project with project NDC/oldshop') })])
+    expect(listed.to_add).toContain('superagent_add_project')
+    const refused = await raw('superagent_request', { text: '[R08] Fix the old shop', project: 'NDC/oldshop' })
+    expect(refused.isError).toBe(true)
+    expect(JSON.stringify(refused.content)).toContain('call superagent_add_project with project NDC/oldshop')
+    expect((await probe.listProjects()).filter(project => project.workspaceRoot === root)).toEqual([])
+
+    const added = await call('superagent_add_project', { projects: [{ project: 'NDC/oldshop' }], request: '[R09] Fix the old shop [worker]', wait_seconds: 20 }) as
+      { summary: string; projects: Record<string, unknown>[]; request: Record<string, unknown> }
+    expect(added.summary).toBe('1 added')
+    expect(added.projects).toEqual([expect.objectContaining({ outcome: 'added', key: 'NDC/oldshop', status: 'ready', title: 'NDC/oldshop', root,
+      warnings: [expect.stringContaining('has 1 uncommitted change')], manual_step: expect.stringContaining('the project "NDC/oldshop"') })])
+    // T3 Code itself lists it, at the real path, under the id the tool returned and with the catalogue path as its title.
+    expect((await probe.listProjects()).filter(project => project.workspaceRoot === root))
+      .toEqual([{ id: added.projects[0]!.project_id, workspaceRoot: root, title: 'NDC/oldshop' }])
+    // The repository is as it was: same commit, same uncommitted file.
+    expect(git(root, 'rev-parse', 'HEAD')).toBe(head)
+    expect(git(root, 'status', '--porcelain')).toBe(status)
+    // The first request runs in a worktree of this repository, under the state dir, and finishes.
+    expect(added.request).toMatchObject({ status: 'accepted', filed_in: 'NDC/oldshop', project: 'NDC/oldshop' })
+    const thread = await threadOf(added.request.short as string)
+    expect(thread.projectId).toBe(added.projects[0]!.project_id)
+    expect(thread.worktreePath.startsWith(`${realpathSync(join(stateDir, 'worktrees', 'ndc-oldshop'))}${sep}`)).toBe(true)
+    expect(git(root, 'worktree', 'list')).toContain(thread.worktreePath)
+    expect(git(server.checkout, 'worktree', 'list')).not.toContain(thread.worktreePath)
+    expect((await ended(added.request.ticket_id as string)).outcome).toBe('completed')
+    // A repeat finds it registered, runs nothing, and files the request once.
+    const again = await call('superagent_add_project', { projects: [{ project: 'NDC/oldshop' }], request: '[R09] Fix the old shop [worker]', wait_seconds: 0 }) as
+      { summary: string; request: Record<string, unknown> }
+    expect(again).toMatchObject({ summary: '1 registered already', request: { repeated: true, trigger_id: added.request.trigger_id } })
+    expect((await probe.listProjects()).filter(project => project.workspaceRoot === root)).toHaveLength(1)
   }, TEST_MS)
 })
