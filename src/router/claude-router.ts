@@ -41,6 +41,8 @@ export interface ClaudeRouterOptions {
   store: Store
   settings: () => Settings
   view: (ticket: Ticket) => TicketView
+  /** How a ticket's work is delivered (its binding's `delivery`), so a `branch` result is not held to pull-request rules. */
+  delivery?: (ticketId: string) => 'pr' | 'branch' | undefined
   /** Calls the Messages API; tests pass a scripted model. */
   call?: ModelCall
   model?: string
@@ -92,7 +94,7 @@ export class ClaudeRouter implements Router {
     if (!kind) return
     const summary = report.summary.length > REPORT_CHARS ? `${report.summary.slice(0, REPORT_CHARS)}…` : report.summary
     this.add({ id: `${kind}:${ticket.id}:${Date.now()}`, text: JSON.stringify({ type: kind, ticket: this.options.view(ticket), state: report.state,
-      summary, ...report.question ? { attention: { question: report.question } } : {},
+      summary, ...this.options.delivery?.(ticket.id) === 'branch' ? { delivery: 'branch' } : {}, ...report.question ? { attention: { question: report.question } } : {},
       ...report.answers ? { answers_trigger_id: report.answers } : {},
       next: kind === 'worker_attention' ? 'Ask the person with orchestrator_reply purpose=attention, copying the question into human_action.'
         : report.state === 'ready' ? 'Tell the requester the result with orchestrator_reply purpose=result, unless a matched rule says otherwise.'

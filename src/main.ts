@@ -7,7 +7,7 @@ import { ProjectRegistry } from './app/projects.ts'
 import { Runtime } from './app/runtime.ts'
 import { acquireLock, ensureConsoleToken } from './app/state-files.ts'
 import { loadConfig, stateDir } from './config.ts'
-import { startHttp } from './http/server.ts'
+import { serve } from './http/server.ts'
 import { McpT3Client } from './t3/client.ts'
 import { connect, daysLeft, loadToken, saveToken } from './t3/connect.ts'
 
@@ -45,13 +45,13 @@ async function run(): Promise<void> {
   if (config.github && !projects.legacy()) throw new Error('GitHub needs the project its repository belongs to: set SUPERAGENT_PROJECT_ROOT and SUPERAGENT_REPOSITORY.')
 
   const runtime = new Runtime(config, t3, projects)
-  await runtime.prepare()
-  const http = await startHttp(runtime, config.port)
+  // The migration of earlier state runs before HTTP opens and before any work resumes.
+  const http = await serve(runtime, config.port)
   runtime.start()
   await runtime.ensureConsole()
   await runtime.ensureWatchdog().catch(error => log(`starting the Watchdog failed: ${error instanceof Error ? error.message : String(error)}`))
   log(`ready: router ${config.router.kind}${config.github ? `, GitHub ${runtime.workProject?.repository} as ${config.github.login}` : ''}; `
-    + `work in ${runtime.workProject ? runtime.workProject.key : 'no project (requests are refused)'}; `
+    + `unnamed requests go to ${runtime.workProject?.key ?? (runtime.requestRefusal() ? 'no project (they are refused)' : runtime.projects.ready()[0]!.key)}; `
     + `console ${runtime.console?.link ?? runtime.console?.threadId}, panel ${runtime.panelUrl()}`)
 
   const shutdown = async () => {

@@ -13,6 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Assignment, Ticket, TicketInput } from '../../vendor/dsh/src/core/index.ts'
 import { T3Executor, type TicketThread } from '../../src/executor/t3-executor.ts'
 import type { McpT3Client } from '../../src/t3/client.ts'
+import { singleProject } from '../harness.ts'
 import { eventually, live, poll, skipReason, startT3, type T3Server } from './t3-server.ts'
 
 const TEST_MS = 120_000
@@ -86,7 +87,7 @@ describe.skipIf(!live)(`read tracking on a real t3code${live ? '' : ` (skipped: 
         inputsRead: (_ticketId: string, ids: string[]) => record('read', ids),
         turnEnded: () => record('turnEnded'),
       }),
-      settings: () => ({}) as never, project: { id: server.projectId, root: server.checkout }, worktreeRoot: server.dir, workerUrl: token => `http://worker/${token}`,
+      settings: () => ({}) as never, ...singleProject({ id: server.projectId, root: server.checkout, worktreeRoot: server.dir }), workerUrl: token => `http://worker/${token}`,
       maxWorkers: () => 2, waitMs: 1000, idlePollMs: 200, pendingCheckMs: 60_000, log: (text, error) => { logged.push(`${text}: ${String(error)}`) },
       state: { load: () => [entry], save: () => {} },
     })

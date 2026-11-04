@@ -41,6 +41,15 @@ export class Store implements Repositories {
     this.db.exec(SCHEMA)
   }
   close(): void { this.db.close() }
+  /**
+   * Copies the whole database to `path` with `VACUUM INTO`, which gives a consistent copy in WAL mode. Must run outside any
+   * transaction; throws when the copy fails or `path` exists.
+   */
+  backup(path: string): void {
+    if (this.depth) throw new Error('A backup cannot run inside a transaction.')
+    mkdirSync(dirname(path), { recursive: true })
+    this.db.prepare('VACUUM INTO ?').run(path)
+  }
 
   atomic<T>(work: () => T): T {
     const level = this.depth++

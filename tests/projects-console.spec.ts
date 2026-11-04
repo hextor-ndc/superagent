@@ -1,17 +1,18 @@
 /**
- * Phase 1 of docs/multi-project-plan.md in the Runtime: the console's `superagent_projects`, a console-only start with no
- * project configured, the refusal of requests while work can only go to the legacy project, the start check for tickets
- * left without a project, and the Watchdog's `projects` part.
+ * Phases 1 and 2 of docs/multi-project-plan.md in the Runtime: the console's `superagent_projects`, a console-only start with
+ * no project configured, the refusal of unnamed requests when no project is the default (D21), tickets that keep their
+ * project across a start without one, and the Watchdog's `projects` part.
  */
 import { createHash } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { threadKey } from '../vendor/dsh/src/core/index.ts'
 import { consoleTrigger } from '../src/app/console-source.ts'
 import { ProjectRegistry } from '../src/app/projects.ts'
 import { Runtime } from '../src/app/runtime.ts'
 import type { Config } from '../src/config.ts'
-import { NO_PROJECT } from '../src/executor/t3-executor.ts'
+import { unregistered } from '../src/executor/t3-executor.ts'
 import { watchdogCheck } from '../src/mcp/watchdog-tools.ts'
 import { FakeT3 } from './fake-t3.ts'
 import { checkout, data, harness, mcp, until, type Harness } from './harness.ts'
@@ -63,10 +64,6 @@ describe('projects in the console', () => {
     const console = await mcp(`${made.base}/mcp/console/console-secret`)
     const call = async (name: string, args: Record<string, unknown> = {}) => data(await console.callTool({ name, arguments: args }))
 
-    // One ready project: still refused, since work cannot go to a project nobody configured yet.
-    const one = await console.callTool({ name: 'superagent_request', arguments: { text: 'Fix the README' } })
-    expect(JSON.stringify(one.content)).toContain(`multi-project routing is not enabled yet: to work in widgets, set SUPERAGENT_PROJECT_ROOT to`)
-
     t3.addProject({ id: 'p-gadgets', workspaceRoot: join(dir, 'gadgets'), title: 'Gadgets' })
     const refreshed = await call('superagent_projects', { refresh: true })
     expect(refreshed).toMatchObject({ summary: '2 ready, 1 denied, 1 missing-checkout', total: 4 })
@@ -83,7 +80,8 @@ describe('projects in the console', () => {
 
     const many = await console.callTool({ name: 'superagent_request', arguments: { text: 'Fix the README' } })
     expect(many.isError).toBe(true)
-    expect(JSON.stringify(many.content)).toContain('multi-project routing is not enabled yet: 2 projects are ready (Gadgets, widgets)')
+    expect(JSON.stringify(many.content)).toContain('multi-project routing is not enabled yet: 2 projects are ready (Gadgets, widgets). '
+      + 'Set SUPERAGENT_PROJECT_ROOT to the project unnamed requests go to')
     expect(made.runtime.repo.tickets.list()).toEqual([])
 
     expect(await call('superagent_projects', { query: 'widgets' })).toMatchObject({ total: 1, projects: [{ key: 'widgets' }] })
@@ -102,10 +100,15 @@ describe('projects in the console', () => {
       note: 'The list is the last one read.' })
     t3.listProjects = list
 
-    // A request that reaches the Engine some other way takes no ticket: the executor has no project to prepare it in.
-    made.runtime.engine.receive(consoleTrigger('hector', 'Fix the README'))
-    await until(() => made!.errors.some(error => error.includes(NO_PROJECT)), 'the refused accept')
+    // A request that reaches the Engine some other way takes no ticket: no project is the default, so the rules router ignores it
+    // with the reason, as the accept would roll back.
+    const other = consoleTrigger('hector', 'Fix the README')
+    made.runtime.engine.receive(other)
+    const decision = await until(() => made!.runtime.repo.decisions.byThread(threadKey(other.threads[0]!))[0], 'the decision')
+    expect(decision).toMatchObject({ kind: 'ignore' })
+    expect(JSON.stringify(decision)).toContain('An accept needs a project, and none is the default')
     expect(made.runtime.repo.tickets.list()).toEqual([])
+    expect(made.runtime.repo.kv.list('ticket-project:')).toEqual([])
     await console.close()
   })
 
@@ -132,7 +135,26 @@ describe('projects in the console', () => {
     expect(stop).toHaveBeenCalled()
   })
 
-  it('refuses to start without a project when tickets of the earlier one are open', async () => {
+  it('takes an unnamed request into the one ready project when no legacy project is set (D21), and says so', async () => {
+    const { dir } = checkout('widgets')
+    catalogue(dir, [{ path: 'widgets', purpose: 'Widget shop.' }])
+    const t3 = new FakeT3([{ id: 'p-widgets', workspaceRoot: join(dir, 'widgets'), title: 'Widgets' }])
+    made = await consoleOnly(t3, dir)
+    const console = await mcp(`${made.base}/mcp/console/console-secret`)
+    expect(data(await console.callTool({ name: 'superagent_projects', arguments: {} }))).toMatchObject({
+      work: 'Requests go to widgets, the only ready project; multi-project routing is not enabled yet.' })
+    const accepted = await console.callTool({ name: 'superagent_request', arguments: { text: 'Fix the README' } })
+    expect(accepted.isError).toBeFalsy()
+    const thread = await until(() => t3.workerThreads()[0], 'the worker thread')
+    const ticket = made.runtime.repo.tickets.list()[0]!
+    expect(made.runtime.binding(ticket.id)).toMatchObject({ projectId: 'p-widgets', key: 'widgets', by: 'single', delivery: 'branch',
+      worktreeRoot: join(dir, 'state', 'worktrees', 'widgets') })
+    expect(thread).toMatchObject({ projectId: 'p-widgets', worktreePath: join(dir, 'state', 'worktrees', 'widgets', ticket.execution!.name) })
+    expect(data(await console.callTool({ name: 'superagent_projects', arguments: {} }))).toMatchObject({ projects: [{ key: 'widgets', open_tickets: 1 }] })
+    await console.close()
+  })
+
+  it('starts without a project when the open tickets of the earlier one carry their binding', async () => {
     const place = checkout()
     const database = join(place.dir, 'state.sqlite')
     const t3 = new FakeT3([{ id: 'project-1', workspaceRoot: place.root }])
@@ -141,15 +163,16 @@ describe('projects in the console', () => {
     await until(() => t3.workerThreads()[0], 'the worker thread')
     await made.close()
     made = undefined
-    // Started again with no project configured, as main.ts builds it: prepare() runs before HTTP opens and work resumes.
+    // Started again with no project configured, as main.ts builds it: the ticket keeps the project it was accepted into.
     const projects = await ProjectRegistry.load({ t3: new FakeT3([]), stateDir: join(place.dir, 'state') })
     const config = { ...noProjectConfig(place.dir), database }
     const runtime = new Runtime(config, new FakeT3([]), projects)
-    await expect(runtime.prepare()).rejects.toThrow('1 open ticket was made in the project workers used, and now no project is set for work')
+    await runtime.prepare()
+    expect(runtime.binding(runtime.repo.tickets.list()[0]!.id)).toMatchObject({ projectId: 'project-1', by: 'legacy' })
     await runtime.stop()
   })
 
-  it('fails a ticket that resumes its launch without a project, rather than leaving it waiting', async () => {
+  it('fails a ticket that resumes its launch after its project left T3 Code, rather than leaving it waiting', async () => {
     const place = checkout()
     const database = join(place.dir, 'state.sqlite')
     const t3 = new FakeT3([{ id: 'project-1', workspaceRoot: place.root }])
@@ -159,14 +182,17 @@ describe('projects in the console', () => {
     made.runtime.engine.receive(consoleTrigger('hector', 'Speed up the build'))
     await until(() => made!.runtime.repo.tickets.list()[0]?.execution, 'the accepted ticket')
     await made.close()
-    // Started again with no project and without the prepare() check main.ts runs: the executor itself fails the launch.
+    // Started again with no project, and T3 Code no longer has the ticket's: the new thread's launch fails the ticket.
     const projects = await ProjectRegistry.load({ t3: new FakeT3([]), stateDir: join(place.dir, 'state') })
-    made = await harness(new FakeT3([]), place, database, { legacy: undefined }, { projects })
+    const empty = new FakeT3([])
+    made = await harness(empty, place, database, { legacy: undefined }, { projects })
+    const binding = made.runtime.binding(made.runtime.repo.tickets.list()[0]!.id)!
     const failed = await until(() => {
       const ticket = made!.runtime.repo.tickets.list()[0]
-      return ticket && JSON.stringify(ticket).includes(NO_PROJECT) ? ticket : undefined
+      return ticket && JSON.stringify(ticket).includes(JSON.stringify(unregistered(binding)).slice(1, -1)) ? ticket : undefined
     }, 'the failed launch')
     expect(failed.id).toBeDefined()
+    expect(empty.calls.filter(call => call.tool === 't3_thread_launch' && !(call.args as { scratch?: boolean }).scratch)).toEqual([])
   })
 
   it('needs a console token: loadConfig leaves it empty until main.ts reads or makes the saved one', async () => {

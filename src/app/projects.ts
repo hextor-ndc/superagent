@@ -14,6 +14,8 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
+import type { Trigger } from '../../vendor/dsh/src/core/index.ts'
+import { CONSOLE } from './console-source.ts'
 import type { LegacyProject } from '../config.ts'
 import type { ProjectSummary, T3Client } from '../t3/client.ts'
 import type { Health } from './health.ts'
@@ -86,6 +88,130 @@ export interface ProjectEntry {
 }
 
 export type Resolved = { found: ProjectEntry } | { found?: undefined; suggestions: string[] }
+
+/**
+ * Who chose a ticket's project (plan, 3.2): the operator named it (`operator`), the GitHub mapping did (`github`), the Router
+ * chose it (`router`, phase 3b), a follow-up carried it over (`inherited`), or the bind-time default picked it (`legacy`: the
+ * legacy project; `single`: the one ready project when there is no legacy project; D21).
+ */
+export type BoundBy = 'operator' | 'github' | 'router' | 'inherited' | 'legacy' | 'single'
+
+/**
+ * kv `ticket-project:<ticketId>`: the project a ticket was accepted into, as the registry had it at that moment. It is a
+ * snapshot, so a later change in T3 Code, the catalogue or projects.json never moves a ticket, and every launch, retry,
+ * restart and resume reads its project from here and nowhere else (D3). `kv.list` returns values only, so it carries its
+ * ticket id.
+ */
+export interface ProjectBinding {
+  ticketId: string
+  /** The T3 Code project id the worker's thread launches under. */
+  projectId: string
+  key: string
+  title: string
+  /** The checkout's real path, where git runs and worktrees are made from. */
+  root: string
+  /** The repository's common git dir at bind time; a checkout whose common dir differs later is another repository. */
+  commonDir?: string
+  /** The project's default branch at bind time, which the review list checks merges into. */
+  defaultBranch?: string
+  /** The folder the ticket's worktree is in. A ticket from before bindings were kept has the folder its worktree is in already. */
+  worktreeRoot: string
+  baseRef: string
+  delivery: Delivery
+  repository?: string
+  dirty: 'warn' | 'refuse'
+  by: BoundBy
+  at: string
+}
+export const BINDING_PREFIX = 'ticket-project:'
+export const bindingKey = (ticketId: string): string => `${BINDING_PREFIX}${ticketId}`
+
+/** The binding of a ticket to a registered project; `worktreeRoot` replaces the project's own, as the migration needs. */
+export function bindingOf(entry: ProjectEntry, ticketId: string, by: BoundBy, at: string, worktreeRoot = entry.worktreeRoot): ProjectBinding {
+  if (!entry.id) throw new Error(`${entry.key} is not a T3 Code project.`)
+  return { ticketId, projectId: entry.id, key: entry.key, title: entry.title, root: entry.root, ...entry.commonDir ? { commonDir: entry.commonDir } : {},
+    ...entry.defaultBranch ? { defaultBranch: entry.defaultBranch } : {}, worktreeRoot, baseRef: entry.baseRef, delivery: entry.delivery,
+    ...entry.repository ? { repository: entry.repository } : {}, dirty: entry.dirty, by, at }
+}
+
+/**
+ * A project hint a Trigger carries in `meta` (D6): `meta.project` with `meta.projectBy`. `operator` (set by
+ * `superagent_request`) and `source` (the GitHub mapping) are explicit; `inherited` (copied to a follow-up) is not. `meta` is
+ * untrusted, so anything else is no hint.
+ */
+export function projectHint(trigger: Pick<Trigger, 'meta'>): { project: string; by: 'operator' | 'source' | 'inherited' } | undefined {
+  const { project, projectBy } = trigger.meta
+  if (typeof project !== 'string' || !project.trim()) return undefined
+  return projectBy === 'operator' || projectBy === 'source' || projectBy === 'inherited' ? { project: project.trim(), by: projectBy } : undefined
+}
+
+/**
+ * Whether a Trigger is a console request stored before the migration to per-ticket projects (D19): it has no `meta.project`
+ * and its `at` is before `schema:projects.migratedAt`. Every such request was made for the project workers used then, the
+ * legacy project, so it counts as an inherited hint for it.
+ */
+export function preUpgrade(trigger: Pick<Trigger, 'meta'> & Partial<Pick<Trigger, 'source' | 'at'>>, migratedAt: string | undefined): boolean {
+  return !!migratedAt && trigger.source === CONSOLE && trigger.meta.project === undefined && !!trigger.at && trigger.at < migratedAt
+}
+
+/**
+ * Which project an accept goes to, by the rules of plan 3.2, in order: an explicit hint on the request's Triggers; a Router
+ * choice (not allowed before phase 3b, so any is refused); an inherited hint, which a console request from before the
+ * migration is for the legacy project (D19); the bind-time default (D21). The project must be ready and not denied. Throws
+ * with the reason otherwise, which rolls the accept back when called in `prepareTicket`. Pure: it reads the registry's last
+ * good list and writes nothing.
+ *
+ * @param triggers - the accept's Triggers, its origin first.
+ * @param choice - the Router's `audit.project`, if the accept carries one.
+ * @param migratedAt - `schema:projects.migratedAt`, when the migration ran.
+ */
+export function resolveProject(registry: ProjectRegistry, { triggers, choice, migratedAt }:
+  { triggers: (Pick<Trigger, 'meta'> & Partial<Pick<Trigger, 'source' | 'at'>>)[]; choice?: unknown; migratedAt?: string }):
+  { entry: ProjectEntry; by: BoundBy } {
+  const hints = triggers.flatMap(trigger => projectHint(trigger) ?? [])
+  const explicit = [...new Map(hints.filter(hint => hint.by !== 'inherited').map(hint => [hint.project, hint])).values()]
+  if (explicit.length > 1) {
+    throw new Error(`The request's messages name different projects (${explicit.map(hint => hint.project).join(', ')}): file one request per project.`)
+  }
+  if (choice !== undefined && choice !== null) {
+    const named = explicit[0]?.project
+    if (named !== undefined && named !== choice) throw new Error(`The request named ${named}, and the route chose ${String(choice)}.`)
+    throw new Error('A Router choice of project is not enabled: the request must name its project, or go to the default one.')
+  }
+  const hint = explicit[0] ?? hints.find(item => item.by === 'inherited')
+  let entry: ProjectEntry, by: BoundBy
+  if (!hint && triggers.some(trigger => preUpgrade(trigger, migratedAt))) {
+    // Not the D21 default: with no legacy project the one ready project may be another folder than the one it was made for.
+    const legacy = registry.configuredLegacy()
+    if (!legacy) {
+      throw new Error(registry.legacyProblem() ?? 'This request was made before the super agent kept a project per ticket, so it was for the '
+        + 'project workers used then, and no such project is set now. Set SUPERAGENT_PROJECT_ROOT to that project and request the work again.')
+    }
+    entry = legacy; by = 'inherited'
+  } else if (hint) {
+    const resolved = registry.resolve(hint.project)
+    if (!resolved.found) {
+      throw new Error(`No project ${hint.project} in T3 Code${resolved.suggestions.length ? `; did you mean ${resolved.suggestions.join(', ')}?` : '.'}`)
+    }
+    entry = resolved.found
+    by = hint.by === 'operator' ? 'operator' : hint.by === 'source' ? 'github' : 'inherited'
+  } else if (registry.hasLegacy()) {
+    const legacy = registry.configuredLegacy()
+    if (!legacy) throw new Error(registry.legacyProblem() ?? 'The project SUPERAGENT_PROJECT_ROOT names is not in T3 Code.')
+    entry = legacy; by = 'legacy'
+  } else {
+    const ready = registry.ready()
+    if (ready.length !== 1) {
+      throw new Error(`An accept needs a project, and none is the default: no legacy project is set and ${ready.length} project`
+        + `${ready.length === 1 ? ' is' : 's are'} ready${ready.length ? ` (${ready.map(item => item.key).join(', ')})` : ''}. `
+        + 'Multi-project routing is not enabled yet: set SUPERAGENT_PROJECT_ROOT to the project unnamed requests go to.')
+    }
+    entry = ready[0]!; by = 'single'
+  }
+  if (entry.status !== 'ready') throw new Error(`Project ${entry.key} is ${entry.status}: ${entry.reason ?? 'it cannot take work.'}`)
+  if (entry.access === 'deny' || !entry.id) throw new Error(`Project ${entry.key} is denied: it never takes work.`)
+  return { entry, by }
+}
 
 const OverrideSchema = z.object({
   access: z.enum(['work', 'named', 'deny']).optional(),
@@ -180,8 +306,14 @@ export class ProjectRegistry {
   /** Every project, ready ones first. */
   list(): ProjectEntry[] { return this.entries }
   ready(): ProjectEntry[] { return this.entries.filter(entry => entry.status === 'ready') }
-  /** The legacy project when it is ready; workers launch only there for now. */
+  /** The legacy project when it is ready: where unnamed requests go (D21). */
   legacy(): ProjectEntry | undefined { return this.entries.find(entry => entry.legacy && entry.status === 'ready') }
+  /** The legacy project whatever its status; undefined when none is configured or it did not resolve (see `legacyProblem`). */
+  configuredLegacy(): ProjectEntry | undefined { return this.entries.find(entry => entry.legacy) }
+  /** Whether `SUPERAGENT_PROJECT_ROOT` or `SUPERAGENT_PROJECT_ID` names a project, resolved or not. */
+  hasLegacy(): boolean { return !!this.options?.legacy || this.entries.some(entry => entry.legacy) }
+  /** The T3 Code project with this id, as the last good refresh saw it. */
+  byId(id: string): ProjectEntry | undefined { return this.entries.find(entry => entry.id === id) }
   /** Why the configured legacy project is not usable; undefined when none is configured or it is ready. */
   legacyProblem(): string | undefined { return this.problem }
   /** When the list was last read, and the error of the last refresh when it failed. */
@@ -235,6 +367,15 @@ export class ProjectRegistry {
     this.timer.unref?.()
   }
   stop(): void { clearInterval(this.timer) }
+  /**
+   * Refreshes when the last good list is older than `maxAgeMs`, as before a new worker thread launches (plan, 3.3). Throws
+   * when that refresh fails, such as when t3code cannot be reached.
+   */
+  async fresh(maxAgeMs: number): Promise<void> {
+    if (!this.options) return
+    if (this.refreshedAt && Date.now() - Date.parse(this.refreshedAt) < maxAgeMs) return
+    await this.refresh()
+  }
 
   /** Reads everything again. A failure keeps the last good list, marks `projects` failing, and is thrown to the caller. */
   refresh(): Promise<ProjectEntry[]> {

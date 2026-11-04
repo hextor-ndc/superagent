@@ -7,7 +7,7 @@ import { z } from 'zod'
 import { liveTicket, type Ticket } from '../../vendor/dsh/src/core/index.ts'
 import { CONSOLE, consoleThread, consoleTrigger } from '../app/console-source.ts'
 import type { Runtime } from '../app/runtime.ts'
-import { STATUSES, type ProjectEntry, type ProjectStatus } from '../app/projects.ts'
+import { BINDING_PREFIX, STATUSES, type ProjectBinding, type ProjectEntry, type ProjectStatus } from '../app/projects.ts'
 import type { PendingQuestion, PendingRequest } from '../t3/client.ts'
 import { ATTENTION_URI, MCP_APP_MIME, attentionPage } from './attention-app.ts'
 import { ok } from './result.ts'
@@ -31,7 +31,7 @@ export function consoleActions(runtime: Runtime) {
         watchdog: runtime.watchdog ? { thread: runtime.watchdog.link ?? runtime.watchdog.threadId, last_check: lastCheck(runtime) ?? null } : null,
         alerts: alerts(runtime).length, recent: tickets.slice(0, 15) }
     },
-    superagent_attention: () => ({ tickets: runtime.attention(), alerts: alerts(runtime) }),
+    superagent_attention: async () => ({ tickets: runtime.attention(), to_review: await runtime.toReview(), alerts: alerts(runtime) }),
     superagent_dismiss_alert: ({ alert_id }: { alert_id: string }) => ({ dismissed: dismissAlert(runtime, alert_id) }),
     superagent_ticket: ({ ticket_id }: { ticket_id: string }) => {
       const found = ticket(ticket_id)
@@ -120,12 +120,18 @@ function projectRows(runtime: Runtime, { query, status, limit, refreshError }: {
     ...entry.describe && entry.catalogue && 'path' in entry.catalogue ? [entry.catalogue.purpose ?? '', entry.catalogue.notes ?? ''] : []].join('\n').toLowerCase()
   const matched = (exact?.found ? [exact.found] : wanted ? all.filter(entry => text(entry).includes(wanted)) : all)
     .filter(entry => !status || entry.status === status)
-  // Every ticket so far was made in the project workers use, the legacy project.
-  const tickets = runtime.repo.tickets.list()
-  const open = tickets.filter(ticket => !ticket.ended).length
-  const last = tickets.map(ticket => ticket.createdAt).sort().at(-1)
-  // The registry's entries are new objects after each refresh, so the work project is matched by id.
-  const works = (entry: ProjectEntry) => !!runtime.workProject && entry.id === runtime.workProject.id
+  // Each ticket's project is its binding's, matched by T3 Code id, since the registry's entries are new objects after each refresh.
+  const bound = new Map(runtime.repo.kv.list<ProjectBinding>(BINDING_PREFIX).map(binding => [binding.ticketId, binding.projectId]))
+  const counts = new Map<string, { open: number; last?: string }>()
+  for (const ticket of runtime.repo.tickets.list()) {
+    const id = bound.get(ticket.id)
+    if (!id) continue
+    const count = counts.get(id) ?? { open: 0 }
+    if (!ticket.ended) count.open++
+    if (!count.last || ticket.createdAt > count.last) count.last = ticket.createdAt
+    counts.set(id, count)
+  }
+  const ready = registry.ready()
   const row = (entry: ProjectEntry) => {
     const catalogue = entry.catalogue
     const described = catalogue && 'path' in catalogue
@@ -138,15 +144,15 @@ function projectRows(runtime: Runtime, { query, status, limit, refreshError }: {
       ...catalogue && 'insideCatalogued' in catalogue ? { inside_catalogued: catalogue.insideCatalogued } : {},
       ...entry.worktrees.length ? { worktrees: entry.worktrees } : {},
       access: entry.access, delivery: entry.delivery, base_ref: entry.baseRef, worktree_root: entry.worktreeRoot,
-      open_tickets: works(entry) ? open : 0, last_ticket: works(entry) ? last ?? null : null,
+      open_tickets: entry.id ? counts.get(entry.id)?.open ?? 0 : 0, last_ticket: entry.id ? counts.get(entry.id)?.last ?? null : null,
     }
   }
   const refreshed = registry.state()
   return {
     summary: registry.summary(),
-    work: runtime.workProject
-      ? `Requests go to ${runtime.workProject.key}, the project SUPERAGENT_PROJECT_ROOT names; multi-project routing is not enabled yet.`
-      : runtime.requestRefusal(),
+    work: runtime.requestRefusal() ?? (registry.hasLegacy()
+      ? `Requests go to ${registry.configuredLegacy()!.key}, the project SUPERAGENT_PROJECT_ROOT names; multi-project routing is not enabled yet.`
+      : `Requests go to ${ready[0]!.key}, the only ready project; multi-project routing is not enabled yet.`),
     ...refreshed.refreshedAt ? { refreshed_at: refreshed.refreshedAt } : {},
     ...refreshError ?? refreshed.error ? { refresh_failed: refreshError ?? refreshed.error, note: 'The list is the last one read.' } : {},
     total: matched.length,
@@ -206,9 +212,10 @@ export function consoleServer(runtime: Runtime): McpServer {
 
   server.registerTool('superagent_attention', {
     description: 'What waits for a person, first: questions to answer, approvals to give in T3 Code, results to review, blocked or failed tickets, and the '
-      + 'Watchdog\'s alerts. Empty means healthy.',
+      + 'Watchdog\'s alerts. `to_review` lists finished tickets of projects without pull requests whose branch is not merged into the project\'s '
+      + 'default branch yet, with the commands that remove the worktree and branch afterwards (the super agent deletes nothing). Empty means healthy.',
     annotations: readOnly, _meta: { ui: { resourceUri: ATTENTION_URI }, 'ui/resourceUri': ATTENTION_URI },
-  }, async () => ok(actions.superagent_attention()))
+  }, async () => ok(await actions.superagent_attention()))
   server.registerTool('superagent_dismiss_alert', { description: 'Dismiss one of the Watchdog\'s alerts once it is dealt with.',
     inputSchema: { alert_id: z.string().min(1) } }, async args => ok(actions.superagent_dismiss_alert(args)))
   server.registerTool('superagent_status', { description: 'Overview: open tickets, worker load, pause state and recent tickets.', annotations: readOnly },

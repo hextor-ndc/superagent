@@ -3,12 +3,12 @@
  * t3code runs the workers. Holds no domain rules of its own.
  */
 import { createHash, randomBytes } from 'node:crypto'
-import { Engine, followupOwners, latestReport, liveTicket, threadKey, ticketStage, type DomainEvent, type SourceScope, type Ticket }
+import { Engine, followupOwners, latestReport, liveTicket, threadKey, ticketStage, type DomainEvent, type SourceScope, type Ticket, type Trigger }
   from '../../vendor/dsh/src/core/index.ts'
 import { SettingsSchema, settingsPolicy, type Settings } from '../../vendor/dsh/src/policy.ts'
 import type { Config } from '../config.ts'
 import { T3Executor, type T3ExecutorOptions, type TicketThread } from '../executor/t3-executor.ts'
-import { MCP_SERVER_NAME, writeMcpConfig } from '../executor/workspace.ts'
+import { MCP_SERVER_NAME, unmerged, writeMcpConfig } from '../executor/workspace.ts'
 import { shortId } from '../executor/render.ts'
 import type { PendingQuestion, PendingRequest, T3Client } from '../t3/client.ts'
 import { GITHUB, GithubSource, ghCli, type Gh } from '../sources/github.ts'
@@ -18,7 +18,8 @@ import { ClaudeRouter, type ModelCall, type Router } from '../router/claude-rout
 import { Jobs } from './jobs.ts'
 import { StoredOutbox } from './outbox.ts'
 import { Health } from './health.ts'
-import { ProjectRegistry, type ProjectEntry } from './projects.ts'
+import { migrateProjects, SCHEMA_KEY, type ProjectsSchema } from './migrate-projects.ts'
+import { BINDING_PREFIX, bindingKey, bindingOf, ProjectRegistry, resolveProject, type ProjectBinding, type ProjectEntry } from './projects.ts'
 import { Store } from './store.ts'
 
 export interface TicketView {
@@ -31,8 +32,21 @@ export interface TicketView {
   pending?: { approvals: { requestId: string; text: string }[]; questions: (PendingQuestion & { requestId: string })[] }
 }
 
+/**
+ * A completed ticket of a `branch` project whose branch is not in the project's default branch yet (D12): the operator's
+ * review list, with the commands that remove what it left once reviewed. The service deletes nothing (open question 8).
+ */
+export interface ReviewItem {
+  id: string; short: string; title: string; project: string; branch: string; worktree: string; ended_at: string
+  /** The branch it is checked against. */
+  into: string
+  summary?: string; link?: string
+  /** To run once the branch is merged, or to discard it; `git branch -d` refuses a branch that is not merged. */
+  cleanup: string[]
+}
+
 /** Timing for the executor and for the look at the Watchdog thread; tests make them short. */
-export type RuntimeTiming = Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs' | 'pendingCheckMs'> & {
+export type RuntimeTiming = Pick<T3ExecutorOptions, 'waitMs' | 'idlePollMs' | 'continueAfterMs' | 'pendingCheckMs' | 'projectsMaxAgeMs' | 'launchRetryMs'> & {
   /** The pause between looks at what the Watchdog thread waits on; 60 s by default. */
   watchdogPendingMs?: number
 }
@@ -62,10 +76,12 @@ export class Runtime {
   /** Every T3 Code project with what the catalogue and projects.json say of it (docs/multi-project-plan.md, 3.1). */
   readonly projects: ProjectRegistry
   /**
-   * The project workers launch in: the legacy project (`SUPERAGENT_PROJECT_ROOT` or `SUPERAGENT_PROJECT_ID`) as the registry
-   * resolved it at the start. Without one, requests are refused until per-ticket projects arrive (plan, phase 2).
+   * The legacy project (`SUPERAGENT_PROJECT_ROOT` or `SUPERAGENT_PROJECT_ID`) as the registry resolved it at the start: where
+   * unnamed requests go, and the project of the GitHub repository. Each ticket keeps its own project in its binding.
    */
   readonly workProject?: ProjectEntry
+  /** The last review list and when it was made; it asks git once per completed ticket, so it is kept for a while. */
+  private review?: { at: number; items: ReviewItem[] }
 
   /**
    * @param projects - the registry main.ts loaded, or one project `{ id, root }`, which becomes `ProjectRegistry.single()` with the
@@ -111,8 +127,7 @@ export class Runtime {
     }
     this.executor = new T3Executor({
       t3, repo: this.repo, engine: () => this.engine, settings: () => this.settings,
-      ...work?.id ? { project: { id: work.id, root: work.root, ...work.repository ? { repository: work.repository } : {} },
-        worktreeRoot: work.worktreeRoot, baseRef: work.baseRef } : {},
+      projects: this.projects, bindings: { of: ticketId => this.binding(ticketId) },
       workerUrl: token => `${config.publicUrl}/mcp/worker/${token}`, maxWorkers: () => this.settings.executor.maxWorkers,
       runtimeMode: config.runtimeMode, log, defer, health: this.health, ...timing,
       ...config.github ? { account: { login: config.github.login, commitEmail: config.github.commitEmail } } : {},
@@ -124,11 +139,13 @@ export class Runtime {
     if (this.github) { const github = this.github; this.outbox.register(GITHUB, message => github.send(message)) }
     this.router = config.router.kind === 'claude'
       ? new ClaudeRouter({ engine: () => this.engine, store: this.repo, settings: () => this.settings, view: ticket => this.view(ticket),
+        delivery: ticketId => this.binding(ticketId)?.delivery,
         model: config.router.model, effort: config.router.effort, defer, log, health: this.health, ...deps.model ? { call: deps.model } : {} })
-      : new InterimRouter(this.jobs, () => this.engine, this.repo, log, config.github ? [config.github.login] : [])
+      : new InterimRouter(this.jobs, () => this.engine, this.repo, log, config.github ? [config.github.login] : [],
+        triggers => this.projectRefusal(triggers))
     this.engine = new Engine({
       repo: this.repo, policy: () => settingsPolicy(this.settings, scope), scope, assessor: this.router, executor: this.executor,
-      outbox: this.outbox, prepareTicket: (ticket, outcome) => this.executor.prepare(ticket, outcome),
+      outbox: this.outbox, prepareTicket: (ticket, outcome) => this.executor.prepare(ticket, outcome, this.bindProject(ticket, outcome)),
       emit: event => {
         this.events.push(event); if (this.events.length > 500) this.events.shift()
         // A person's message that reached an open ticket is its worker's; the Router hears of it in the same transaction, and of
@@ -161,28 +178,56 @@ export class Runtime {
   }
 
   /**
-   * What must hold before HTTP opens and the work of a previous run resumes; main.ts awaits it. Tickets made before were all
-   * made in one project, so without a project to work in they stay where they are and the start is refused. Phase 2's
-   * migration of existing state goes here as well.
+   * What must hold before HTTP opens and the work of a previous run resumes; main.ts awaits it (through `serve`). Migration v1
+   * binds the tickets of an earlier version to the legacy project, after copying the database, and refuses the start when
+   * there are such tickets and no legacy project (src/app/migrate-projects.ts).
    */
   async prepare(): Promise<void> {
-    const open = this.repo.tickets.open().length
-    if (!this.workProject && open) {
-      throw new Error(`${open} open ticket${open === 1 ? ' was' : 's were'} made in the project workers used, and now no project is set for work: `
-        + 'set SUPERAGENT_PROJECT_ROOT (or SUPERAGENT_PROJECT_ID) to that project again.')
-    }
+    await migrateProjects({ store: this.repo, projects: this.projects, database: this.config.database, stateDir: this.config.stateDir,
+      log: this.config.log })
   }
 
+  /** A ticket's project, as bound at its accept. */
+  binding(ticketId: string): ProjectBinding | undefined { return this.repo.kv.get<ProjectBinding>(bindingKey(ticketId)) }
   /**
-   * Why a new console request cannot be taken now; undefined when it can. Until per-ticket projects arrive, work goes only to
-   * the legacy project, so without one every request is refused rather than sent to a project nobody named.
+   * Binds a newly accepted ticket to its project, inside the Engine's accept transaction (the `prepareTicket` hook), by the
+   * rules of `resolveProject`, and records it in kv `ticket-project:<id>`. A throw rolls the whole accept back: no ticket,
+   * decision, subscription or binding is left.
+   */
+  bindProject(ticket: Ticket, outcome: { audit?: Record<string, unknown> }): ProjectBinding {
+    const ids = [ticket.origin.triggerId, ...ticket.origin.triggerIds.filter(id => id !== ticket.origin.triggerId)]
+    const triggers = ids.flatMap(id => this.repo.triggers.get(id) ?? [])
+    const audit = outcome.audit
+    const choice = audit && typeof audit === 'object' && 'project' in audit ? audit.project : undefined
+    const { entry, by } = resolveProject(this.projects, { triggers, choice, migratedAt: this.migratedAt() })
+    const binding = bindingOf(entry, ticket.id, by, new Date().toISOString())
+    this.repo.kv.set(bindingKey(ticket.id), binding)
+    return binding
+  }
+  /**
+   * Why an accept of `triggers` would be refused at its binding, by the same rules and the same registry list; undefined
+   * when it would bind. The rules router asks before it accepts, so a request no project can take is ignored with the reason
+   * instead of failing its job on every try (plan, 3.2).
+   */
+  projectRefusal(triggers: Trigger[]): string | undefined {
+    try { resolveProject(this.projects, { triggers, migratedAt: this.migratedAt() }); return undefined } catch (error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+  }
+  private migratedAt(): string | undefined { return this.repo.kv.get<ProjectsSchema>(SCHEMA_KEY)?.migratedAt }
+
+  /**
+   * Why a new console request cannot be taken now; undefined when it can. Requests cannot name a project yet (phase 3a), so
+   * an unnamed one goes to the legacy project, or to the one ready project when there is no legacy project (D21); otherwise
+   * it is refused rather than sent to a project nobody named. The legacy project is taken as the registry has it now, so one
+   * whose checkout went missing since the start refuses with its status rather than storing a request no ticket can come of.
    */
   requestRefusal(): string | undefined {
-    if (this.workProject) return undefined
+    if (this.projects.hasLegacy()) return this.projectRefusal([])
     const ready = this.projects.ready()
-    const set = 'Set SUPERAGENT_PROJECT_ROOT to the project workers use and restart the super agent.'
+    if (ready.length === 1) return undefined
+    const set = 'Set SUPERAGENT_PROJECT_ROOT to the project unnamed requests go to and restart the super agent.'
     if (ready.length > 1) return `multi-project routing is not enabled yet: ${ready.length} projects are ready (${ready.map(entry => entry.key).join(', ')}). ${set}`
-    if (ready.length === 1) return `multi-project routing is not enabled yet: to work in ${ready[0]!.key}, set SUPERAGENT_PROJECT_ROOT to ${ready[0]!.root} and restart the super agent.`
     return `multi-project routing is not enabled yet, and no project is ready: add a git checkout as a project in T3 Code. ${set} `
       + 'superagent_projects lists what T3 Code has.'
   }
@@ -322,6 +367,27 @@ export class Runtime {
   tickets(): TicketView[] { return this.repo.tickets.list().map(ticket => this.view(ticket)) }
   /** What waits for a person, first; the panel's and the attention app's list. A healthy state is an empty list. */
   attention(): TicketView[] { return this.tickets().filter(view => view.stage.startsWith('person/')) }
+  /**
+   * The review list (D12): completed tickets of `branch` projects whose branch still exists and is not in the project's default
+   * branch. A ready report ends such a ticket at once, so nothing else shows it. Made again when older than `maxAgeMs`.
+   */
+  async toReview(maxAgeMs = 60_000): Promise<ReviewItem[]> {
+    if (this.review && Date.now() - this.review.at < maxAgeMs) return this.review.items
+    const bindings = new Map(this.repo.kv.list<ProjectBinding>(BINDING_PREFIX).map(binding => [binding.ticketId, binding]))
+    const items: ReviewItem[] = []
+    for (const ticket of this.repo.tickets.list()) {
+      const binding = bindings.get(ticket.id), thread = this.executor.thread(ticket.id)
+      if (ticket.ended?.outcome !== 'completed' || binding?.delivery !== 'branch' || !thread?.branch) continue
+      const into = this.projects.byId(binding.projectId)?.defaultBranch ?? binding.defaultBranch ?? 'HEAD'
+      if (!await unmerged(binding.root, thread.branch, into)) continue
+      const summary = latestReport(ticket)?.summary
+      items.push({ id: ticket.id, short: shortId(ticket.id), title: ticket.title, project: binding.key, branch: thread.branch,
+        worktree: thread.worktreePath, ended_at: ticket.ended.at, into, ...summary ? { summary } : {}, ...thread.link ? { link: thread.link } : {},
+        cleanup: [`git -C ${quote(binding.root)} worktree remove ${quote(thread.worktreePath)}`, `git -C ${quote(binding.root)} branch -d ${quote(thread.branch)}`] })
+    }
+    this.review = { at: Date.now(), items }
+    return items
+  }
   /** The Ticket an id names: its full id, or the short `T-xxxxxxxx` form the console shows. */
   findTicket(id: string): Ticket | undefined {
     const wanted = id.replace(/^\[?T-/, '').replace(/\]$/, '')
@@ -331,6 +397,8 @@ export class Runtime {
 }
 
 export const newToken = (): string => randomBytes(24).toString('base64url')
+/** A path or name as one shell word, for the commands the review list shows. */
+const quote = (word: string): string => /^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`
 
 function watchdogSetup(minutes: number): string {
   return [

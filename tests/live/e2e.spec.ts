@@ -19,7 +19,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { ProjectRegistry } from '../../src/app/projects.ts'
 import { Runtime, type TicketView } from '../../src/app/runtime.ts'
 import { loadConfig } from '../../src/config.ts'
-import { startHttp } from '../../src/http/server.ts'
+import { serve } from '../../src/http/server.ts'
 import { McpT3Client, type ThreadRead } from '../../src/t3/client.ts'
 import { eventually, live, skipReason, startT3, type Access, type T3Server } from './t3-server.ts'
 
@@ -58,8 +58,8 @@ describe.skipIf(!live)(`superagent on a real t3code${live ? '' : ` (skipped: ${s
     const projects = await ProjectRegistry.load({ t3, stateDir: config.stateDir, legacy: config.legacy, projectsFile: config.projectsFile })
     if (project) expect(projects.legacy()?.id).toBe(server.projectId)
     const runtime = new Runtime(config, t3, projects, { waitMs: 2000, idlePollMs: 500, continueAfterMs: 1000, pendingCheckMs: 1000 })
-    await runtime.prepare()
-    const http = await startHttp(runtime, 0)
+    // As main.ts: the migration runs before HTTP opens.
+    const http = await serve(runtime, 0)
     const base = `http://127.0.0.1:${(http.address() as AddressInfo).port}`
     // The public URL is known once the server listens; the scripted agents reach it on loopback.
     config.publicUrl = base
@@ -116,17 +116,29 @@ describe.skipIf(!live)(`superagent on a real t3code${live ? '' : ` (skipped: ${s
     expect(agent.errors).toEqual([])
   }, TEST_MS)
 
-  it('starts with no project configured, lists the T3 Code project as ready, and refuses requests until one is set', async () => {
+  it('starts with no project configured, lists the T3 Code project as ready, and runs a request there with branch delivery', async () => {
     const agent = made = await superagent('full-access', { project: false })
     expect(agent.runtime.workProject).toBeUndefined()
     await agent.runtime.ensureConsole()
     const listed = await call(agent, 'superagent_projects', { refresh: true })
     expect(listed.projects).toEqual(expect.arrayContaining([expect.objectContaining({ id: server.projectId, key: 'widgets', status: 'ready',
       root: realpathSync(server.checkout), base_ref: 'main', access: 'named', delivery: 'branch' })]))
-    const refused = await agent.console.callTool({ name: 'superagent_request', arguments: { text: '[R09] Tidy the README [worker]' } })
-    expect(refused.isError).toBe(true)
-    expect(JSON.stringify(refused.content)).toContain('multi-project routing is not enabled yet')
-    expect(agent.runtime.repo.tickets.list()).toEqual([])
+    // The one ready project is the default when no legacy project is set (D21); its worktrees go under the state dir (D13).
+    await call(agent, 'superagent_request', { text: '[R09] Tidy the README [worker]' })
+    const ticket = await ticketOf(agent)
+    const entry = agent.runtime.executor.thread(ticket.id)!
+    expect(agent.runtime.binding(ticket.id)).toMatchObject({ projectId: server.projectId, by: 'single', delivery: 'branch' })
+    expect(entry.worktreePath).toBe(join(agent.runtime.config.stateDir, 'worktrees', 'widgets', ticket.execution!.name))
+    expect(execFileSync('git', ['worktree', 'list'], { cwd: server.checkout, encoding: 'utf8' })).toContain(realpathSync(entry.worktreePath))
+    // The whole first message: t3code cuts each item to 4000 characters unless asked for more.
+    const first = (await agent.t3.read(entry.threadId!, { maxCharsPerItem: 100_000 } as never)).items[0]!.text
+    expect(first).toContain('## Delivery requirements')
+    expect(first).toContain('Deliverable: commit your change on the ticket branch in this worktree. Do not push')
+    expect(first).not.toContain('DSH_SUPERAGENT_GITHUB_REPOSITORY')
+    const done = await eventually(async () => agent.runtime.repo.tickets.get(ticket.id)?.ended, 'the ticket to end', 60_000)
+    expect(done.outcome).toBe('completed')
+    // The scripted worker commits nothing, so its branch is in main already and there is nothing to review.
+    expect((await call(agent, 'superagent_attention')).to_review).toEqual([])
     expect(agent.errors).toEqual([])
   }, TEST_MS)
 

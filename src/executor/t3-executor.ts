@@ -11,8 +11,9 @@ import { latestAssignment, liveTicket, runningAssignment, waitsForPerson, type A
 import type { Settings } from '../../vendor/dsh/src/policy.ts'
 import type { Health } from '../app/health.ts'
 import { Jobs, Later } from '../app/jobs.ts'
+import type { ProjectBinding, ProjectRegistry } from '../app/projects.ts'
 import { T3Error, TERMINAL, type PendingRequest, type T3Client, type T3Status } from '../t3/client.ts'
-import { assignmentMessage, inputMessage, threadTitle, ticketName, type ExecutionVariables } from './render.ts'
+import { assignmentMessage, BRANCH_DELIVERABLE, inputMessage, threadTitle, ticketName, type ExecutionVariables } from './render.ts'
 import { WorkerSlots } from './slots.ts'
 import { prepareWorktree, type Prepared } from './workspace.ts'
 
@@ -21,8 +22,16 @@ export interface TicketThread {
   ticketId: string
   threadId?: string
   link?: string
+  /**
+   * The T3 Code project the thread was launched under, as a cross-check of the Ticket's binding (which stays in its own kv
+   * row, since this record is first saved only after the launch). Absent on records saved before projects were kept per ticket.
+   */
+  projectId?: string
   worktreePath: string
   branch: string
+  /** The commit the worktree started from, when this service made it, and the note on the checkout's uncommitted changes. */
+  baseSha?: string
+  baseNote?: string
   /** The capability in the Ticket's worker MCP URL; only this Ticket's worker holds it. */
   token: string
   /** The latest run whose end was reported to the Engine. */
@@ -54,12 +63,16 @@ export interface T3ExecutorOptions {
   repo: Pick<Repositories, 'tickets' | 'triggers'>
   settings: () => Settings
   /**
-   * The t3code project the workers run in, and its checkout on this machine. Without one (no legacy project configured), no
-   * Ticket can be accepted: `prepare` throws, which rolls the accept back, and a launch fails its Ticket.
+   * The registry, read before a new thread launches: the project must still be registered at the root its Ticket was bound to.
+   * It never chooses a Ticket's project; `bindings` does.
    */
-  project?: { id: string; root: string; repository?: string }
-  worktreeRoot?: string
-  baseRef?: string
+  projects: Pick<ProjectRegistry, 'fresh' | 'byId'>
+  /** Each Ticket's project, as `bindProject` recorded it at the accept: the only place a launch takes its project from (D3). */
+  bindings: { of(ticketId: string): ProjectBinding | undefined }
+  /** How old the registry may be before a new thread's launch reads it again; 60 s by default. */
+  projectsMaxAgeMs?: number
+  /** The first pause before a failed launch is tried again; it doubles each time. 5 s by default. */
+  launchRetryMs?: number
   branchPrefix?: string
   /** Builds a Ticket's worker MCP URL from its capability token. */
   workerUrl: (token: string) => string
@@ -87,8 +100,12 @@ export interface T3ExecutorOptions {
   defer?: (run: () => void) => void
 }
 
-/** Why no Ticket can be accepted or started without a project. */
-export const NO_PROJECT = 'No project to work in: set SUPERAGENT_PROJECT_ROOT to the T3 Code project workers use (multi-project routing is not enabled yet).'
+/** Why a launch of a Ticket that has no binding fails: there is no default at launch time (D3). */
+export const NO_BINDING = 'No project is recorded for this ticket, and a launch never picks one: stop it and request the work again.'
+/** Why a new thread cannot launch in a project T3 Code no longer has where the Ticket was bound. */
+export const unregistered = (binding: Pick<ProjectBinding, 'key' | 'root'>): string => `Project ${binding.key} is no longer registered in T3 Code at `
+  + `${binding.root}. A ticket keeps the project it was accepted into, so a retry fails the same way: stop it and request the work again, `
+  + 'so it is filed in the project\'s current registration.'
 
 /** How many times a worker whose turn failed is told to go on before its Ticket is reported failed, as in the prototype. */
 const CONTINUATIONS = 3
@@ -173,9 +190,12 @@ export class T3Executor implements Executor {
     try { this.options.state?.save(entry) } catch (error) { this.options.log?.(`saving the thread of ${entry.ticketId} failed`, error) }
   }
 
-  // The Engine's `prepareTicket` hook: what the executor chose for a newly accepted Ticket.
-  prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
-    if (!this.options.project || !this.options.worktreeRoot) throw new Error(NO_PROJECT)
+  /**
+   * The Engine's `prepareTicket` hook, after the Runtime bound the Ticket to `binding`: its worktree goes in the project's
+   * worktree folder, and a `branch` project's deliverable is written into the assignment, which the brief reads as the
+   * explicit request for another deliverable than a pull request.
+   */
+  prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, binding: Pick<ProjectBinding, 'worktreeRoot' | 'delivery'>): Ticket {
     const name = ticketName(outcome.name, ticket.id)
     const ruleIds = ticket.mandate.basis.rules
     const rules = this.options.settings().policy.rules.filter(rule => ruleIds?.includes(rule.id))
@@ -185,7 +205,8 @@ export class T3Executor implements Executor {
       ? `Proactively accepted under ${ruleIds.join(', ')}. Scope: ${outcome.scope}.${rules ? `\nMatched rules; their procedure and `
         + `communication instructions take precedence for this ticket:${rules}` : ''}${note}`
       : `Scope: ${outcome.scope}.${note}`
-    return { ...ticket, execution: { name, directory: join(this.options.worktreeRoot, name), assignment } }
+    const deliverable = binding.delivery === 'branch' ? `\n${BRANCH_DELIVERABLE}` : ''
+    return { ...ticket, execution: { name, directory: join(binding.worktreeRoot, name), assignment: `${assignment}${deliverable}` } }
   }
 
   /** The t3code thread of a Ticket, for links and the console. */
@@ -243,7 +264,8 @@ export class T3Executor implements Executor {
   load(): { used: number; max: number } { return { used: this.slots.used(), max: this.options.maxWorkers() } }
 
   start(ticket: Ticket, assignment: Assignment): void {
-    this.jobs.enqueue(`launch:${ticket.id}`, () => this.launch(ticket.id, assignment.id), { retries: 3, firstDelayMs: 5000, maxDelayMs: 300_000 })
+    this.jobs.enqueue(`launch:${ticket.id}`, () => this.launch(ticket.id, assignment.id),
+      { retries: 3, firstDelayMs: this.options.launchRetryMs ?? 5000, maxDelayMs: 300_000 })
   }
   deliver(ticket: Ticket, assignment: Assignment): void {
     this.jobs.enqueue(`deliver:${ticket.id}`, () => this.deliverNow(ticket.id, assignment.id), { retries: 6, firstDelayMs: 2000 })
@@ -309,27 +331,68 @@ export class T3Executor implements Executor {
     // A stop queued meanwhile stays, for the next launch to wait on: it is a stop of this Assignment, which the looks below see.
     if (this.stopping.get(ticketId) === stopping) this.stopping.delete(ticketId)
     if (!this.waitsToStart(ticketId, assignmentId)) return
-    const project = this.options.project, worktreeRoot = this.options.worktreeRoot
-    if (!project || !worktreeRoot) { this.fail(ticketId, NO_PROJECT); return }
+    // Every launch, retry, restart and resume takes its project from the binding alone; without one it fails, never defaults.
+    const binding = this.options.bindings.of(ticketId)
+    if (!binding) { this.fail(ticketId, NO_BINDING); return }
+    const known = this.threads.get(ticketId)
+    if (known?.projectId && known.projectId !== binding.projectId) {
+      this.fail(ticketId, `This ticket's thread is in T3 Code project ${known.projectId}, but the ticket is bound to ${binding.key} (${binding.projectId}): `
+        + 'stop it and request the work again.')
+      return
+    }
     this.slots.reserve(ticketId, 'launch')
     let stopped = false
     try {
-      const entry = this.threads.get(ticketId) ?? this.newEntry(ticket)
+      const entry = known ?? this.newEntry(ticket)
+      // A retry or a restart with a thread only sends to it. A new thread needs the project registered where it was bound:
+      // re-adding a folder in T3 Code gives it a new id, and the binding is a snapshot, so a plain retry would fail again.
+      if (!entry.threadId) {
+        try { await this.options.projects.fresh(this.options.projectsMaxAgeMs ?? 60_000) } catch (error) {
+          if (!(error instanceof T3Error)) {
+            // A local file (projects.json, the catalogue) the refresh could not read. It says nothing of T3 Code's ids and roots,
+            // so the last list read still answers whether the project is registered there, and t3code checks the launch itself.
+            this.options.log?.(`reading the projects before launching ${ticketId} failed; checking its project against the last list read`, error)
+          } else if (error.transient) {
+            // T3 Code cannot be asked now: the launch is tried again later, and the Ticket does not fail.
+            throw new Error(`Reading T3 Code's projects before launching ${ticketId} failed: ${message(error)}`)
+          } else {
+            // A lasting refusal, such as a token that may not list projects, fails the Ticket where it shows, as a launch's does.
+            if (this.waitsToStart(ticketId, assignmentId)) this.fail(ticketId, `Reading T3 Code's projects before the launch failed: ${error.message}`)
+            return
+          }
+        }
+        const registered = this.options.projects.byId(binding.projectId)
+        if (!registered || registered.root !== binding.root) {
+          if (this.waitsToStart(ticketId, assignmentId)) this.fail(ticketId, unregistered(binding))
+          return
+        }
+      }
       let prepared: Prepared
       try {
-        prepared = await prepareWorktree({ projectRoot: project.root, worktreeRoot,
-          name: ticket.execution!.name, branchPrefix: this.options.branchPrefix ?? 'agent/', baseRef: this.options.baseRef ?? 'HEAD',
-          mcpUrl: this.options.workerUrl(entry.token) })
+        prepared = await prepareWorktree({ projectRoot: binding.root, ...binding.commonDir ? { commonDir: binding.commonDir } : {},
+          worktreeRoot: binding.worktreeRoot, directory: ticket.execution!.directory, name: ticket.execution!.name,
+          branchPrefix: this.options.branchPrefix ?? 'agent/', baseRef: binding.baseRef, dirty: binding.dirty, mcpUrl: this.options.workerUrl(entry.token) })
       } catch (error) {
         // A failed preparation fails the Ticket at once, as in the prototype: a retry or a person's message prepares again.
         if (this.waitsToStart(ticketId, assignmentId)) this.fail(ticketId, `Preparing the worktree failed: ${message(error)}`)
         return
       }
-      Object.assign(entry, { worktreePath: prepared.worktreePath, branch: prepared.branch })
+      Object.assign(entry, { worktreePath: prepared.worktreePath, branch: prepared.branch, projectId: binding.projectId })
+      if (prepared.base) {
+        entry.baseSha = prepared.base.sha
+        if (prepared.base.note) entry.baseNote = prepared.base.note
+        else delete entry.baseNote
+      }
       this.threads.set(ticketId, entry)
       if (!this.waitsToStart(ticketId, assignmentId)) { stopped = true; return }
+      const described = this.options.projects.byId(binding.projectId)
+      const catalogue = described?.describe && described.catalogue && 'path' in described.catalogue ? described.catalogue : undefined
       const variables: ExecutionVariables = { ticketId, name: ticket.execution!.name, directory: prepared.worktreePath, branch: prepared.branch,
-        repository: project.repository, account: this.options.account?.login, commitEmail: this.options.account?.commitEmail }
+        ...binding.delivery === 'pr' && binding.repository ? { repository: binding.repository } : {},
+        account: this.options.account?.login, commitEmail: this.options.account?.commitEmail, delivery: binding.delivery,
+        ...entry.baseSha ? { base: { ref: binding.baseRef, sha: entry.baseSha, ...entry.baseNote ? { note: entry.baseNote } : {} } } : {},
+        project: { title: binding.title, key: binding.key, root: binding.root, ...catalogue?.purpose ? { purpose: catalogue.purpose } : {},
+          ...catalogue?.map ? { map: catalogue.map } : {} } }
       const origin = this.options.repo.triggers.get(ticket.origin.triggerId)
       const batch = ticket.origin.triggerIds.filter(id => id !== ticket.origin.triggerId).flatMap(id => this.options.repo.triggers.get(id) ?? [])
       const text = assignmentMessage(ticket, origin, variables, batch)
@@ -339,7 +402,7 @@ export class T3Executor implements Executor {
         await this.options.t3.send(threadId, `${text}\n\nThis is a new assignment of the same ticket: continue from the worktree's current state.`,
           `assign:${assignmentId}`)
       } else {
-        const launched = await this.options.t3.launch({ projectId: project.id, title: threadTitle(ticket), message: text,
+        const launched = await this.options.t3.launch({ projectId: binding.projectId, title: threadTitle(ticket), message: text,
           worktreePath: prepared.worktreePath, branch: prepared.branch, clientRequestId: `launch:${assignmentId}`,
           ...(this.options.runtimeMode ? { runtimeMode: this.options.runtimeMode } : {}) })
         threadId = launched.threadId
@@ -402,7 +465,8 @@ export class T3Executor implements Executor {
     const wakes = !this.busy.has(ticketId)
     if (wakes) this.slots.reserve(ticketId, inputs.some(fromPerson) ? 'person' : 'wake')
     try {
-      const text = inputs.flatMap(input => inputMessage(input, input.kind === 'trigger' ? this.options.repo.triggers.get(input.triggerId) : undefined) ?? [])
+      const delivery = this.options.bindings.of(ticketId)?.delivery
+      const text = inputs.flatMap(input => inputMessage(input, input.kind === 'trigger' ? this.options.repo.triggers.get(input.triggerId) : undefined, delivery) ?? [])
         .join('\n\n')
       const ids = inputs.map(input => input.id)
       const sent = text ? await this.options.t3.send(entry.threadId, text, deliverRequestId(assignmentId, ids)) : undefined
@@ -541,7 +605,8 @@ export class T3Executor implements Executor {
     const held = runId ? entry.queued?.[runId] ?? [] : []
     const ticket = this.options.repo.tickets.get(ticketId)
     const again = held.flatMap(id => ticket?.inputs.find(input => input.id === id) ?? [])
-      .flatMap(input => inputMessage(input, input.kind === 'trigger' ? this.options.repo.triggers.get(input.triggerId) : undefined) ?? [])
+      .flatMap(input => inputMessage(input, input.kind === 'trigger' ? this.options.repo.triggers.get(input.triggerId) : undefined,
+        this.options.bindings.of(ticketId)?.delivery) ?? [])
     try {
       const sent = await this.options.t3.send(entry.threadId!, 'Your previous turn failed with an error. Go on with the assignment from where it stopped.'
         + (again.length ? `\n\nThe messages below came for the turn that failed. They are sent again in case it failed before you read them:\n\n${again.join('\n\n')}` : ''),

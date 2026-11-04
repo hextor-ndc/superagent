@@ -14,6 +14,8 @@
  *   answer (it is the answer) stays with the worker. The stop is kept in the store until the Engine took it, so a restart
  *   or a failed attempt does not lose it;
  * - proactive (inferred) candidates are ignored, so nothing proactive happens without the real Router;
+ * - a request no project can take now (the legacy project's checkout is gone, say) is ignored with the reason, as binding it
+ *   would fail;
  * - a worker's `ready` report goes back to the requester as the result, and its question as the attention message.
  */
 import { liveTicket, UserError, type Candidate, type EngineForMainSession, type Ticket, type Trigger, type WorkerReport }
@@ -28,10 +30,14 @@ const STOPS = 'interim-stop:'
 const STOP_REASON = 'The person asked to stop on the ticket\'s thread.'
 
 export class InterimRouter implements Router {
-  /** @param agents - the agent's own account names (its GitHub login); a mention of anyone else is not addressed to it. */
+  /**
+   * @param agents - the agent's own account names (its GitHub login); a mention of anyone else is not addressed to it.
+   * @param projectRefusal - why an accept of these Triggers would be refused at its binding to a project (`Runtime.projectRefusal`);
+   *   undefined when it would bind.
+   */
   constructor(private readonly jobs: Jobs, private readonly engine: () => Pick<EngineForMainSession, 'candidateDelivered' | 'decide' | 'reply'>,
     private readonly store: Pick<Store, 'tickets' | 'triggers' | 'kv'>, private readonly log: (message: string, error?: unknown) => void = () => {},
-    private readonly agents: string[] = []) {}
+    private readonly agents: string[] = [], private readonly projectRefusal: (triggers: Trigger[]) => string | undefined = () => undefined) {}
 
   /** Runs the stops a previous run read but did not get to decide. */
   start(): void {
@@ -54,6 +60,10 @@ export class InterimRouter implements Router {
           : 'Not addressed to the agent; the rules router takes only requests addressed to it.')
       }
       const trigger = fresh.at(-1)!
+      // The rules cannot judge a project. An accept no project can take would throw in the Engine's prepareTicket and fail this
+      // job on every try, with nobody told, so it is ignored with the reason (plan, 3.2).
+      const refused = this.projectRefusal(candidate.triggers)
+      if (refused) return ignore(`No project can take this request: ${refused}`)
       engine.decide(trigger.id, { kind: 'accept', evalId: candidate.evalId, title: titleOf(trigger), scope: scopeOf(fresh),
         reason: 'Explicit request from an allowed person.', name: titleOf(trigger) })
     })

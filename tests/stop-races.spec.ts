@@ -10,7 +10,7 @@ import type { Assignment, Ticket, TicketInput } from '../vendor/dsh/src/core/ind
 import { T3Executor, type TicketThread } from '../src/executor/t3-executor.ts'
 import { T3Error, type LaunchInput, type LaunchResult, type SendResult } from '../src/t3/client.ts'
 import { FakeT3 } from './fake-t3.ts'
-import { checkout, until } from './harness.ts'
+import { checkout, singleProject, until } from './harness.ts'
 
 /**
  * A FakeT3 whose launches and sends, once made, hold their answer back until `gate` resolves. With `late` the call itself
@@ -81,7 +81,7 @@ describe('stop races', () => {
         turnEnded: (_ticketId: string, assignmentId: string) => { ends.push(assignmentId) }, inputsDelivered: (_ticketId: string, _assignmentId: string, ids: string[]) => {
           ticket.undelivered = ticket.undelivered.filter(id => !ids.includes(id))
         } }),
-      settings: () => ({}) as never, project: { id: 'project-1', root: '/unused' }, worktreeRoot: '/unused', workerUrl: token => token,
+      settings: () => ({}) as never, ...singleProject({ id: 'project-1', root: '/unused', worktreeRoot: '/unused' }), workerUrl: token => token,
       maxWorkers: () => 1, waitMs: 5, idlePollMs: 5, pendingCheckMs: 1000, continueAfterMs, log: () => {},
       state: { load: () => [entry], save: () => {} },
     })
@@ -174,7 +174,7 @@ describe('stop races', () => {
         ticket.assignments.find(item => item.id === assignmentId)!.state = 'running'
       }, deliveryFailed: () => {}, report: (_ticketId: string, report: { state: string }) => { reports.push(report.state); return {} as never },
       assignmentInterrupted: () => {}, inputsRead: () => {}, turnEnded: () => {}, inputsDelivered: () => {} }),
-      settings: () => ({}) as never, project: { id: 'project-1', root: place.root }, worktreeRoot: join(place.dir, 'worktrees'),
+      settings: () => ({}) as never, ...singleProject({ id: 'project-1', root: place.root, worktreeRoot: join(place.dir, 'worktrees') }),
       workerUrl: token => token, maxWorkers: () => 1, waitMs: 5, idlePollMs: 5, pendingCheckMs: 1000, continueAfterMs, log: () => {},
       state: { load: () => entries, save: entry => { saved.push(structuredClone(entry)) } },
     })

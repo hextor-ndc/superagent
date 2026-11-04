@@ -21,6 +21,10 @@ const DEPLOYMENT = [
     + 'orchestrator_trigger_requeue and orchestrator_thread_unsubscribe. There is no shell, no skill tool and no settings tool here: '
     + 'where the instructions below mention one, the operator does that from the T3 Code console instead.',
   'The console Source is the operator typing in T3 Code; its replies stay in T3 Code.',
+  'A worker report or question that says delivery "branch" is from a ticket in a project without pull requests: its worker commits on the '
+    + 'ticket branch and does not push or open a pull request, and the operator reviews and merges the branch locally. For such a ticket, a '
+    + 'ready report that names the branch and its last commit SHA is a complete result: deliver it, and do not ask for a pull request or '
+    + 'for evidence in one.',
   'When a batch needs nothing from you, end your turn with one short line and no tool call.',
 ].join('\n')
 

@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { Assignment, Ticket, TicketInput } from '../vendor/dsh/src/core/index.ts'
 import { continueRequestId, T3Executor, type TicketThread } from '../src/executor/t3-executor.ts'
 import { FakeT3 } from './fake-t3.ts'
-import { until } from './harness.ts'
+import { singleProject, until } from './harness.ts'
 
 describe('a failed turn across a restart', () => {
   let open: T3Executor[] = []
@@ -42,7 +42,7 @@ describe('a failed turn across a restart', () => {
         report: (_ticketId: string, report: { state: string }) => { reports.push(report.state); return {} as never },
         inputsRead: (_ticketId: string, ids: string[]) => { read.push(...ids) },
         turnEnded: (_ticketId: string, assignmentId: string) => { ends.push(assignmentId); atEnds.push(records.at(-1)) } }),
-      settings: () => ({}) as never, project: { id: 'project-1', root: '/unused' }, worktreeRoot: '/unused', workerUrl: token => token,
+      settings: () => ({}) as never, ...singleProject({ id: 'project-1', root: '/unused', worktreeRoot: '/unused' }), workerUrl: token => token,
       maxWorkers: () => 1, waitMs: 5, idlePollMs: 5, pendingCheckMs: 1000, continueAfterMs: 1, log: () => {},
       state: { load: () => [entry], save: record => { records.push(structuredClone(record)) } },
     })
