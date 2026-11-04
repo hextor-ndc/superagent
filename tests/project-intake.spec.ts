@@ -258,7 +258,8 @@ describe('the console\'s intake across projects (phase 3a)', () => {
     expect(fresh.messages[0]!.text).toContain('pass `project` (its key) on every superagent_request')
     expect(fresh.messages[0]!.text).toContain('superagent_reroute')
     expect(fresh.messages[0]!.text).toContain('superagent_new_project')
-    expect(first.made.runtime.repo.kv.get('console:intro')).toBe(3)
+    expect(fresh.messages[0]!.text).toContain('add it with superagent_add_project')
+    expect(first.made.runtime.repo.kv.get('console:intro')).toBe(4)
     await console!.close(); console = undefined; await first.made.close(); env = undefined
 
     // The thread an earlier version launched and introduced, under the same request id, on a database without the version.
@@ -272,14 +273,15 @@ describe('the console\'s intake across projects (phase 3a)', () => {
     env = await setup({ dir: first.dir, t3, database })
     await env.made.runtime.ensureConsole()
     const old = [...t3.threads.values()].find(item => item.title === 'Superagent')!
-    expect(old.messages.map(message => message.clientRequestId)).toEqual([requestId, `${requestId}:intro-v2`, `${requestId}:intro-v3`])
+    expect(old.messages.map(message => message.clientRequestId)).toEqual([requestId, `${requestId}:intro-v2`, `${requestId}:intro-v3`, `${requestId}:intro-v4`])
     expect(old.messages[1]!.text).toContain('If a ticket went to the wrong project, use superagent_reroute')
     expect(old.messages[2]!.text).toContain('use superagent_new_project')
     expect(old.messages[2]!.text).toContain('only ARCHIVE/ stays denied')
-    expect(env.made.runtime.repo.kv.get('console:intro')).toBe(3)
+    expect(old.messages[3]!.text).toContain('there is a new tool, superagent_add_project')
+    expect(env.made.runtime.repo.kv.get('console:intro')).toBe(4)
     await env.made.close(); env = undefined
 
-    // A thread introduced at version 2 gets only the third update, once.
+    // A thread introduced at version 2 gets only the third and fourth updates, once.
     const t3b = new FakeT3([{ id: 'p-widgets', workspaceRoot: first.widgets, title: 'Widgets' }, { id: 'p-gadgets', workspaceRoot: first.gadgets, title: 'Gadgets' }],
       { checkWorktrees: true })
     await t3b.launchScratch({ title: 'Superagent', clientRequestId: requestId, message: 'This is the Superagent console.' })
@@ -288,8 +290,22 @@ describe('the console\'s intake across projects (phase 3a)', () => {
     await env.made.runtime.ensureConsole()
     await env.made.runtime.ensureConsole()
     const v2 = [...t3b.threads.values()].find(item => item.title === 'Superagent')!
-    expect(v2.messages.map(message => message.clientRequestId)).toEqual([requestId, `${requestId}:intro-v3`])
-    expect(env.made.runtime.repo.kv.get('console:intro')).toBe(3)
+    expect(v2.messages.map(message => message.clientRequestId)).toEqual([requestId, `${requestId}:intro-v3`, `${requestId}:intro-v4`])
+    expect(env.made.runtime.repo.kv.get('console:intro')).toBe(4)
+    await env.made.close(); env = undefined
+
+    // A thread introduced at version 3 gets only the fourth update, once.
+    const t3c = new FakeT3([{ id: 'p-widgets', workspaceRoot: first.widgets, title: 'Widgets' }, { id: 'p-gadgets', workspaceRoot: first.gadgets, title: 'Gadgets' }],
+      { checkWorktrees: true })
+    await t3c.launchScratch({ title: 'Superagent', clientRequestId: requestId, message: 'This is the Superagent console.' })
+    env = await setup({ dir: first.dir, t3: t3c, database: join(first.dir, 'state-v3.sqlite') })
+    env.made.runtime.repo.kv.set('console:intro', 3)
+    await env.made.runtime.ensureConsole()
+    await env.made.runtime.ensureConsole()
+    const v3 = [...t3c.threads.values()].find(item => item.title === 'Superagent')!
+    expect(v3.messages.map(message => message.clientRequestId)).toEqual([requestId, `${requestId}:intro-v4`])
+    expect(v3.messages[1]!.text).toContain('Never add a project the operator did not ask for or agree to.')
+    expect(env.made.runtime.repo.kv.get('console:intro')).toBe(4)
   })
 })
 

@@ -19,6 +19,7 @@ import { Jobs } from './jobs.ts'
 import { StoredOutbox } from './outbox.ts'
 import { Health } from './health.ts'
 import { migrateProjects, SCHEMA_KEY, type ProjectsSchema } from './migrate-projects.ts'
+import { addProjects, type AddProjectInput, type AddProjectResult } from './add-project.ts'
 import { newProject, t3Cli, type NewProjectInput, type NewProjectResult, type Step, type T3Cli } from './new-project.ts'
 import { BINDING_PREFIX, bindingKey, bindingOf, deniedProject, ProjectRegistry, rerouteKey, resolveProject, type BoundBy, type ProjectBinding,
   type ProjectEntry, type ProjectRules, type Rerouted } from './projects.ts'
@@ -61,8 +62,9 @@ export const IGNORED_FOR_MS = 24 * 60 * 60_000
 export type ProjectPreview = { id: string; key: string; title: string; by: BoundBy } | { refused: string }
 
 /**
- * What `superagent_new_project` runs with besides the configuration: the t3 CLI (from `T3_BIN` and `SUPERAGENT_T3_BASE_DIR` by
- * default), and for tests git's environment, a hook before each step and a shorter wait for T3 Code's list.
+ * What `superagent_new_project` and `superagent_add_project` run with besides the configuration: the t3 CLI (from `T3_BIN` and
+ * `SUPERAGENT_T3_BASE_DIR` by default), and for tests git's environment, a hook before each step of a new project and a
+ * shorter wait for T3 Code's list.
  */
 export interface NewProjectDeps { cli?: T3Cli; env?: NodeJS.ProcessEnv; beforeStep?: (step: Step) => void; listWaitMs?: number }
 
@@ -103,9 +105,9 @@ export class Runtime {
   readonly workProject?: ProjectEntry
   /** The last review list and when it was made; it asks git once per completed ticket, so it is kept for a while. */
   private review?: { at: number; items: ReviewItem[] }
-  /** What `superagent_new_project` runs with: the t3 CLI, and in tests git's environment and a hook before each step. */
+  /** What `superagent_new_project` and `superagent_add_project` run with: the t3 CLI, and in tests git's environment and a hook before each step. */
   private readonly starter: NewProjectDeps & { cli: T3Cli }
-  /** The `superagent_new_project` call that runs, which the next one waits for. */
+  /** The `superagent_new_project` or `superagent_add_project` call that runs, which the next one waits for. */
   private starting: Promise<unknown> = Promise.resolve()
 
   /**
@@ -305,6 +307,17 @@ export class Runtime {
     this.starting = job.catch(() => {})
     return job
   }
+  /**
+   * Adds catalogued git checkouts as T3 Code projects (src/app/add-project.ts). It waits for, and is waited for by, the other
+   * calls that add projects, so a new project and an added one never run the CLI at once.
+   */
+  addProjects(inputs: AddProjectInput[]): Promise<AddProjectResult[]> {
+    const { cli, env, listWaitMs } = this.starter
+    const job = this.starting.then(() => addProjects({ catalogue: this.config.catalogue, projects: this.projects, t3: this.t3, cli,
+      ...env ? { env } : {}, ...listWaitMs !== undefined ? { listWaitMs } : {} }, inputs))
+    this.starting = job.catch(() => {})
+    return job
+  }
 
   /** Resumes the work a previous run left (Tickets in t3code threads, messages not yet sent), then starts the passes. */
   start(): void {
@@ -356,7 +369,7 @@ export class Runtime {
         .then(() => this.repo.kv.set(CONSOLE_INTRO_KEY, CONSOLE_INTRO_VERSION), error => this.config.log('introducing the console failed', error))
     } else {
       // Each update once, in order; a failed send leaves the version where it was, so the next start sends it again.
-      for (const [at, text] of [[2, CONSOLE_INTRO_V2], [3, CONSOLE_INTRO_V3]] as const) {
+      for (const [at, text] of [[2, CONSOLE_INTRO_V2], [3, CONSOLE_INTRO_V3], [4, CONSOLE_INTRO_V4]] as const) {
         if ((this.repo.kv.get<number>(CONSOLE_INTRO_KEY) ?? version) >= at) continue
         const sent = await this.t3.send(launched.threadId, text, `${requestId}:intro-v${at}`, 'queue')
           .then(() => { this.repo.kv.set(CONSOLE_INTRO_KEY, at); return true }, error => { this.config.log('updating the console\'s introduction failed', error); return false })
@@ -552,7 +565,7 @@ const WATCHDOG_REARM = 'The superagent has not seen a Watchdog check for a while
 
 /** kv: the version of the introduction the console thread has; 1 for a thread introduced before it was kept. */
 const CONSOLE_INTRO_KEY = 'console:intro'
-const CONSOLE_INTRO_VERSION = 3
+const CONSOLE_INTRO_VERSION = 4
 
 /** How the console agent files work across projects (plan, 3.2), in the introduction and in the update for an older thread. */
 const PROJECT_RULES = [
@@ -569,14 +582,23 @@ const NEW_PROJECT_RULES = [
     + 'and a one-sentence purpose; ask the operator for both when they are not clear. It can also file a first request there. If it '
     + 'fails part way, call it again with the same arguments to finish. Tell the operator the manual step it returns.',
 ]
+/** How the console agent adds a catalogued folder T3 Code does not have yet, in the introduction and in the update for an older thread. */
+const ADD_PROJECT_RULES = [
+  'A project with status not-registered is a folder the catalogue lists that T3 Code does not have yet, and a request there is refused. '
+    + 'When the operator wants work in one, or asks for it, add it with superagent_add_project (several at once if wanted; it can file a '
+    + 'first request in a single one). Its `why` says when a folder cannot be added, such as a linked worktree, whose main checkout it names. '
+    + 'Never add a project the operator did not ask for or agree to. Tell the operator the manual step it returns for each project added.',
+]
 const CONSOLE_INTRO = [
   'This is the Superagent console. You help the operator run the superagent, which works on tickets in their own T3 Code threads.',
   'Use the `superagent` MCP tools: superagent_attention first (what waits for a person), superagent_status, superagent_ticket, '
     + 'superagent_request to start work, superagent_projects (the T3 Code projects and why each can or cannot take work), superagent_new_project, '
+    + 'superagent_add_project, '
     + 'superagent_answer to answer a ticket\'s question, superagent_reroute, superagent_stop, superagent_retry, '
     + 'superagent_note, superagent_pause, superagent_messages and superagent_dismiss_alert (for the Watchdog\'s alerts).',
   ...PROJECT_RULES,
   ...NEW_PROJECT_RULES,
+  ...ADD_PROJECT_RULES,
   'A ticket at person/approve waits on an approval in its T3 Code thread: only T3 Code can grant it, so link the thread and say so.',
   'Keep answers short. Do not do ticket work in this thread: start a request instead, and link each ticket\'s thread when you mention it.',
   'Reply with one line saying you are ready.',
@@ -593,5 +615,11 @@ const CONSOLE_INTRO_V3 = [
   'An update to your instructions: folders under PERSONAL/ and FAMILY/ now take work like any other project, and their purpose and notes are '
     + 'shown; only ARCHIVE/ stays denied unless projects.json says otherwise.',
   ...NEW_PROJECT_RULES,
+  'Reply with one line saying you have it.',
+].join('\n')
+/** What changed in the introduction since version 3. */
+const CONSOLE_INTRO_V4 = [
+  'An update to your instructions: there is a new tool, superagent_add_project.',
+  ...ADD_PROJECT_RULES,
   'Reply with one line saying you have it.',
 ].join('\n')

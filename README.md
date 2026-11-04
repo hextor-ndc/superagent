@@ -53,7 +53,7 @@ ANTHROPIC_API_KEY=<key> \
 npm start
 ```
 
-It prints every T3 Code project with its status, the counts (for example "2 ready, 3 no-git, 108 not-registered, 2 denied"), the console thread and the panel URL. Open the **Superagent** thread in t3code and ask, for example, "start a request: fix the typo in the README". To start a project that does not exist yet, ask the console for it; it uses `superagent_new_project` (see "Starting a new project" below).
+It prints every T3 Code project with its status, the counts (for example "2 ready, 3 no-git, 108 not-registered, 2 denied"), the console thread and the panel URL. Open the **Superagent** thread in t3code and ask, for example, "start a request: fix the typo in the README". To work in a folder the catalogue lists but T3 Code does not have yet (status `not-registered`), ask the console to add it; it uses `superagent_add_project` (see "Adding a catalogued folder" below). To start a project that does not exist yet, ask the console for it; it uses `superagent_new_project` (see "Starting a new project" below).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -66,7 +66,7 @@ It prints every T3 Code project with its status, the counts (for example "2 read
 | `SUPERAGENT_BASE_REF` | `HEAD` | What that project's new worktrees start from |
 | `SUPERAGENT_CATALOGUE` | none | A `repositories.json` that describes the folders on this machine, such as `/Users/hextor/coding/repositories.json`; read again when it changes |
 | `SUPERAGENT_PROJECTS_FILE` | `<state dir>/projects.json` | Per-project overrides (below); optional |
-| `T3_BIN` | `t3` on `PATH` | The T3 Code CLI `superagent_new_project` adds new projects with |
+| `T3_BIN` | `t3` on `PATH` | The T3 Code CLI `superagent_new_project` and `superagent_add_project` add projects with |
 | `SUPERAGENT_T3_BASE_DIR` | T3 Code's own default (`~/.t3`) | The T3 Code data directory that CLI is given (`--base-dir`); set it when the t3code `T3_MCP_URL` names runs on another one |
 | `SUPERAGENT_UNNAMED_REQUESTS` | `default` | A console request that names no project: `default` files it in the configured project (or the one ready project) and says so; `refuse` refuses it |
 | `SUPERAGENT_PORT` / `SUPERAGENT_PUBLIC_URL` | `3790` / `http://127.0.0.1:3790` | Where t3code's agents reach this service |
@@ -114,7 +114,7 @@ Each project has a status:
 | Status | Meaning |
 | --- | --- |
 | `ready` | Registered in T3 Code, a git checkout whose top level is the folder, not denied |
-| `not-registered` | Catalogued only: add the folder as a project in T3 Code, then refresh |
+| `not-registered` | Catalogued only: `superagent_add_project` adds a git checkout to T3 Code (or add the folder in T3 Code, then refresh). For a linked worktree the reason names the main checkout to add instead; a folder whose real path is outside the catalogue's workspace is not added |
 | `no-git` | Not a git checkout, or a folder inside one rather than its top level. A catalogued folder whose `.git` file points at a git dir that is not on this machine (a checkout copied from elsewhere) is one too |
 | `denied` | By `projects.json`, by default (`ARCHIVE/` under the catalogue's workspace), or because it is a folder of the super agent's own worktrees (a `*-superagent` folder or one directly in it, `<state dir>/worktrees`, a `worktreeRoot` from `projects.json`). A deny holds for the repository: a registered linked worktree whose main checkout is denied (registered and denied, or under a denied path or prefix) is denied too, wherever its own folder is |
 | `missing-checkout` | The folder no longer exists |
@@ -127,9 +127,19 @@ The console's `superagent_projects({ query?, status?, limit?, refresh? })` lists
 
 To make an existing folder a project, once per project:
 
-1. Add the folder as a project in T3 Code. The super agent cannot: its token is refused `t3_project_create`.
+1. Add the folder as a project in T3 Code: for a catalogued git checkout, ask the console (`superagent_add_project`, below); otherwise in T3 Code itself. The super agent's token is refused `t3_project_create`, so the tool uses the t3 CLI.
 2. In that project's settings in T3 Code, turn off PR watching and "continue threads after server update". The super agent cannot read or change these settings.
 3. Optionally, add an entry to `projects.json`.
+
+#### Adding a catalogued folder
+
+The console's `superagent_add_project({ projects: [{ project, title? }], request?, wait_seconds? })` adds folders the catalogue lists, and that are git checkouts, as T3 Code projects. `superagent_projects({ status: "not-registered" })` lists the candidates; the `why` of each says whether it can be added. `project` is a catalogue path such as `NDC/bardash`, a folder relative to the catalogue's workspace (or absolute), or a key or alias. `title` is the T3 Code project's title, the catalogue path by default. It needs `SUPERAGENT_CATALOGUE`.
+
+It reads T3 Code, the catalogue and `projects.json` once, after any read that is already running. Then for each project it asks git whether the folder is a checkout's top level and not a linked worktree, and runs `t3 project add --title=<title> [--base-dir <SUPERAGENT_T3_BASE_DIR>] <real path>` (`T3_BIN` names the binary) and waits until T3 Code lists the project at that path. If the CLI says T3 Code has a project there already (added since its list was read), the result is `registered already`. After the last one it reads the projects again, starting after any read already running, and returns, for each, its key, its status and the manual step: turn off PR watching and "continue threads after server update" in that project's settings in T3 Code. A checkout with uncommitted changes is added, with a warning: what the changes mean for tickets is decided at each launch (`dirty`, below).
+
+It writes nothing into the repository (git is only read) and nothing to `repositories.json` or `REPOSITORIES.md`, which list the folder already. Several projects at once each get their own result (`added`, `registered already`, `refused` or `failed`); one that is refused or fails does not stop the others, and the call is an error only when none was added or found registered. A project T3 Code has already is returned with its key, and nothing runs, so a repeated call adds nothing. With one project, `request` is filed there as `superagent_request` would; its trigger id comes from the project and the text, so repeating the call files it once.
+
+Each of these is refused before anything runs, with the reason: a T3 Code project already (returned, not refused); a denied folder (`ARCHIVE/`, `projects.json`, or a folder of ticket worktrees); a folder that is not a git checkout (the super agent works only in git checkouts, and it does not run `git init` in a folder that exists); a linked worktree, catalogued as `git-worktree` or not (it names the main checkout to add instead, or says that the main checkout is denied too); a folder inside another checkout rather than its top level; a catalogued folder that is not on disk; a folder outside the catalogue's workspace, catalogued or not (a catalogue path through a symlink or with `../`; the `ARCHIVE/` and `projects.json` rules are paths inside the workspace, so they would not apply to it); and a folder the catalogue does not list (add it to the catalogue first, or use `superagent_new_project` for a new folder). A request that names a catalogued folder that can be added is refused with the same advice, by `superagent_request` and by the routers; nothing is added on a request.
 
 #### Starting a new project
 
@@ -229,7 +239,7 @@ This runs the typecheck and the tests that need no t3code: an end-to-end run aga
 npm run test:live
 ```
 
-This starts its own isolated `t3 serve` for each suite (a temporary base directory and port, a scripted ACP agent as the only provider), so it never touches `~/.t3` or a running t3code. It needs `t3` on `PATH`, or `T3_BIN` set to the binary. Set `T3_LIVE_KEEP=1` to keep the temporary folders. The suites are in `tests/live/`: the contract of every `/mcp` tool the super agent uses, end-to-end runs with approvals and questions, a worker whose agent process crashes, read tracking, `src/main.ts start` itself with two projects and a denied one (requests in each, a kill and restart, the lock, reroute and refusals, and `superagent_new_project` with the t3 CLI on the test server's base dir; `tests/live/two-projects.spec.ts`), and the workload below. Approvals are answered the way t3code's web app does. Telemetry is off for every test server. The pull request link test runs t3's runtime binary (`~/.t3/runtime/versions/<version>/t3`, only read and run) with a temporary HOME, no GitHub tokens or git config, and a proxy that refuses every request.
+This starts its own isolated `t3 serve` for each suite (a temporary base directory and port, a scripted ACP agent as the only provider), so it never touches `~/.t3` or a running t3code. It needs `t3` on `PATH`, or `T3_BIN` set to the binary. Set `T3_LIVE_KEEP=1` to keep the temporary folders. The suites are in `tests/live/`: the contract of every `/mcp` tool the super agent uses, end-to-end runs with approvals and questions, a worker whose agent process crashes, read tracking, `src/main.ts start` itself with two projects and a denied one (requests in each, a kill and restart, the lock, reroute and refusals, `superagent_new_project` with the t3 CLI on the test server's base dir, and `superagent_add_project` for a catalogued checkout that exists already; `tests/live/two-projects.spec.ts`), and the workload below. Approvals are answered the way t3code's web app does. Telemetry is off for every test server. The pull request link test runs t3's runtime binary (`~/.t3/runtime/versions/<version>/t3`, only read and run) with a temporary HOME, no GitHub tokens or git config, and a proxy that refuses every request.
 
 #### Several projects on one t3code
 

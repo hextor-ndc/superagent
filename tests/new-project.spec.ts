@@ -427,6 +427,15 @@ describe('superagent_new_project', () => {
     expect(after).toBe(`${JSON.stringify(JSON.parse(after), null, 4)}\n`)
     expect(entriesOf(env).map(item => item.path)).toEqual(['NDC/four', 'PERSONAL/automix', 'PERSONAL/votes', 'widgets'])
   })
+
+  it('reads the projects after its own changes, not by joining a read that started while the CLI ran', async () => {
+    // As the timer's read would: it reads T3 Code before the project is added, and the catalogue before the entry is written.
+    const env = await start({ during: current => { void current.made.runtime.projects.refresh().catch(() => {}) } })
+    const result = await env.call({ folder: 'NDC/timed', purpose: 'Timed.' })
+    expect(result.isError, result.text).toBeUndefined()
+    expect(result.data).toMatchObject({ key: 'NDC/timed', status: 'ready', project_id: 'p-new-1' })
+    expect(result.data.why).toBeUndefined()
+  })
 })
 
 describe('the t3 CLI runner', () => {

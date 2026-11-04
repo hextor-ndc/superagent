@@ -74,7 +74,8 @@ describe('the project registry', () => {
     // The catalogued linked worktree folds into its checkout rather than showing as a folder to add.
     expect(registry.list().some(entry => entry.key === 'widgets-feature')).toBe(false)
     expect(byKey(registry, 'Plain')).toMatchObject({ status: 'no-git', reason: expect.stringContaining('not a git checkout') })
-    expect(byKey(registry, 'docs-only')).toMatchObject({ status: 'not-registered', reason: `Add ${ws.real('docs-only')} as a project in T3 Code, then run superagent_projects with refresh.` })
+    expect(byKey(registry, 'docs-only')).toMatchObject({ status: 'not-registered', reason: `Not a T3 Code project yet: call superagent_add_project with `
+      + `project docs-only to add it (or add ${ws.real('docs-only')} as a project in T3 Code, then run superagent_projects with refresh).` })
     expect(byKey(registry, 'docs-only').id).toBeUndefined()
     expect(byKey(registry, 'notes')).toMatchObject({ status: 'no-git' })
     expect(byKey(registry, 'apps')).toMatchObject({ status: 'no-git', catalogue: { purpose: 'All the apps.' } })
@@ -201,8 +202,11 @@ describe('the project registry', () => {
     const registry = await ws.load(new FakeT3([]))
     expect(byKey(registry, 'copied')).toMatchObject({ status: 'no-git',
       reason: `${ws.real('copied')} is not a git checkout here: its .git file points at C:/Users/someone/repo/.git/worktrees/copied, which does not exist on this machine.` })
-    // A linked worktree's .git file whose git dir exists may be a checkout.
-    expect(byKey(registry, 'linked').status).toBe('not-registered')
+    // A linked worktree's .git file whose git dir exists may be a checkout. It is a linked worktree, whatever the catalogue
+    // calls it, so its reason names the main checkout, which is not catalogued here.
+    expect(byKey(registry, 'linked')).toMatchObject({ status: 'not-registered', reason: `${ws.real('linked')} is a linked worktree of `
+      + `${ws.real('apps/widgets')}, not a project of its own, which is not in the catalogue: add ${ws.real('apps/widgets')} to the catalogue, `
+      + 'then add it with superagent_add_project.' })
   })
 
   it('gives every project its own worktree folder, even when two keys make the same folder name', async () => {

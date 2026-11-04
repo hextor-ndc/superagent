@@ -2,6 +2,7 @@
  * Point 2: the console tools, which the agent of the Superagent thread in t3code uses to run the super agent for the
  * operator. `superagent_attention` also carries the MCP App of point 3.
  */
+import { createHash } from 'node:crypto'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { liveTicket, reasonText, threadKey, type Decision, type Ticket, type Trigger } from '../../vendor/dsh/src/core/index.ts'
@@ -10,6 +11,7 @@ import type { Runtime } from '../app/runtime.ts'
 import { shortId } from '../executor/render.ts'
 import { BINDING_PREFIX, denied, rerouteKey, STATUSES, type ProjectBinding, type ProjectEntry, type ProjectStatus, type Rerouted } from '../app/projects.ts'
 import type { NewProjectInput } from '../app/new-project.ts'
+import type { AddProjectInput, AddProjectResult } from '../app/add-project.ts'
 import type { PendingQuestion, PendingRequest } from '../t3/client.ts'
 import { ATTENTION_URI, MCP_APP_MIME, attentionPage } from './attention-app.ts'
 import { ok } from './result.ts'
@@ -81,6 +83,31 @@ export function consoleActions(runtime: Runtime) {
       if (earlier) return { ...made, request: { trigger_id: id, filed_in: made.key, repeated: true, ...await awaitOutcome(runtime, earlier, wait_seconds * 1000) } }
       // The project is made either way: a refused request is reported, not thrown, and superagent_request can file it later.
       const filed = await fileRequest(request, made.project_id, wait_seconds, { id, thread: `request-new-project-${made.job}` })
+        .catch((error: unknown) => ({ refused: error instanceof Error ? error.message : String(error) }))
+      return { ...made, request: filed }
+    },
+    superagent_add_project: async ({ projects, request, wait_seconds = WAIT_SECONDS }: { projects: AddProjectInput[]; request?: string; wait_seconds?: number }) => {
+      if (request?.trim() && projects.length !== 1) {
+        throw new Error(`A first request goes with one project, and ${projects.length} were given: add them without \`request\`, then file each `
+          + 'request with superagent_request.')
+      }
+      const results = await runtime.addProjects(projects)
+      const outcomes = ['added', 'registered already', 'refused', 'failed'] as const
+      const summary = outcomes.map(outcome => [outcome, results.filter(result => result.outcome === outcome).length] as const)
+        .filter(([, count]) => count).map(([outcome, count]) => `${count} ${outcome}`).join(', ')
+      const made = { summary, projects: results }
+      if (!request?.trim()) return made
+      const only = results[0]!
+      if (!only.project_id) return { ...made, request: { not_filed: `${only.project} was ${only.outcome}, so the request was not filed.` } }
+      // The trigger id comes from the project and the text, so a repeated call finds the request filed before and files nothing.
+      const hash = createHash('sha256').update(`${only.project_id}\n${request.trim()}`).digest('hex').slice(0, 16)
+      const id = `console:add-project:${hash}`
+      const earlier = runtime.repo.triggers.get(id)
+      if (earlier) {
+        return { ...made, request: { trigger_id: id, filed_in: only.key ?? only.project, repeated: true, ...await awaitOutcome(runtime, earlier, wait_seconds * 1000) } }
+      }
+      // The project is added either way: a refused request is reported, not thrown, and superagent_request can file it later.
+      const filed = await fileRequest(request, only.project_id, wait_seconds, { id, thread: `request-add-project-${hash}` })
         .catch((error: unknown) => ({ refused: error instanceof Error ? error.message : String(error) }))
       return { ...made, request: filed }
     },
@@ -242,11 +269,15 @@ const quote = (word: string): string => /^[\w@%+=:,./-]+$/.test(word) ? word : `
 const PROJECT_NOTES = {
   side_effects: 'Each ticket in a project adds a branch agent/<name>, a worktree under the project\'s worktree_root, and the lines .mcp.json '
     + 'and .codex/ in the repository\'s .git/info/exclude. Nothing touches the checkout\'s own files.',
-  setup: 'To start a new project, call superagent_new_project. To make an existing folder a project: add it as a project in T3 Code (the '
-    + 'super agent cannot), then call superagent_projects with refresh. Either way, turn off PR watching and "continue threads after server '
-    + 'update" in that project\'s settings in T3 Code. Access, aliases, delivery and base ref can be set in projects.json in the super agent\'s '
-    + 'state directory.',
+  setup: 'Status not-registered is a catalogued folder T3 Code does not have yet: superagent_add_project adds one that is a git checkout '
+    + '(superagent_projects with status not-registered lists them; the `why` of each says whether it can be added, or which main checkout '
+    + 'to add for a linked worktree). To start a project that does not exist yet, call superagent_new_project. Either way, turn off PR '
+    + 'watching and "continue threads after server update" in that project\'s settings in T3 Code. Access, aliases, delivery and base ref '
+    + 'can be set in projects.json in the super agent\'s state directory.',
 }
+/** What `superagent_projects` says when it lists a catalogued folder T3 Code does not have. */
+const TO_ADD = 'A not-registered project whose `why` says to call superagent_add_project is a catalogued git checkout: superagent_add_project '
+  + 'with projects [{ project: <key> }] adds it to T3 Code (several at once if wanted), and then requests can go there.'
 const clip = (text: string | undefined, chars: number) => text && text.length > chars ? `${text.slice(0, chars - 1)}…` : text
 
 /**
@@ -297,6 +328,7 @@ function projectRows(runtime: Runtime, { query, status, limit, refreshError }: {
     total: matched.length,
     projects: matched.slice(0, limit).map(row),
     ...query?.trim() && !matched.length && exact && !exact.found ? { suggestions: exact.suggestions } : {},
+    ...matched.slice(0, limit).some(entry => entry.status === 'not-registered') ? { to_add: TO_ADD } : {},
     ...PROJECT_NOTES,
   }
 }
@@ -375,7 +407,8 @@ export function consoleServer(runtime: Runtime): McpServer {
   async args => ok(actions.superagent_ticket(args)))
   server.registerTool('superagent_projects', {
     description: 'The T3 Code projects and catalogued folders: for each, whether work can go there (status, and why not), what it is for, '
-      + 'access, delivery and base ref. `query` matches a name, alias, path or purpose; `refresh` reads T3 Code, the catalogue and projects.json again.',
+      + 'access, delivery and base ref. `query` matches a name, alias, path or purpose; `refresh` reads T3 Code, the catalogue and projects.json again. '
+      + '`status: not-registered` lists the catalogued folders T3 Code does not have yet, which superagent_add_project can add.',
     inputSchema: { query: z.string().trim().max(200).optional(), status: z.enum(STATUSES as [ProjectStatus, ...ProjectStatus[]]).optional(),
       limit: z.number().int().min(1).max(200).optional(), refresh: z.boolean().optional() },
     annotations: readOnly,
@@ -408,6 +441,29 @@ export function consoleServer(runtime: Runtime): McpServer {
       wait_seconds: wait,
     },
   }, async args => ok(await actions.superagent_new_project(args)))
+  server.registerTool('superagent_add_project', {
+    description: 'Add folders the catalogue lists, and that are git checkouts, as T3 Code projects, so work can go there: the ones '
+      + 'superagent_projects shows with status not-registered. It runs the t3 CLI only; it writes nothing into the repository or the catalogue. '
+      + 'Each project is refused, with the reason and nothing run, when it is a T3 Code project already (returned as it is, with its key), '
+      + 'denied, not a git checkout, a linked worktree (it names the main checkout to add), missing, outside the workspace or not '
+      + 'catalogued (use superagent_new_project for a new folder). Several at once each get a result; one that fails does not stop the others. '
+      + 'Optionally files a first request in a single project, as superagent_request would. Returns each project\'s key and status, '
+      + 'and a step the operator must do in T3 Code for each one added.',
+    inputSchema: {
+      projects: z.array(z.object({
+        project: project.describe('A catalogue path such as NDC/bardash (as superagent_projects shows it), a folder relative to the catalogue\'s '
+          + 'workspace, or a key or alias.'),
+        title: z.string().trim().min(1).max(100).optional().describe('The T3 Code project\'s title; the catalogue path by default.'),
+      })).min(1).max(50),
+      request: z.string().trim().min(1).max(8000).optional().describe('A first request to file when one project is given, as superagent_request would.'),
+      wait_seconds: wait,
+    },
+  }, async args => {
+    const result = await actions.superagent_add_project(args)
+    // A call that added nothing and found nothing registered is an error, with each project's reason.
+    const none = result.projects.every((item: AddProjectResult) => item.outcome === 'refused' || item.outcome === 'failed')
+    return { ...ok(result), ...none ? { isError: true } : {} }
+  })
   server.registerTool('superagent_reroute', {
     description: 'A ticket went to the wrong project: stop it and file its request again, with the same text, in `project`. Returns the stopped '
       + 'ticket, the new request\'s result as superagent_request gives it, and the branch and worktree the stopped ticket left, for the operator '
