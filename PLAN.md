@@ -6,7 +6,7 @@ DeepSeek's prototype supplies the control plane: Source → Trigger → Thread �
 
 ## Ground rules: staying safe across t3code updates
 
-1. **Use only t3code's documented outside-agent surface:** `/mcp` tools such as `t3_thread_launch`, `t3_thread_send`, `t3_thread_read`, `t3_thread_wait`, `t3_thread_interrupt`, `t3_thread_organize`, `t3_pending_request`, `link_pull_request` and `t3_project_list`. Every call goes through one module, `src/t3/client.ts`.
+1. **Use only t3code's documented outside-agent surface:** `/mcp` tools such as `t3_thread_launch`, `t3_thread_send`, `t3_thread_read`, `t3_thread_wait`, `t3_thread_interrupt`, `t3_thread_organize`, `t3_pending_request`, `link_pull_request` and `t3_project_list`. Every call goes through one module, `src/t3/client.ts`. One exception: `superagent_new_project` adds a project with t3's own CLI, `t3 project add`, since `/mcp` refuses the super agent's token `t3_project_create`; it runs only for that tool (src/app/new-project.ts).
 2. **No internal RPC in phase 1.** Tags and the live event stream (`subscribeThread`) would need the WebSocket RPC, which is internal and changes with every release. If we ever use it, it goes behind the same `T3Client` interface.
 3. **Turn off the features that overlap with ours** in the project settings of every T3 Code project the super agent works in: PR watching and `continueThreadsAfterServerUpdate`. The super agent owns follow-ups and recovery. Linking a PR still makes t3code settle the thread when the PR merges, which is only a sidebar state and harmless.
 4. **Pin t3code** to a stable release on worker machines. Before moving to a new release, run the live contract tests (`npm run test:live`, which starts its own isolated `t3 serve`; the contract is `tests/live/contract.spec.ts`) and the paper's synthetic workload against it (`npm run acceptance:live`).
@@ -34,7 +34,8 @@ DeepSeek's prototype supplies the control plane: Source → Trigger → Thread �
 - **Concurrency:** limited by `WorkerSlots`, ported from the prototype, including the extra slot reserved for a person's message.
 
 ### 2. A Superagent console thread (`src/mcp/console-tools.ts`)
-- One t3code thread with no project ("Superagent"), launched once, whose agent has the **console MCP server**. Its tools are `superagent_status`, `superagent_attention`, `superagent_dismiss_alert`, `superagent_ticket`, `superagent_projects`, `superagent_request`, `superagent_reroute`, `superagent_answer`, `superagent_stop`, `superagent_retry`, `superagent_note`, `superagent_pause`, and `superagent_messages`. Requests name the T3 Code project they go to (docs/multi-project-plan.md).
+- One t3code thread with no project ("Superagent"), launched once, whose agent has the **console MCP server**. Its tools are `superagent_status`, `superagent_attention`, `superagent_dismiss_alert`, `superagent_ticket`, `superagent_projects`, `superagent_new_project`, `superagent_request`, `superagent_reroute`, `superagent_answer`, `superagent_stop`, `superagent_retry`, `superagent_note`, `superagent_pause`, and `superagent_messages`. Requests name the T3 Code project they go to (docs/multi-project-plan.md).
+- `superagent_new_project` starts a new project in the catalogue: the folder, a git repository, the T3 Code project (added with the t3 CLI, since the super agent's token is refused `t3_project_create`), and its entries in repositories.json and REPOSITORIES.md (docs/multi-project-plan.md, "All folders and new projects").
 - The operator manages the super agent by chatting in t3code. The Watchdog will run in a scheduled version of this thread (phase 3).
 
 ### 3. Dashboards rendered inside t3code (`src/mcp/attention-app.ts`, `src/http/panel.ts`)
@@ -57,7 +58,7 @@ DeepSeek's prototype supplies the control plane: Source → Trigger → Thread �
 | 2 | SQLite store and restart recovery; GitHub Source and Channel; the Router as a Claude session in the control plane, with batching; OAuth `connect` | done |
 | 3 | Watchdog as a scheduled t3code thread (done); several machines (one `t3 serve` each, plus a cloud control plane); per-machine tokens and project allowlists | in progress |
 | 4 | Acceptance test: the paper's synthetic workload (~300 messages, ~20 requests), in memory and against an isolated t3code with a scripted ACP agent | done |
-| Multi-project | One instance, one console, many T3 Code projects: each ticket bound to its project; see [docs/multi-project-plan.md](docs/multi-project-plan.md) | phases 0 to 3a done |
+| Multi-project | One instance, one console, many T3 Code projects: each ticket bound to its project; every catalogued folder but `ARCHIVE/` takes work; new projects started from the console; see [docs/multi-project-plan.md](docs/multi-project-plan.md) | phases 0 to 3a done, and "All folders and new projects" |
 
 ## Phase 2 notes
 

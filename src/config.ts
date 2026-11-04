@@ -41,6 +41,13 @@ export interface Config {
    * legacy project, or in the one ready project when none is set, and says so; `refuse` refuses it (plan, open question 1).
    */
   unnamedRequests?: 'default' | 'refuse'
+  /** `T3_BIN`, else `t3` on PATH: the T3 Code CLI `superagent_new_project` adds a new project with. */
+  t3Bin?: string
+  /**
+   * `SUPERAGENT_T3_BASE_DIR`: the T3 Code data directory that CLI is given (`--base-dir`), which must be that of the t3code
+   * `T3_MCP_URL` names. Left out, the CLI uses T3 Code's own default, `~/.t3`.
+   */
+  t3BaseDir?: string
   port: number
   /** How t3code's agents reach this service; workers' MCP URLs start with it. */
   publicUrl: string
@@ -87,6 +94,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...env.SUPERAGENT_CATALOGUE?.trim() ? { catalogue: resolve(env.SUPERAGENT_CATALOGUE.trim()) } : {},
     projectsFile: resolve(env.SUPERAGENT_PROJECTS_FILE?.trim() || join(state, 'projects.json')),
     unnamedRequests: oneOf(env.SUPERAGENT_UNNAMED_REQUESTS, ['default', 'refuse'] as const, 'default'),
+    t3Bin: env.T3_BIN?.trim() || 't3',
+    ...env.SUPERAGENT_T3_BASE_DIR?.trim() ? { t3BaseDir: resolve(env.SUPERAGENT_T3_BASE_DIR.trim()) } : {},
     port,
     publicUrl: (env.SUPERAGENT_PUBLIC_URL ?? `http://127.0.0.1:${port}`).replace(/\/+$/, ''),
     consoleToken: env.SUPERAGENT_CONSOLE_TOKEN?.trim() ?? '',

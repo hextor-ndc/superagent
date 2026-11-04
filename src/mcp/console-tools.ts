@@ -9,6 +9,7 @@ import { CONSOLE, consoleThread, consoleTrigger, type ConsoleHint } from '../app
 import type { Runtime } from '../app/runtime.ts'
 import { shortId } from '../executor/render.ts'
 import { BINDING_PREFIX, denied, rerouteKey, STATUSES, type ProjectBinding, type ProjectEntry, type ProjectStatus, type Rerouted } from '../app/projects.ts'
+import type { NewProjectInput } from '../app/new-project.ts'
 import type { PendingQuestion, PendingRequest } from '../t3/client.ts'
 import { ATTENTION_URI, MCP_APP_MIME, attentionPage } from './attention-app.ts'
 import { ok } from './result.ts'
@@ -17,6 +18,18 @@ import { alerts, dismissAlert, lastCheck } from './watchdog-tools.ts'
 /** The console actions, shared by the MCP tools and the panel's HTTP API. */
 export function consoleActions(runtime: Runtime) {
   const { engine } = runtime
+  /**
+   * Files a console request in a project, checked before anything is stored by the rules its binding applies, so a refused
+   * request leaves nothing; then waits for the decision. `made` fixes the trigger's id and thread, for a request that must be
+   * filed once however often its call is repeated.
+   */
+  const fileRequest = async (text: string, project: string | undefined, waitSeconds: number, made?: { id: string; thread: string }) => {
+    const { entry, hint } = await runtime.requestProject(project)
+    const trigger = { ...consoleTrigger(runtime.config.operator, text, made ? consoleThread(made.thread) : undefined, hint), ...made ? { id: made.id } : {} }
+    engine.receive(trigger)
+    return { trigger_id: trigger.id, filed_in: hint ? entry.key : `${entry.key}, the default for requests that name no project`,
+      ...await awaitOutcome(runtime, trigger, waitSeconds * 1000) }
+  }
   const ticket = (id: string) => {
     const found = runtime.findTicket(id)
     if (!found) throw new Error(`No ticket ${id}`)
@@ -57,13 +70,19 @@ export function consoleActions(runtime: Runtime) {
       if (refresh) await runtime.projects.refresh().catch(error => { refreshError = error instanceof Error ? error.message : String(error) })
       return projectRows(runtime, { query, status, limit, refreshError })
     },
-    superagent_request: async ({ text, project, wait_seconds = WAIT_SECONDS }: { text: string; project?: string; wait_seconds?: number }) => {
-      // The project is checked before anything is stored, by the rules its binding applies; a refused request leaves nothing.
-      const { entry, hint } = await runtime.requestProject(project)
-      const trigger = consoleTrigger(runtime.config.operator, text, undefined, hint)
-      engine.receive(trigger)
-      return { trigger_id: trigger.id, filed_in: hint ? entry.key : `${entry.key}, the default for requests that name no project`,
-        ...await awaitOutcome(runtime, trigger, wait_seconds * 1000) }
+    superagent_request: ({ text, project, wait_seconds = WAIT_SECONDS }: { text: string; project?: string; wait_seconds?: number }) =>
+      fileRequest(text, project, wait_seconds),
+    superagent_new_project: async ({ request, wait_seconds = WAIT_SECONDS, ...input }: NewProjectInput & { wait_seconds?: number }) => {
+      const made = await runtime.newProject({ ...input, ...request ? { request } : {} })
+      if (!request?.trim()) return made
+      // The first request's trigger id comes from the job, so a repeated call finds the request filed before and files nothing.
+      const id = `console:new-project:${made.job}`
+      const earlier = runtime.repo.triggers.get(id)
+      if (earlier) return { ...made, request: { trigger_id: id, filed_in: made.key, repeated: true, ...await awaitOutcome(runtime, earlier, wait_seconds * 1000) } }
+      // The project is made either way: a refused request is reported, not thrown, and superagent_request can file it later.
+      const filed = await fileRequest(request, made.project_id, wait_seconds, { id, thread: `request-new-project-${made.job}` })
+        .catch((error: unknown) => ({ refused: error instanceof Error ? error.message : String(error) }))
+      return { ...made, request: filed }
     },
     superagent_reroute: async ({ ticket_id, project, wait_seconds = WAIT_SECONDS }: { ticket_id: string; project: string; wait_seconds?: number }) => {
       const found = ticket(ticket_id)
@@ -223,9 +242,10 @@ const quote = (word: string): string => /^[\w@%+=:,./-]+$/.test(word) ? word : `
 const PROJECT_NOTES = {
   side_effects: 'Each ticket in a project adds a branch agent/<name>, a worktree under the project\'s worktree_root, and the lines .mcp.json '
     + 'and .codex/ in the repository\'s .git/info/exclude. Nothing touches the checkout\'s own files.',
-  setup: 'To make a folder a project: add it as a project in T3 Code (the super agent cannot), then in that project\'s settings turn off PR '
-    + 'watching and "continue threads after server update". Then call superagent_projects with refresh. Access, aliases, delivery and '
-    + 'base ref can be set in projects.json in the super agent\'s state directory.',
+  setup: 'To start a new project, call superagent_new_project. To make an existing folder a project: add it as a project in T3 Code (the '
+    + 'super agent cannot), then call superagent_projects with refresh. Either way, turn off PR watching and "continue threads after server '
+    + 'update" in that project\'s settings in T3 Code. Access, aliases, delivery and base ref can be set in projects.json in the super agent\'s '
+    + 'state directory.',
 }
 const clip = (text: string | undefined, chars: number) => text && text.length > chars ? `${text.slice(0, chars - 1)}…` : text
 
@@ -371,6 +391,23 @@ export function consoleServer(runtime: Runtime): McpServer {
     inputSchema: { text: z.string().trim().min(1).max(8000), project: project.optional()
       .describe('The project: its key, alias, title, folder path or T3 Code id, as superagent_projects shows it.'), wait_seconds: wait },
   }, async args => ok(await actions.superagent_request(args)))
+  server.registerTool('superagent_new_project', {
+    description: 'Start a new project in the catalogue: make the folder under the catalogue\'s workspace, a git repository on main with a README.md '
+      + 'and a REPO_MAP.md in a first commit, add it as a T3 Code project, add it to repositories.json and REPOSITORIES.md, and optionally file '
+      + 'a first request there. Refused, with nothing written, without a catalogue, for a folder outside the workspace, denied (ARCHIVE/), '
+      + 'catalogued, registered, not empty or inside another git checkout, or when git has no user.name and user.email. If it fails part '
+      + 'way, call it again with the same arguments to finish. Returns the project\'s key and status, and a step the operator must do in T3 Code.',
+    inputSchema: {
+      folder: z.string().trim().min(1).max(255).describe('The new folder, relative to the catalogue\'s workspace, such as PERSONAL/garden or NDC/newthing.'),
+      purpose: z.string().trim().min(1).max(300).describe('One sentence: what the project is for.'),
+      title: z.string().trim().min(1).max(100).optional().describe('The T3 Code project\'s title; the folder\'s name by default.'),
+      flow: z.string().trim().min(1).max(500).optional().describe('One sentence on how work or data moves through it, for the catalogue.'),
+      notes: z.string().trim().max(2000).optional(),
+      related: z.array(z.string().trim().min(1).max(255)).max(20).optional().describe('Catalogue paths of related projects.'),
+      request: z.string().trim().min(1).max(8000).optional().describe('A first request to file in the new project, as superagent_request would.'),
+      wait_seconds: wait,
+    },
+  }, async args => ok(await actions.superagent_new_project(args)))
   server.registerTool('superagent_reroute', {
     description: 'A ticket went to the wrong project: stop it and file its request again, with the same text, in `project`. Returns the stopped '
       + 'ticket, the new request\'s result as superagent_request gives it, and the branch and worktree the stopped ticket left, for the operator '

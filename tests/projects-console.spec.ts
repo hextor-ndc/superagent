@@ -4,7 +4,7 @@
  * project across a start without one, and the Watchdog's `projects` part.
  */
 import { createHash } from 'node:crypto'
-import { writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { threadKey } from '../vendor/dsh/src/core/index.ts'
@@ -55,6 +55,26 @@ describe('projects in the console', () => {
     await console.close()
   })
 
+  it('lists PERSONAL/ and FAMILY/ projects as ready, with their catalogue text, and takes requests there by default', async () => {
+    const { dir } = checkout('PERSONAL/diary')
+    checkout('FAMILY/photos', dir)
+    catalogue(dir, [{ path: 'PERSONAL/diary', purpose: 'A private diary.', notes: 'Kept by hand.' }, { path: 'FAMILY/photos', purpose: 'Family photos.' }])
+    const t3 = new FakeT3([{ id: 'p-diary', workspaceRoot: join(dir, 'PERSONAL', 'diary'), title: 'Diary' },
+      { id: 'p-photos', workspaceRoot: join(dir, 'FAMILY', 'photos'), title: 'Photos' }])
+    made = await consoleOnly(t3, dir)
+    const console = await mcp(`${made.base}/mcp/console/console-secret`)
+    const listed = data(await console.callTool({ name: 'superagent_projects', arguments: {} }))
+    expect(listed).toMatchObject({ summary: '2 ready', projects: [
+      expect.objectContaining({ key: 'FAMILY/photos', status: 'ready', access: 'named', purpose: 'Family photos.' }),
+      expect.objectContaining({ key: 'PERSONAL/diary', status: 'ready', access: 'named', purpose: 'A private diary.', notes: 'Kept by hand.' }),
+    ] })
+    expect(JSON.stringify(listed)).not.toContain('withheld')
+    expect(data(await console.callTool({ name: 'superagent_projects', arguments: { query: 'private diary' } }))).toMatchObject({ total: 1 })
+    const filed = data(await console.callTool({ name: 'superagent_request', arguments: { text: 'Add an entry', project: 'PERSONAL/diary', wait_seconds: 5 } }))
+    expect(filed).toMatchObject({ status: 'accepted', filed_in: 'PERSONAL/diary', project: 'PERSONAL/diary' })
+    await console.close()
+  })
+
   it('leaves t3code\'s scratch project, which holds the console and the Watchdog, out of the projects', async () => {
     const place = checkout()
     catalogue(place.dir, [])
@@ -80,6 +100,9 @@ describe('projects in the console', () => {
     checkout('PERSONAL/diary', dir)
     catalogue(dir, [{ path: 'widgets', purpose: 'Widget shop.', notes: 'Payments in src/pay.' }, { path: 'docs', purpose: 'Docs.' },
       { path: 'PERSONAL/diary', purpose: 'A private diary.' }])
+    // The operator denies PERSONAL/ and withholds its text in projects.json; by default it takes work and is described.
+    mkdirSync(join(dir, 'state'), { recursive: true })
+    writeFileSync(join(dir, 'state', 'projects.json'), JSON.stringify({ 'PERSONAL/': { access: 'deny', describe: false } }))
     const t3 = new FakeT3([{ id: 'p-widgets', workspaceRoot: join(dir, 'widgets'), title: 'Widgets' },
       { id: 'p-diary', workspaceRoot: join(dir, 'PERSONAL', 'diary'), title: 'Diary' }])
     made = await consoleOnly(t3, dir)
@@ -96,7 +119,7 @@ describe('projects in the console', () => {
       expect.objectContaining({ key: 'PERSONAL/diary', status: 'denied', description: expect.stringContaining('withheld') }),
       expect.objectContaining({ key: 'docs', status: 'missing-checkout' }),
     ])
-    // Catalogue text from PERSONAL/ is not sent to the console's model.
+    // Catalogue text projects.json withholds is not sent to the console's model.
     expect(JSON.stringify(refreshed)).not.toContain('A private diary')
     expect(refreshed).toMatchObject({ side_effects: expect.stringContaining('.git/info/exclude'), setup: expect.stringContaining('PR watching') })
 

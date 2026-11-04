@@ -53,7 +53,7 @@ ANTHROPIC_API_KEY=<key> \
 npm start
 ```
 
-It prints every T3 Code project with its status, the counts (for example "2 ready, 3 no-git, 108 not-registered, 2 denied"), the console thread and the panel URL. Open the **Superagent** thread in t3code and ask, for example, "start a request: fix the typo in the README".
+It prints every T3 Code project with its status, the counts (for example "2 ready, 3 no-git, 108 not-registered, 2 denied"), the console thread and the panel URL. Open the **Superagent** thread in t3code and ask, for example, "start a request: fix the typo in the README". To start a project that does not exist yet, ask the console for it; it uses `superagent_new_project` (see "Starting a new project" below).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -66,6 +66,8 @@ It prints every T3 Code project with its status, the counts (for example "2 read
 | `SUPERAGENT_BASE_REF` | `HEAD` | What that project's new worktrees start from |
 | `SUPERAGENT_CATALOGUE` | none | A `repositories.json` that describes the folders on this machine, such as `/Users/hextor/coding/repositories.json`; read again when it changes |
 | `SUPERAGENT_PROJECTS_FILE` | `<state dir>/projects.json` | Per-project overrides (below); optional |
+| `T3_BIN` | `t3` on `PATH` | The T3 Code CLI `superagent_new_project` adds new projects with |
+| `SUPERAGENT_T3_BASE_DIR` | T3 Code's own default (`~/.t3`) | The T3 Code data directory that CLI is given (`--base-dir`); set it when the t3code `T3_MCP_URL` names runs on another one |
 | `SUPERAGENT_UNNAMED_REQUESTS` | `default` | A console request that names no project: `default` files it in the configured project (or the one ready project) and says so; `refuse` refuses it |
 | `SUPERAGENT_PORT` / `SUPERAGENT_PUBLIC_URL` | `3790` / `http://127.0.0.1:3790` | Where t3code's agents reach this service |
 | `SUPERAGENT_CONSOLE_TOKEN` | made once and kept in `<state dir>/console-token` | The secret in the console and panel URLs |
@@ -99,6 +101,8 @@ Everything goes in the state directory (`SUPERAGENT_STATE_DIR`, `~/.superagent-t
 - `superagent.lock`: the pid of the running instance. A second instance on the same state directory refuses to start; a lock whose process is gone is taken over, and so is one whose pid now belongs to a process that started after the lock was written (a pid reused after a crash or a reboot). When the start is refused, the message names the process; if it is not a superagent, delete the lock file. An instance of an earlier version takes no lock, so stop it before starting this one.
 - `projects.json`: your overrides, if any.
 - `state.sqlite.bak-<time>`: the copy of the database the first start of this version makes before binding old tickets to their project; delete it once you are happy.
+- `new-projects/<folder>-<hash>.json`: the arguments and progress of each `superagent_new_project` job, so a call repeated after a failure finishes it. Delete one, with its folder, to start that project over with other arguments.
+- `catalogue-backups/`: the copy of `repositories.json` or `REPOSITORIES.md` made before each `superagent_new_project` write, named `<file>.<time>`; delete them once you are happy.
 - `worktrees/<project>/`: where ticket worktrees of projects other than the configured one go. The folder name comes from the project's key; when two keys give the same name, the second gets a short hash of its T3 Code id. t3code accepts worktrees outside the checkout's folder (see "Several projects on one t3code").
 
 ### Projects
@@ -112,28 +116,46 @@ Each project has a status:
 | `ready` | Registered in T3 Code, a git checkout whose top level is the folder, not denied |
 | `not-registered` | Catalogued only: add the folder as a project in T3 Code, then refresh |
 | `no-git` | Not a git checkout, or a folder inside one rather than its top level. A catalogued folder whose `.git` file points at a git dir that is not on this machine (a checkout copied from elsewhere) is one too |
-| `denied` | By `projects.json`, by default (`ARCHIVE/`, `PERSONAL/`, `FAMILY/` under the catalogue's workspace), or because it is a folder of the super agent's own worktrees (a `*-superagent` folder or one directly in it, `<state dir>/worktrees`, a `worktreeRoot` from `projects.json`). A deny holds for the repository: a registered linked worktree whose main checkout is denied (registered and denied, or under a denied path or prefix) is denied too, wherever its own folder is |
+| `denied` | By `projects.json`, by default (`ARCHIVE/` under the catalogue's workspace), or because it is a folder of the super agent's own worktrees (a `*-superagent` folder or one directly in it, `<state dir>/worktrees`, a `worktreeRoot` from `projects.json`). A deny holds for the repository: a registered linked worktree whose main checkout is denied (registered and denied, or under a denied path or prefix) is denied too, wherever its own folder is |
 | `missing-checkout` | The folder no longer exists |
 | `ambiguous` | Two T3 Code projects have the same folder (t3code takes a symlinked form of a registered root as a new project); name the one to use in `projects.json` by its id |
 | `folded` | A linked worktree registered as its own project while its main checkout is registered too; work for that repository goes to the main checkout |
 
 t3code's scratch project ("No project"), which it makes for the console and Watchdog threads and lists from then on, is left out.
 
-The console's `superagent_projects({ query?, status?, limit?, refresh? })` lists them with the reason, purpose, access, delivery and base ref. Catalogue text from `PERSONAL/` and `FAMILY/` is not sent to the console's model unless `projects.json` allows it.
+The console's `superagent_projects({ query?, status?, limit?, refresh? })` lists them with the reason, purpose, access, delivery and base ref. Every folder of the catalogue can take work, `PERSONAL/`, `FAMILY/` and `COMMON/` included, except `ARCHIVE/`, and its catalogue purpose and notes are sent to the console's model, unless `projects.json` says otherwise (the operator's choice of 2026-11-04; before, `PERSONAL/` and `FAMILY/` were denied and their text withheld by default). To keep a folder's text from the models, set `describe: false` for it; to deny it, `access: deny`.
 
-To make a folder a project, once per project:
+To make an existing folder a project, once per project:
 
 1. Add the folder as a project in T3 Code. The super agent cannot: its token is refused `t3_project_create`.
 2. In that project's settings in T3 Code, turn off PR watching and "continue threads after server update". The super agent cannot read or change these settings.
 3. Optionally, add an entry to `projects.json`.
 
-`projects.json` maps a key to overrides. A key is a T3 Code project id, an absolute path, a catalogue path, or a prefix ending in `/` (absolute, or relative to the catalogue's workspace). The more specific key wins: an id over a path over a prefix, and a longer prefix over a shorter one. An entry for `ARCHIVE/`, `PERSONAL/` or `FAMILY/` replaces that default, and a longer one such as `ARCHIVE/tool/` overrides it there; a broader prefix, such as the whole workspace, does not lift the defaults. When two projects have the same key (two T3 Code projects with one title), the second gets its T3 Code id added; which one keeps the plain key does not change between refreshes. Unknown fields are refused, and an invalid file stops the start; a later refresh with an invalid file keeps the last good list.
+#### Starting a new project
+
+The console's `superagent_new_project({ folder, purpose, title?, flow?, notes?, related?, request?, wait_seconds? })` starts a project that does not exist yet, such as `{ folder: "PERSONAL/garden", purpose: "Plan the vegetable garden by season." }`. It needs `SUPERAGENT_CATALOGUE`. In order, it:
+
+1. makes the folder, relative to the catalogue's workspace (a new folder, or an existing empty one). The catalogue, the index and the files name it as the disk does: on a file system that ignores case, as macOS's does, `personal/garden` becomes `PERSONAL/garden`;
+2. runs `git init` with the branch `main`, writes a `README.md` and a `REPO_MAP.md` stub in the shape of the catalogue's other maps, and commits them with your own git identity;
+3. adds the folder as a T3 Code project with the t3 CLI (`t3 project add --title=<title> [--base-dir <SUPERAGENT_T3_BASE_DIR>] <folder>`; `T3_BIN` names the binary). The title is in the same argument as `--title`, so one that starts with a dash is not read as an option. t3code takes it while it runs, and the project is in its list at once;
+4. adds a `git-repository` entry to `repositories.json`, in path order, with the fields the other entries have (`checked_on` today, `head` the first commit, `had_local_changes` false, `map` `<folder>/REPO_MAP.md`, empty `modules`, `manifests` and `existing_docs`; no `source_evidence`), and a row to the "Repository and project catalog" table of its top folder in the `REPOSITORIES.md` next to it. The `scope` line of `repositories.json` gets its counts raised when they match the list exactly; otherwise it is left, and so are the counts in `REPOSITORIES.md`'s own text;
+5. reads the projects again, and files `request`, when given, in the new project as `superagent_request` would.
+
+It returns the project's key, its status and one step left to you: turn off PR watching and "continue threads after server update" in the new project's settings in T3 Code.
+
+It refuses, before writing anything: without a catalogue; for a folder that is absolute, has `.` or `..`, or leads outside the workspace through a symlink; for a folder reached through a symlink inside the workspace (it names the folder's own path to use instead) or through a symlink to something that does not exist; for a denied folder (`ARCHIVE/`, a deny in `projects.json`, or a folder of ticket worktrees); for a folder that is catalogued (paths that differ only in case count as the same), is a T3 Code project already, is not empty, is a file or a symlink, or is inside another git checkout; for a folder name with characters other than letters, digits, spaces and `. _ + -` (or starting with a dot or a dash, or ending in a dot, a space or `.lock`); for a purpose that is not one line; for `related` paths the catalogue does not list; when git has no `user.name` and `user.email` (it never makes one up); and when the t3 CLI cannot be run.
+
+`repositories.json` and `REPOSITORIES.md` are shared with other tools and people. Before each write, the file is copied to `<state dir>/catalogue-backups/`, read again, changed by the one entry or row, written to a temporary file beside it and renamed over it, and only when it did not change since it was read; otherwise it is read and changed again, up to three times. There is no lock: another tool's write that lands in the instant between that last check and the rename is still lost. A file of an unexpected shape (a `repositories.json` whose text `JSON.stringify` would not give back with its own indent, a `REPOSITORIES.md` without the section, the heading or the table) is not written; the result says so, with the entry or row to add by hand.
+
+Each step checks what is there before it acts, and the job's arguments are kept in `<state dir>/new-projects/`. If a call fails part way (or the service stops), call it again with the same arguments: it finishes the job and adds nothing twice, and the first request is filed once. Other arguments for an unfinished job are refused. A finished project that you remove and start again at the same folder with other arguments is a new job, and its first request is filed.
+
+`projects.json` maps a key to overrides. A key is a T3 Code project id, an absolute path, a catalogue path, or a prefix ending in `/` (absolute, or relative to the catalogue's workspace). The more specific key wins: an id over a path over a prefix, and a longer prefix over a shorter one. An entry for `ARCHIVE/` replaces that default, and a longer one such as `ARCHIVE/tool/` overrides it there; a broader prefix, such as the whole workspace, does not lift the default. When two projects have the same key (two T3 Code projects with one title), the second gets its T3 Code id added; which one keeps the plain key does not change between refreshes. Unknown fields are refused, and an invalid file stops the start; a later refresh with an invalid file keeps the last good list.
 
 ```json
 {
   "NDC/bardash": { "access": "named", "aliases": ["bardash", "bar"], "baseRef": "main", "dirty": "warn" },
-  "PERSONAL/automix": { "access": "named", "describe": true },
-  "COMMON/": { "access": "deny" }
+  "FAMILY/javimp": { "describe": false },
+  "ARCHIVE/launcher/": { "access": "named" }
 }
 ```
 
@@ -145,9 +167,9 @@ To make a folder a project, once per project:
 | `baseRef` | a ref | What new worktrees start from; default the local branch `origin/HEAD` names, else `main`, else `master` |
 | `worktreeRoot` | an absolute path | Where the project's ticket worktrees go; default `<state dir>/worktrees/<project>` |
 | `dirty` | `warn` (default), `refuse` | When the base is the branch checked out and the checkout has uncommitted changes |
-| `describe` | `true`, `false` | Whether the catalogue's purpose and notes may be sent to models; `false` by default under `PERSONAL/` and `FAMILY/` |
+| `describe` | `true` (default), `false` | Whether the catalogue's purpose and notes may be sent to models |
 
-The configured project keeps its own settings (`SUPERAGENT_WORKTREE_ROOT`, `SUPERAGENT_BASE_REF`, `SUPERAGENT_REPOSITORY`) and access `work`; only an entry for its own id or path can deny it. A prefix's other fields still apply to it, so under `PERSONAL/` or `FAMILY/` its catalogue text stays withheld (`describe: false`) unless an entry allows it.
+The configured project keeps its own settings (`SUPERAGENT_WORKTREE_ROOT`, `SUPERAGENT_BASE_REF`, `SUPERAGENT_REPOSITORY`) and access `work`; only an entry for its own id or path can deny it. A prefix's other fields still apply to it, so under a prefix with `describe: false` its catalogue text stays withheld unless an entry allows it.
 
 ### Requests in several projects
 
@@ -207,7 +229,7 @@ This runs the typecheck and the tests that need no t3code: an end-to-end run aga
 npm run test:live
 ```
 
-This starts its own isolated `t3 serve` for each suite (a temporary base directory and port, a scripted ACP agent as the only provider), so it never touches `~/.t3` or a running t3code. It needs `t3` on `PATH`, or `T3_BIN` set to the binary. Set `T3_LIVE_KEEP=1` to keep the temporary folders. The suites are in `tests/live/`: the contract of every `/mcp` tool the super agent uses, end-to-end runs with approvals and questions, a worker whose agent process crashes, read tracking, `src/main.ts start` itself with two projects and a denied one (requests in each, a kill and restart, the lock, reroute and refusals; `tests/live/two-projects.spec.ts`), and the workload below. Approvals are answered the way t3code's web app does. Telemetry is off for every test server. The pull request link test runs t3's runtime binary (`~/.t3/runtime/versions/<version>/t3`, only read and run) with a temporary HOME, no GitHub tokens or git config, and a proxy that refuses every request.
+This starts its own isolated `t3 serve` for each suite (a temporary base directory and port, a scripted ACP agent as the only provider), so it never touches `~/.t3` or a running t3code. It needs `t3` on `PATH`, or `T3_BIN` set to the binary. Set `T3_LIVE_KEEP=1` to keep the temporary folders. The suites are in `tests/live/`: the contract of every `/mcp` tool the super agent uses, end-to-end runs with approvals and questions, a worker whose agent process crashes, read tracking, `src/main.ts start` itself with two projects and a denied one (requests in each, a kill and restart, the lock, reroute and refusals, and `superagent_new_project` with the t3 CLI on the test server's base dir; `tests/live/two-projects.spec.ts`), and the workload below. Approvals are answered the way t3code's web app does. Telemetry is off for every test server. The pull request link test runs t3's runtime binary (`~/.t3/runtime/versions/<version>/t3`, only read and run) with a temporary HOME, no GitHub tokens or git config, and a proxy that refuses every request.
 
 #### Several projects on one t3code
 
